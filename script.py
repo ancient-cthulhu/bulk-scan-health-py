@@ -140,6 +140,8 @@ class ScanResult:
     is_latest: bool = True; scan_status: str = "No Scan"
     published: str = ""; days_since: object = "N/A"; duration: str = ""
     engine: str = ""; analysis_size_mb: float = 0.0
+    va_score: object = ""; va_rating: str = ""
+    policy_status: str = ""; policy_name: str = ""
     files_uploaded: int = 0; total_modules: int = 0
     selected_modules: int = 0; fatal_errors: int = 0
     flaws: FlawSummary = field(default_factory=FlawSummary)
@@ -158,6 +160,9 @@ class ScanResult:
             "Published": self.published, "Days Since Scan": self.days_since,
             "Duration": self.duration, "Engine": self.engine,
             "Analysis Size (MB)": self.analysis_size_mb,
+            "Veracode Score": self.va_score,
+            "Veracode Rating": self.va_rating,
+            "Policy Status": self.policy_status,
             "Total Upload Size (MB)": self.total_upload_mb,
             "Files Uploaded": self.files_uploaded,
             "Total Modules": self.total_modules,
@@ -510,6 +515,13 @@ class VeracodeClient:
             "scan_name": unescape(sa.get("version","")), "engine": sa.get("engine_version",""),
             "submitted": sa.get("submitted_date",""), "published": sa.get("published_date",""),
             "analysis_size": _si(sa.get("analysis_size_bytes","0")),
+            # Veracode's own severity-weighted, size-adjusted score for this
+            # scan, plus policy outcome. Same response, no extra API call.
+            # Parsed defensively: absent attributes yield None, never 0.
+            "va_score": _si_or_none(sa.get("score")),
+            "va_rating": (sa.get("rating") or "").strip(),
+            "policy_status": unescape(root.get("policy_compliance_status","") or ""),
+            "policy_name": unescape(root.get("policy_name","") or ""),
             "is_latest": root.get("is_latest_build","true").lower() == "true",
             "flaws": fl, "dr_modules": dr_mods,
             "sca_on": sca_on, "sca_comps": sca_comps,
@@ -1055,6 +1067,7 @@ def _process_build(client: VeracodeClient, app: dict, builds: list[dict],
               "analysis_id":"","sau_id":"","bu":"","app_name":app["name"],
               "scan_name":build.get("ver",""),"engine":"",
               "submitted":"","published":"","analysis_size":0,
+              "va_score":None,"va_rating":"","policy_status":"","policy_name":"",
               "is_latest":True,"flaws":fl,"dr_modules":[],"sca_on":False,"sca_comps":[]}
     else:
         fl = dr["flaws"]
@@ -1110,6 +1123,9 @@ def _process_build(client: VeracodeClient, app: dict, builds: list[dict],
         published=dr.get("published",""), days_since=ds if ds is not None else "N/A",
         duration=dur, engine=dr.get("engine",""),
         analysis_size_mb=round(asz/(1024*1024),2) if asz else 0,
+        va_score=dr.get("va_score") if dr.get("va_score") is not None else "",
+        va_rating=dr.get("va_rating",""),
+        policy_status=dr.get("policy_status",""), policy_name=dr.get("policy_name",""),
         total_upload_mb=round(total_upload/(1024*1024),2) if total_upload else 0,
         files_uploaded=len(files), total_modules=len(modules),
         selected_modules=len(sel), selected_names=sel_names[:500],
