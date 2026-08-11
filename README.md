@@ -99,7 +99,7 @@ python script.py --dashboard
 | `--log-level` | `INFO` | Logging level: `DEBUG`, `INFO`, or `WARNING` |
 | `--timeout` | `120` | Per-request HTTP timeout in seconds |
 | `--skip-checks` | None | Comma-separated check numbers to skip (e.g. `1,17,30`) |
-| `--dashboard` | `false` | Add the executive dashboard sheets. See [DASHBOARD.md](DASHBOARD.md) |
+| `--dashboard` | `false` | Add the executive dashboard sheets |
 | `--dashboard-output` | None | Dashboard workbook path. Only used with `--output-format csv` or `json` |
 
 ---
@@ -169,7 +169,7 @@ The tool runs 31 individual checks, each identified by number. All checks can be
 ### Excel (default)
 
 Seven sheets. `--dashboard` prepends three more, leaving these unchanged: **Executive
-Dashboard**, **App Heatmap** and **Issue Heatmap**. See [DASHBOARD.md](DASHBOARD.md).
+Dashboard**, **App Heatmap** and **Issue Heatmap**.
 
 1. **Scan Health Summary**: One row per app/sandbox. Includes health status, flaw breakdown, selected module names, SCA component count, scan age bucket, total upload size, health trend, issues, recommendations, platform URLs, and an open-flaw severity breakdown (Very High / High / Medium / Low) with a `Flaw Severity Data` availability flag. Health and Scan Age Bucket columns are conditionally formatted.
 
