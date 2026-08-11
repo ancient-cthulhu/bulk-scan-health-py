@@ -45,37 +45,37 @@ export VERACODE_API_KEY_SECRET=YOUR_API_KEY_SECRET
 
 ```bash
 # All apps, default Excel output
-python script.py
+python veracode_scan_health_tenant.py
 
 # Limit to the first 10 apps
-python script.py --max-apps 10
+python veracode_scan_health_tenant.py --max-apps 10
 
 # Filter to specific apps
-python script.py --app-name-filter "^MyApp.*"
+python veracode_scan_health_tenant.py --app-name-filter "^MyApp.*"
 
 # Include sandboxes, EU region
-python script.py --include-sandboxes --region eu
+python veracode_scan_health_tenant.py --include-sandboxes --region eu
 
 # Parallel execution with 4 workers
-python script.py --parallel 4 --delay 0.2
+python veracode_scan_health_tenant.py --parallel 4 --delay 0.2
 
 # JSON output
-python script.py --output-format json --output results.json
+python veracode_scan_health_tenant.py --output-format json --output results.json
 
 # Trend analysis against last week's report
-python script.py --previous-report last_week.xlsx
+python veracode_scan_health_tenant.py --previous-report last_week.xlsx
 
 # Resume a partial run
-python script.py --resume partial_output.xlsx
+python veracode_scan_health_tenant.py --resume partial_output.xlsx
 
 # Dry run (list apps only)
-python script.py --dry-run
+python veracode_scan_health_tenant.py --dry-run
 
 # Skip specific checks
-python script.py --skip-checks 1,17,30
+python veracode_scan_health_tenant.py --skip-checks 1,17,30
 
 # Executive dashboard (adds 3 sheets to the front of the workbook)
-python script.py --dashboard
+python veracode_scan_health_tenant.py --dashboard
 ```
 
 ---
@@ -99,7 +99,7 @@ python script.py --dashboard
 | `--log-level` | `INFO` | Logging level: `DEBUG`, `INFO`, or `WARNING` |
 | `--timeout` | `120` | Per-request HTTP timeout in seconds |
 | `--skip-checks` | None | Comma-separated check numbers to skip (e.g. `1,17,30`) |
-| `--dashboard` | `false` | Add the executive dashboard sheets |
+| `--dashboard` | `false` | Add the executive dashboard sheets. |
 | `--dashboard-output` | None | Dashboard workbook path. Only used with `--output-format csv` or `json` |
 
 ---
