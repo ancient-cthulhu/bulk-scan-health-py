@@ -20,7 +20,7 @@ import threading
 import xml.etree.ElementTree as ET
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from html import unescape
 from pathlib import Path
@@ -33,6 +33,11 @@ from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
+try:
+    import dashboard as _dash
+except ImportError:  # dashboard layer is optional; core scanning is unaffected
+    _dash = None
 
 log = logging.getLogger("scan_health")
 
@@ -125,6 +130,13 @@ CHECK_CATEGORIES: dict[int, str] = {
 class FlawSummary:
     total: int = 0; fixed: int = 0; pol_aff: int = 0
     mitigated: int = 0; open_pol: int = 0; open_nopol: int = 0
+    # Open (not fixed, not mitigated) flaws by Veracode severity level.
+    # 5 = Very High, 4 = High, 3 = Medium, 2/1/0 rolled up as Low.
+    # sev_available is False when the severity breakdown could not be derived,
+    # so the dashboard can render "unknown" rather than implying zero.
+    open_vhigh: int = 0; open_high: int = 0
+    open_med: int = 0; open_low: int = 0
+    sev_available: bool = False
 
 @dataclass
 class ScanResult:
@@ -161,6 +173,11 @@ class ScanResult:
             "Open Affecting Policy": self.flaws.open_pol,
             "Mitigated": self.flaws.mitigated, "Fixed": self.flaws.fixed,
             "Policy Affecting": self.flaws.pol_aff,
+            "Open Very High Flaws": self.flaws.open_vhigh,
+            "Open High Flaws": self.flaws.open_high,
+            "Open Medium Flaws": self.flaws.open_med,
+            "Open Low Flaws": self.flaws.open_low,
+            "Flaw Severity Data": "Available" if self.flaws.sev_available else "Unavailable",
             "SCA Components": self.sca_count,
             "Scan Age Bucket": self.age_bucket,
             "Health": self.health, "Health Trend": self.health_trend,
@@ -471,6 +488,15 @@ class VeracodeClient:
             elif is_miti: fl.mitigated += 1
             elif apc: fl.open_pol += 1
             else: fl.open_nopol += 1
+            # Severity breakdown of OPEN flaws only. Same XML, no extra API call.
+            if not is_fixed and not is_miti:
+                sev = _si(f.get("severity"), -1)
+                if sev == 5: fl.open_vhigh += 1
+                elif sev == 4: fl.open_high += 1
+                elif sev == 3: fl.open_med += 1
+                elif sev >= 0: fl.open_low += 1
+        # Only claim the breakdown is usable if we actually walked flaw elements.
+        fl.sev_available = fl.total > 0
         if fl.total == 0:
             fl.total = _si(root.get("total_flaws","0"))
             fl.open_pol = _si(root.get("flaws_not_mitigated","0"))
@@ -1230,6 +1256,29 @@ def _load_previous(path: str) -> dict[tuple[str, str], dict]:
     return data
 
 
+def _load_previous_agg(path: str) -> dict[int, int]:
+    """Read 'Check # -> Apps Affected' from a prior report's Tenant Aggregation
+    sheet so the dashboard can trend each health check over time. Optional: an
+    older report without that sheet simply yields no baseline."""
+    counts: dict[int, int] = {}
+    try:
+        wb = load_workbook(path, read_only=True)
+        if "Tenant Aggregation" not in wb.sheetnames:
+            wb.close(); return counts
+        ws = wb["Tenant Aggregation"]
+        headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        ci = headers.index("Check #") if "Check #" in headers else -1
+        ai = headers.index("Apps Affected") if "Apps Affected" in headers else -1
+        if ci >= 0 and ai >= 0:
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                n = _si(row[ci], -1)
+                if n > 0: counts[n] = _si(row[ai])
+        wb.close()
+    except Exception as e:
+        log.debug("Could not load previous aggregation: %s", e)
+    return counts
+
+
 # ==========================================================================
 # Output
 # ==========================================================================
@@ -1362,7 +1411,8 @@ def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict
 
 
 def write_excel(health: list[dict], mods: list[dict], files: list[dict],
-                recs: list[dict], trends: list[dict], agg: list[dict], path: str) -> None:
+                recs: list[dict], trends: list[dict], agg: list[dict], path: str,
+                dash_bundle: dict | None = None) -> None:
     wb=Workbook()
     ws=wb.active; ws.title="Scan Health Summary"
     if not health: ws["A1"]="No data."; wb.save(path); return
@@ -1391,6 +1441,14 @@ def write_excel(health: list[dict], mods: list[dict], files: list[dict],
     for ri,(k,v) in enumerate(stats,2):
         wso.cell(row=ri,column=1,value=k).font=_BF; wso.cell(row=ri,column=2,value=v).font=_DF
         for c in (1,2): wso.cell(row=ri,column=c).border=_BD; wso.cell(row=ri,column=c).alignment=_CA
+    # Executive Dashboard / heatmaps are prepended; the seven sheets above are untouched.
+    if dash_bundle and _dash is not None:
+        try:
+            _dash.write_dashboard_sheets(wb, dash_bundle["apps"], dash_bundle["issues"],
+                                         dash_bundle["metrics"], dash_bundle["tenant_trend"],
+                                         dash_bundle["issue_rows"], dash_bundle["config"])
+        except Exception as e:
+            log.warning("Dashboard sheet generation failed, core report unaffected: %s", e)
     wb.save(path); log.info("[+] Report saved: %s", path)
 
 
@@ -1422,51 +1480,6 @@ def write_json(health: list[dict], mods: list[dict], files: list[dict],
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, default=str)
     log.info("[+] JSON: %s", path)
-
-
-# ==========================================================================
-# Self-test
-# ==========================================================================
-
-def _self_test() -> None:
-    """Run checks against a mock fixture and verify expected results."""
-    files = [
-        {"name": "app.jar", "status": "OK", "md5": "aaa", "is_ignored": False, "is_third_party": False},
-        {"name": "Thumbs.db", "status": "OK", "md5": "bbb", "is_ignored": False, "is_third_party": False},
-        {"name": "secret.pem", "status": "OK", "md5": "ccc", "is_ignored": False, "is_third_party": False},
-        {"name": "nested.zip", "status": "Archive File Within Another Archive", "md5": "ddd", "is_ignored": False, "is_third_party": False},
-        {"name": "app.java", "status": "OK", "md5": "eee", "is_ignored": False, "is_third_party": False},
-    ]
-    modules = [
-        {"name": "app.jar", "status": "OK", "platform": "Java", "size": "5MB", "md5": "aaa",
-         "has_fatal": False, "is_dep": False, "issues": [], "is_selected": True,
-         "is_ignored": False, "is_third_party": False, "compiler": "", "os": "", "arch": ""},
-        {"name": "lib.jar", "status": "OK", "platform": "Java", "size": "2MB", "md5": "fff",
-         "has_fatal": False, "is_dep": True, "issues": [], "is_selected": True,
-         "is_ignored": False, "is_third_party": False, "compiler": "", "os": "", "arch": ""},
-    ]
-    flaws = FlawSummary(total=5, open_pol=2, mitigated=1, fixed=2, pol_aff=3)
-    issues, recs = run_checks(files, modules, flaws, {"analysis_size": 100},
-                              False, [], "2020-01-01 00:00:00 UTC")
-
-    checks_triggered = set()
-    for i in issues:
-        d = i.description.lower()
-        if "thumbs.db" in d or "unnecessary" in d: checks_triggered.add(1)
-        if "secret" in d or "sensitive" in d or ".pem" in d: checks_triggered.add(16)
-        if "nested" in d: checks_triggered.add(7)
-        if "java source" in d: checks_triggered.add(11)
-        if "dependency" in d or "dependenc" in d: checks_triggered.add(26)
-        if "not scanned recently" in d or "not been recent" in d: checks_triggered.add(30)
-
-    expected = {1, 7, 11, 16, 26, 30}
-    missing = expected - checks_triggered
-    if missing:
-        print(f"FAIL: expected checks {missing} not triggered")
-        print(f"Issues found: {[i.description for i in issues]}")
-        raise SystemExit(1)
-    print(f"PASS: {len(issues)} issues, {len(recs)} recommendations. Checks triggered: {sorted(checks_triggered)}")
-    raise SystemExit(0)
 
 
 # ==========================================================================
@@ -1510,15 +1523,16 @@ def main() -> None:
     p.add_argument("--log-level", choices=["DEBUG","INFO","WARNING"], default="INFO")
     p.add_argument("--timeout", type=int, default=120)
     p.add_argument("--skip-checks", default=None, help="Comma-separated check numbers to skip")
-    p.add_argument("--self-test", action="store_true")
+    p.add_argument("--dashboard", action="store_true",
+                   help="Generate the executive dashboard (heatmaps, KPIs, attention scores)")
+    p.add_argument("--dashboard-output", default=None,
+                   help="Dashboard workbook path. Only used when --output-format is csv or "
+                        "json; with xlsx the dashboard sheets are added to the main report")
     args = p.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S",
                         force=True)
-
-    if args.self_test:
-        _self_test()
 
     skip_checks: set[int] = set()
     if args.skip_checks:
@@ -1607,13 +1621,34 @@ def main() -> None:
             log.info("\n[*] Writing %d health / %d module / %d file / %d rec / %d trend rows...",
                      len(h_rows), len(m_rows), len(f_rows), len(r_rows), len(t_rows))
 
+            # Dashboard layer: consumes the rows already built above. No extra API calls.
+            bundle = None
+            if args.dashboard:
+                if _dash is None:
+                    log.warning("[!] --dashboard requested but dashboard.py is not importable")
+                else:
+                    bundle = _dash.generate_dashboard(
+                        health_rows=h_rows, issue_records=[asdict(a) for a in all_ai],
+                        prev_rows=prev_data, check_categories=CHECK_CATEGORIES,
+                        prev_issue_counts=(_load_previous_agg(args.previous_report)
+                                           if args.previous_report else None))
+                    log.info("[*] Dashboard: %d profiles scored, %d structured issues",
+                             len(bundle["apps"]), len(bundle["issues"]))
+
             fmt = args.output_format
             if fmt == "xlsx":
-                write_excel(h_rows, m_rows, f_rows, r_rows, t_rows, agg, args.output)
+                write_excel(h_rows, m_rows, f_rows, r_rows, t_rows, agg, args.output,
+                            dash_bundle=bundle)
             elif fmt == "csv":
                 write_csv(h_rows, m_rows, f_rows, r_rows, t_rows, agg, args.output)
             elif fmt == "json":
                 write_json(h_rows, m_rows, f_rows, t_rows, args.output)
+
+            # For csv/json the dashboard has nowhere to live, so it gets its own workbook.
+            if bundle is not None and fmt != "xlsx":
+                xp = args.dashboard_output or f"{Path(args.output).with_suffix('')}_dashboard.xlsx"
+                _dash.write_dashboard_xlsx(xp, bundle)
+                log.info("[+] Dashboard workbook: %s", xp)
 
             _print_summary(h_rows)
 
