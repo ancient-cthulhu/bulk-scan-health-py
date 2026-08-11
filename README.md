@@ -53,6 +53,9 @@ python script.py --max-apps 10
 # Filter to specific apps
 python script.py --app-name-filter "^MyApp.*"
 
+# Include sandboxes, EU region
+python script.py --include-sandboxes --region eu
+
 # Parallel execution with 4 workers
 python script.py --parallel 4 --delay 0.2
 
@@ -108,10 +111,12 @@ python script.py --dashboard
 | Sheet | Contents |
 |---|---|
 | **Executive Dashboard** | KPI cards, health distribution, attention bands, priority matrix, top organisational issues, tenant trend, applications requiring attention |
-| **App Heatmap** | One row per profile, colour-coded, autofilter and frozen panes |
+| **App Heatmap** | One row per profile: health, scan age, Veracode score/rating, policy status, flaw severity breakdown, density, and the basis behind each rating. Autofilter and frozen panes |
 | **Issue Heatmap** | All 31 checks with prevalence, severity, and trend |
 
 Each application gets an **Attention Score** (0-100) for prioritisation. It does not replace the Good/Fair/Poor classification, and it is explainable: every score lists its drivers (e.g. `Scan health is POOR (+27); 7 open very-high flaws (+23); scan is 260 days old (+18)`). Thresholds and weights are configurable in `DASHBOARD_CONFIG`.
+
+Findings risk is an absolute severity floor plus a size-aware volume signal. The floor means an open Very High is never green regardless of application size. For volume, the tool uses Veracode's own scan score and rating when the scan reports them, since those are already severity-weighted and size-adjusted; otherwise it falls back to severity-weighted open flaws (VH 10, H 5, M 1, L 0.1) divided by `analysis_size_bytes`, so a large app is not penalised for being large. Every application records the signal that classified it in `Findings Basis`. Policy compliance status is reported alongside, with unknown outcomes excluded from the pass rate rather than counted as failures. All thresholds and the density basis are configurable.
 
 Scan health and security findings are shown as separate dimensions. A healthy scan does not mean an application has no vulnerabilities, and poor scan health with a low flaw count is not evidence of safety. Applications with no published scan are reported as Unknown in grey, never as healthy.
 
