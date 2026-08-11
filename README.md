@@ -45,37 +45,37 @@ export VERACODE_API_KEY_SECRET=YOUR_API_KEY_SECRET
 
 ```bash
 # All apps, default Excel output
-python veracode_scan_health_tenant.py
+python script.py
 
 # Limit to the first 10 apps
-python veracode_scan_health_tenant.py --max-apps 10
+python script.py --max-apps 10
 
 # Filter to specific apps
-python veracode_scan_health_tenant.py --app-name-filter "^MyApp.*"
+python script.py --app-name-filter "^MyApp.*"
 
 # Include sandboxes, EU region
-python veracode_scan_health_tenant.py --include-sandboxes --region eu
+python script.py --include-sandboxes --region eu
 
 # Parallel execution with 4 workers
-python veracode_scan_health_tenant.py --parallel 4 --delay 0.2
+python script.py --parallel 4 --delay 0.2
 
 # JSON output
-python veracode_scan_health_tenant.py --output-format json --output results.json
+python script.py --output-format json --output results.json
 
 # Trend analysis against last week's report
-python veracode_scan_health_tenant.py --previous-report last_week.xlsx
+python script.py --previous-report last_week.xlsx
 
 # Resume a partial run
-python veracode_scan_health_tenant.py --resume partial_output.xlsx
+python script.py --resume partial_output.xlsx
 
 # Dry run (list apps only)
-python veracode_scan_health_tenant.py --dry-run
+python script.py --dry-run
 
 # Skip specific checks
-python veracode_scan_health_tenant.py --skip-checks 1,17,30
+python script.py --skip-checks 1,17,30
 
 # Executive dashboard (adds 3 sheets to the front of the workbook)
-python veracode_scan_health_tenant.py --dashboard
+python script.py --dashboard
 ```
 
 ---
