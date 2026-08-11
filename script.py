@@ -465,18 +465,13 @@ class VeracodeClient:
         self._s = requests.Session()
         self._s.auth = RequestsAuthPluginVeracodeHMAC()
         self._s.headers["User-Agent"] = "veracode-scan-health-py/3.0"
-
-        # Retries are deliberately patient: a rate-limit window commonly lasts
-        # longer than the few seconds a 3-retry/1.0-factor schedule survives.
-        # respect_retry_after_header is on by default; set explicitly so the
-        # intent survives future edits.
+                     
         retry = Retry(total=max_retries, backoff_factor=backoff_factor,
                       status_forcelist=(429, 500, 502, 503, 504),
                       allowed_methods=("GET",),
                       respect_retry_after_header=True,
                       raise_on_status=False)
-        # Default pool_maxsize is 10; above that, urllib3 discards connections
-        # and silently loses keep-alive, which matters on large tenants.
+        # Default pool_maxsize is 10
         pool = max(10, pool_size)
         self._s.mount("https://", HTTPAdapter(max_retries=retry,
                                               pool_connections=pool, pool_maxsize=pool))
@@ -517,10 +512,7 @@ class VeracodeClient:
     def _note_throttle(self, resp: requests.Response) -> None:
         """React to a rate-limit response by slowing the whole client down.
 
-        urllib3 already retries the individual request. This adds the missing
-        piece: a tenant-wide cooldown plus a persistent increase to the pacing
-        interval, so every other worker also eases off instead of continuing to
-        hammer the endpoint in lockstep.
+        urllib3 already retries the individual request.
         """
         if resp.status_code not in (429, 503):
             return
@@ -531,8 +523,6 @@ class VeracodeClient:
                 60.0, 2.0 * max(self._rate_delay, 0.5) * self.throttle_events)
             self._cooldown_until = max(self._cooldown_until,
                                        time.monotonic() + cooldown)
-            # Ratchet the steady-state interval up; it is never lowered again
-            # within a run, since we have evidence the original rate was too high.
             self._rate_delay = min(5.0, max(self._rate_delay * 1.5, 0.2))
             new_delay = self._rate_delay
         log.warning("[!] Rate limited (HTTP %d)%s. Pausing %.1fs and increasing "
