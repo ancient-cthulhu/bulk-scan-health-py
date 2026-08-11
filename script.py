@@ -54,6 +54,23 @@ REGIONS: dict[str, dict[str, str]] = {
     "eu":         {"base": "https://analysiscenter.veracode.eu",  "xml": "https://analysiscenter.veracode.eu/api/5.0",  "rest": "https://api.veracode.eu/appsec/v1"},
 }
 
+# Statuses worth retrying. 520-524 are Cloudflare-specific and mean the edge
+# could not get a good response from the origin, which is exactly what an
+# overloaded platform looks like from the outside. They are not standard HTTP,
+# so urllib3 does not retry them by default.
+RETRY_STATUSES = (408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
+
+# Statuses that should slow the whole client down, not just retry the one
+# request. Any of these means we are part of the problem: either we are being
+# rate limited, or the origin is struggling and more traffic will not help.
+THROTTLE_STATUSES = (429, 503, 520, 521, 522, 523, 524)
+
+# Cloudflare error codes that appear in the body of a 403 when a WAF rule or
+# rate limit fires. These are NOT credential problems.
+_CF_BLOCK_MARKERS = ("error 1015", "error 1020", "error 1010", "error 1012",
+                     "attention required", "cloudflare", "cf-ray",
+                     "checking your browser", "just a moment")
+
 _NS = re.compile(r'\sxmlns="[^"]+"')
 _NS_B = re.compile(rb'\sxmlns="[^"]+"')
 _DT_FMTS = ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S UTC")
@@ -446,6 +463,11 @@ def _fancy_match_modules(modules: list[dict], patterns: list[str], selected_only
 # API Client
 # ==========================================================================
 
+class EdgeBlockError(Exception):
+    """Blocked by a CDN/WAF layer rather than the API. Retryable; not an auth
+    failure, so it must not abort the whole run."""
+
+
 class AuthError(Exception):
     """Raised on 401/403 to signal credential issues."""
 
@@ -459,7 +481,8 @@ class VeracodeClient:
 
     def __init__(self, region: str = "commercial", timeout: int = 120,
                  pool_size: int = 10, rate_delay: float = 0.15,
-                 max_retries: int = 8, backoff_factor: float = 2.0) -> None:
+                 max_retries: int = 8, backoff_factor: float = 2.0,
+                 breaker_threshold: int = 15) -> None:
         self._cfg = REGIONS[region]
         self._timeout = timeout
         self._s = requests.Session()
@@ -470,8 +493,22 @@ class VeracodeClient:
         # longer than the few seconds a 3-retry/1.0-factor schedule survives.
         # respect_retry_after_header is on by default; set explicitly so the
         # intent survives future edits.
-        retry = Retry(total=max_retries, backoff_factor=backoff_factor,
-                      status_forcelist=(429, 500, 502, 503, 504),
+        # Retry budgets are deliberately asymmetric.
+        #
+        # A rate-limit *status* means the server is up and telling us to slow
+        # down, so being patient is correct and costs almost no bandwidth.
+        #
+        # A connect/read *failure* means the network path itself is degraded.
+        # Retrying hard there amplifies traffic on an already-saturated link:
+        # detailedreport.do responses are megabytes, and a retry re-sends the
+        # whole thing. That is a congestion feedback loop, so connect/read get
+        # a much smaller budget than status.
+        retry = Retry(total=max_retries,
+                      status=max_retries,
+                      connect=min(2, max_retries),
+                      read=min(2, max_retries),
+                      backoff_factor=backoff_factor,
+                      status_forcelist=RETRY_STATUSES,
                       allowed_methods=("GET",),
                       respect_retry_after_header=True,
                       raise_on_status=False)
@@ -487,8 +524,12 @@ class VeracodeClient:
         self._next_slot = 0.0
         self._rate_lock = threading.Lock()
         self._cooldown_until = 0.0
-        self.throttle_events = 0        # observed 429/503 responses
+        self.throttle_events = 0        # observed rate-limit responses
+        self.network_failures = 0       # timeouts / resets / dropped connections
         self.request_count = 0
+        self._consecutive_failures = 0
+        self._breaker_threshold = max(1, breaker_threshold)
+        self._breaker_open = threading.Event()
 
     # ------------------------------------------------------------------
     # Pacing
@@ -522,7 +563,7 @@ class VeracodeClient:
         interval, so every other worker also eases off instead of continuing to
         hammer the endpoint in lockstep.
         """
-        if resp.status_code not in (429, 503):
+        if resp.status_code not in THROTTLE_STATUSES:
             return
         retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
         with self._rate_lock:
@@ -543,24 +584,85 @@ class VeracodeClient:
 
     def _get(self, url: str, params: dict | None) -> requests.Response:
         self._pace()
-        r = self._s.get(url, params=params, timeout=self._timeout)
+        try:
+            r = self._s.get(url, params=params, timeout=self._timeout)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            # A network-level failure never produces a response, so it would
+            # otherwise bypass the throttle logic entirely: the client would
+            # keep firing at full rate into a degraded link. Treat it as a
+            # pushback signal, exactly like a 429.
+            self._note_network_failure(e)
+            raise
         with self._rate_lock:
             self.request_count += 1
-        if r.status_code in (429, 503):
+            self._consecutive_failures = 0
+        if r.status_code in THROTTLE_STATUSES:
             self._note_throttle(r)
         return r
+
+    def _note_network_failure(self, exc: Exception) -> None:
+        """Back off when the network path degrades.
+
+        Timeouts and resets are how saturation presents when there is no
+        rate-limit response to read (a proxy, VPN, or WAF in front of the API
+        may simply drop traffic). Without this, the tool cannot distinguish a
+        congested link from a healthy one and keeps adding load.
+        """
+        with self._rate_lock:
+            self.network_failures += 1
+            self._consecutive_failures += 1
+            consec = self._consecutive_failures
+            cooldown = min(120.0, 5.0 * consec)
+            self._cooldown_until = max(self._cooldown_until,
+                                       time.monotonic() + cooldown)
+            self._rate_delay = min(5.0, max(self._rate_delay * 1.5, 0.2))
+            new_delay = self._rate_delay
+            tripped = consec >= self._breaker_threshold
+        log.warning("[!] Network failure (%s). Pausing %.1fs and increasing request "
+                    "spacing to %.2fs (%d consecutive).",
+                    type(exc).__name__, cooldown, new_delay, consec)
+        if tripped and not self._breaker_open.is_set():
+            self._breaker_open.set()
+            log.error("[!] CIRCUIT BREAKER: %d consecutive network failures. The network "
+                      "path or platform appears to be degraded. Stopping to avoid adding "
+                      "further load. Partial results will be written; re-run with "
+                      "--resume to continue.", consec)
+
+    @property
+    def breaker_tripped(self) -> bool:
+        """True once repeated network failures indicate a degraded path."""
+        return self._breaker_open.is_set()
 
     def close(self) -> None: self._s.close()
     def __enter__(self) -> "VeracodeClient": return self
     def __exit__(self, *a: object) -> None: self.close()
 
     def _check_auth(self, resp: requests.Response) -> None:
-        if resp.status_code in (401, 403):
-            body = resp.text[:200] if resp.text else ""
-            raise AuthError(
-                f"HTTP {resp.status_code} from {resp.url}. "
-                f"API credentials may be expired or lack required permissions. "
-                f"Response: {body}")
+        """Distinguish a real credential problem from an edge/WAF block.
+
+        A 403 from Cloudflare (WAF rule, rate limit 1015, browser challenge) is
+        NOT an authentication failure, but it was previously reported as
+        "credentials may be expired" and aborted the entire run. That is both a
+        misleading diagnosis and the wrong reaction: the correct response to a
+        WAF block is to slow down and retry, not to stop and blame the API keys.
+        """
+        if resp.status_code not in (401, 403):
+            return
+        body = resp.text[:500] if resp.text else ""
+        low = body.lower()
+        if resp.status_code == 403 and any(m in low for m in _CF_BLOCK_MARKERS):
+            raise EdgeBlockError(
+                f"HTTP 403 from {resp.url} was returned by an edge/WAF layer "
+                f"(Cloudflare), not by the Veracode API. This usually means we are "
+                f"sending requests too quickly or tripping a protection rule. "
+                f"Credentials are most likely fine. Reduce --parallel and raise "
+                f"--request-delay. Response: {body[:200]}")
+        raise AuthError(
+            f"HTTP {resp.status_code} from {resp.url}. "
+            f"API credentials may be expired or lack required permissions. "
+            f"Response: {body[:200]}")
 
     def _xml(self, ep: str, params: dict | None = None) -> ET.Element:
         r = self._get(f"{self._cfg['xml']}/{ep}", params)
@@ -3547,6 +3649,10 @@ def main() -> None:
                    help="Retry attempts for 429/5xx responses (default 8)")
     p.add_argument("--retry-backoff", type=float, default=2.0,
                    help="Exponential backoff factor between retries (default 2.0)")
+    p.add_argument("--max-network-failures", type=int, default=15,
+                   help="Consecutive network failures (timeouts/resets) before the run "
+                        "stops to avoid loading a degraded network path (default 15). "
+                        "Partial results are still written; use --resume to continue.")
     p.add_argument("--delay", type=float, default=0.5,
                    help="Seconds between applications. Note: paces applications, not "
                         "individual requests; use --request-delay to throttle the API.")
@@ -3580,6 +3686,8 @@ def main() -> None:
         p.error("--max-retries must be >= 0")
     if args.retry_backoff < 0:
         p.error("--retry-backoff must be >= 0")
+    if args.max_network_failures < 1:
+        p.error("--max-network-failures must be >= 1")
     if args.timeout < 1:
         p.error("--timeout must be >= 1")
     if args.max_apps < 0:
@@ -3626,7 +3734,8 @@ def main() -> None:
                             pool_size=max(10, args.parallel * 2),
                             rate_delay=args.request_delay,
                             max_retries=args.max_retries,
-                            backoff_factor=args.retry_backoff) as client:
+                            backoff_factor=args.retry_backoff,
+                            breaker_threshold=args.max_network_failures) as client:
             log.info("[*] Region: %s", args.region)
             apps = client.get_apps()
             log.info("[*] Found %d apps", len(apps))
@@ -3660,6 +3769,9 @@ def main() -> None:
 
             def _do_app(idx_app: tuple[int, dict]) -> None:
                 if stop.is_set():
+                    return
+                if client.breaker_tripped:
+                    stop.set()
                     return
                 idx, app = idx_app
                 log.info("[%d/%d] %s (id=%s)", idx, len(apps), app["name"], app.get("legacy_id"))
@@ -3714,7 +3826,7 @@ def main() -> None:
                     pool.shutdown(wait=True, cancel_futures=True)
             else:
                 for i, app in enumerate(apps, 1):
-                    if stop.is_set(): break
+                    if stop.is_set() or client.breaker_tripped: break
                     _do_app((i, app))
 
             # Build output rows
@@ -3754,6 +3866,14 @@ def main() -> None:
                 write_dashboard_xlsx(xp, bundle)
                 log.info("[+] Dashboard workbook: %s", xp)
 
+            if client.breaker_tripped:
+                log.error("[!] Run STOPPED EARLY by the circuit breaker after repeated "
+                          "network failures. The report below is PARTIAL. Re-run with "
+                          "--resume once the network path is healthy.")
+            if client.network_failures:
+                log.warning("[!] %d network failure(s) (timeouts/resets) during this run. "
+                            "These indicate a degraded path rather than API rate limiting.",
+                            client.network_failures)
             if client.throttle_events:
                 log.warning("[!] Rate limited %d time(s) during this run; final request "
                             "spacing was %.2fs across %d requests. Consider raising "
