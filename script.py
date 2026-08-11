@@ -267,6 +267,30 @@ class AggIssue:
 _FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
 
 
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header. RFC 9110 permits either delay-seconds or an
+    HTTP-date, and Veracode may send either, so both are handled. Returns None
+    when absent or unparseable, and clamps to a sane ceiling so a malformed or
+    hostile value cannot stall the run for hours."""
+    if not value:
+        return None
+    v = value.strip()
+    try:
+        return max(0.0, min(float(v), 300.0))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(v)
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, min((dt - datetime.now(timezone.utc)).total_seconds(), 300.0))
+    except Exception:
+        return None
+
+
 def _safe_cell(v: object) -> object:
     """Neutralise spreadsheet formula injection.
 
@@ -426,21 +450,105 @@ class AuthError(Exception):
     """Raised on 401/403 to signal credential issues."""
 
 class VeracodeClient:
+    """Veracode API client with request-level pacing and adaptive backoff.
+
+    Pacing is applied per HTTP request, not per application. Each application
+    costs 6+ calls, so spacing only the applications leaves every call inside an
+    application unthrottled, which is what overwhelms the API on large tenants.
+    """
+
     def __init__(self, region: str = "commercial", timeout: int = 120,
-                 pool_size: int = 10) -> None:
+                 pool_size: int = 10, rate_delay: float = 0.15,
+                 max_retries: int = 8, backoff_factor: float = 2.0) -> None:
         self._cfg = REGIONS[region]
         self._timeout = timeout
         self._s = requests.Session()
         self._s.auth = RequestsAuthPluginVeracodeHMAC()
         self._s.headers["User-Agent"] = "veracode-scan-health-py/3.0"
-        retry = Retry(total=3, backoff_factor=1.0,
+
+        # Retries are deliberately patient: a rate-limit window commonly lasts
+        # longer than the few seconds a 3-retry/1.0-factor schedule survives.
+        # respect_retry_after_header is on by default; set explicitly so the
+        # intent survives future edits.
+        retry = Retry(total=max_retries, backoff_factor=backoff_factor,
                       status_forcelist=(429, 500, 502, 503, 504),
-                      allowed_methods=("GET",))
+                      allowed_methods=("GET",),
+                      respect_retry_after_header=True,
+                      raise_on_status=False)
         # Default pool_maxsize is 10; above that, urllib3 discards connections
         # and silently loses keep-alive, which matters on large tenants.
         pool = max(10, pool_size)
         self._s.mount("https://", HTTPAdapter(max_retries=retry,
                                               pool_connections=pool, pool_maxsize=pool))
+
+        # --- request pacing and adaptive throttle state
+        self._rate_delay = max(0.0, rate_delay)
+        self._base_delay = max(0.0, rate_delay)
+        self._next_slot = 0.0
+        self._rate_lock = threading.Lock()
+        self._cooldown_until = 0.0
+        self.throttle_events = 0        # observed 429/503 responses
+        self.request_count = 0
+
+    # ------------------------------------------------------------------
+    # Pacing
+    # ------------------------------------------------------------------
+    def _pace(self) -> None:
+        """Space outbound requests globally across all worker threads.
+
+        Reserves the next time slot under a short-lived lock, then sleeps
+        outside it, so workers are paced without being serialised.
+        """
+        while True:
+            with self._rate_lock:
+                now = time.monotonic()
+                start_at = max(now, self._next_slot, self._cooldown_until)
+                if self._rate_delay > 0 or start_at > now:
+                    self._next_slot = start_at + self._rate_delay
+                wait = start_at - now
+            if wait <= 0:
+                return
+            time.sleep(wait)
+            # Re-check: a 429 may have extended the cooldown while we slept.
+            with self._rate_lock:
+                if time.monotonic() >= self._cooldown_until:
+                    return
+
+    def _note_throttle(self, resp: requests.Response) -> None:
+        """React to a rate-limit response by slowing the whole client down.
+
+        urllib3 already retries the individual request. This adds the missing
+        piece: a tenant-wide cooldown plus a persistent increase to the pacing
+        interval, so every other worker also eases off instead of continuing to
+        hammer the endpoint in lockstep.
+        """
+        if resp.status_code not in (429, 503):
+            return
+        retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+        with self._rate_lock:
+            self.throttle_events += 1
+            cooldown = retry_after if retry_after is not None else min(
+                60.0, 2.0 * max(self._rate_delay, 0.5) * self.throttle_events)
+            self._cooldown_until = max(self._cooldown_until,
+                                       time.monotonic() + cooldown)
+            # Ratchet the steady-state interval up; it is never lowered again
+            # within a run, since we have evidence the original rate was too high.
+            self._rate_delay = min(5.0, max(self._rate_delay * 1.5, 0.2))
+            new_delay = self._rate_delay
+        log.warning("[!] Rate limited (HTTP %d)%s. Pausing %.1fs and increasing "
+                    "request spacing to %.2fs (throttle event #%d).",
+                    resp.status_code,
+                    f", Retry-After: {retry_after:g}s" if retry_after is not None else "",
+                    cooldown, new_delay, self.throttle_events)
+
+    def _get(self, url: str, params: dict | None) -> requests.Response:
+        self._pace()
+        r = self._s.get(url, params=params, timeout=self._timeout)
+        with self._rate_lock:
+            self.request_count += 1
+        if r.status_code in (429, 503):
+            self._note_throttle(r)
+        return r
 
     def close(self) -> None: self._s.close()
     def __enter__(self) -> "VeracodeClient": return self
@@ -455,7 +563,7 @@ class VeracodeClient:
                 f"Response: {body}")
 
     def _xml(self, ep: str, params: dict | None = None) -> ET.Element:
-        r = self._s.get(f"{self._cfg['xml']}/{ep}", params=params, timeout=self._timeout)
+        r = self._get(f"{self._cfg['xml']}/{ep}", params)
         self._check_auth(r)
         r.raise_for_status()
         # Parse bytes, not r.text: the XML declaration is authoritative, while
@@ -464,7 +572,7 @@ class VeracodeClient:
         return ET.fromstring(_NS_B.sub(b"", r.content, count=0))
 
     def _rest(self, path: str, params: dict | None = None) -> dict:
-        r = self._s.get(f"{self._cfg['rest']}{path}", params=params, timeout=self._timeout)
+        r = self._get(f"{self._cfg['rest']}{path}", params)
         self._check_auth(r)
         r.raise_for_status()
         return r.json()
@@ -3430,7 +3538,18 @@ def main() -> None:
     p.add_argument("--output", default=f"scan_health_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
     p.add_argument("--output-format", choices=["xlsx","csv","json"], default="xlsx")
     p.add_argument("--max-apps", type=int, default=0)
-    p.add_argument("--delay", type=float, default=0.5)
+    p.add_argument("--request-delay", type=float, default=0.15,
+                   help="Seconds between individual API requests, applied globally across "
+                        "all workers (default 0.15, about 6-7 requests/sec). This is the "
+                        "setting that throttles the API: each application costs 6+ requests. "
+                        "Raise it to be gentler; 0 disables pacing entirely (not recommended).")
+    p.add_argument("--max-retries", type=int, default=8,
+                   help="Retry attempts for 429/5xx responses (default 8)")
+    p.add_argument("--retry-backoff", type=float, default=2.0,
+                   help="Exponential backoff factor between retries (default 2.0)")
+    p.add_argument("--delay", type=float, default=0.5,
+                   help="Seconds between applications. Note: paces applications, not "
+                        "individual requests; use --request-delay to throttle the API.")
     p.add_argument("--skip-no-scan", action="store_true")
     p.add_argument("--include-sandboxes", action="store_true")
     p.add_argument("--region", choices=["commercial","eu"], default="commercial")
@@ -3455,6 +3574,12 @@ def main() -> None:
         p.error("--parallel must be >= 1")
     if args.delay < 0:
         p.error("--delay must be >= 0")
+    if args.request_delay < 0:
+        p.error("--request-delay must be >= 0")
+    if args.max_retries < 0:
+        p.error("--max-retries must be >= 0")
+    if args.retry_backoff < 0:
+        p.error("--retry-backoff must be >= 0")
     if args.timeout < 1:
         p.error("--timeout must be >= 1")
     if args.max_apps < 0:
@@ -3498,7 +3623,10 @@ def main() -> None:
 
     try:
         with VeracodeClient(args.region, timeout=args.timeout,
-                            pool_size=max(10, args.parallel * 2)) as client:
+                            pool_size=max(10, args.parallel * 2),
+                            rate_delay=args.request_delay,
+                            max_retries=args.max_retries,
+                            backoff_factor=args.retry_backoff) as client:
             log.info("[*] Region: %s", args.region)
             apps = client.get_apps()
             log.info("[*] Found %d apps", len(apps))
@@ -3508,6 +3636,12 @@ def main() -> None:
                 log.info("[*] Filtered to %d apps", len(apps))
             if args.max_apps:
                 apps = apps[:args.max_apps]
+
+            if args.request_delay <= 0 and len(apps) > 100:
+                log.warning("[!] --request-delay is 0, so %d applications (~%d API requests) "
+                            "will be sent with no pacing. This can overload the platform. "
+                            "Consider --request-delay 0.15 or higher.",
+                            len(apps), len(apps) * 6)
 
             if args.dry_run:
                 print(f"Would process {len(apps)} apps:")
@@ -3620,6 +3754,11 @@ def main() -> None:
                 write_dashboard_xlsx(xp, bundle)
                 log.info("[+] Dashboard workbook: %s", xp)
 
+            if client.throttle_events:
+                log.warning("[!] Rate limited %d time(s) during this run; final request "
+                            "spacing was %.2fs across %d requests. Consider raising "
+                            "--request-delay or lowering --parallel next time.",
+                            client.throttle_events, client._rate_delay, client.request_count)
             if failures:
                 log.warning("[!] %d application(s) could not be retrieved and are marked "
                             "'Error' in the report (not 'No Scan'): %s",
