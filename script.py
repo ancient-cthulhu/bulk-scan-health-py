@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import re
 import time
 import logging
@@ -260,6 +261,17 @@ class AggIssue:
 # ==========================================================================
 # Helpers
 # ==========================================================================
+
+def _si_or_none(v: object) -> int | None:
+    """Int or None. Distinguishes 'absent' from 'zero', which matters for any
+    Veracode-supplied score where 0 is a real and very bad value."""
+    if v is None or v == "":
+        return None
+    try:
+        return int(float(v))
+    except (ValueError, TypeError):
+        return None
+
 
 def _si(v: object, d: int = 0) -> int:
     try: return int(v)
@@ -1528,12 +1540,47 @@ DASHBOARD_CONFIG: dict[str, Any] = {
     # Security-findings thresholds. Applied to OPEN flaws (not fixed, not
     # mitigated). "very_high" is Veracode severity 5, "high" is severity 4.
     "flaws": {
-        "very_high_yellow": 1,   # >= this -> at least YELLOW
-        "very_high_red": 1,      # >= this -> RED
-        "high_yellow": 1,
-        "high_red": 5,
-        "total_open_yellow": 50,
-        "total_open_red": 250,
+        # Which signal drives the findings axis:
+        #   "auto"           - use Veracode's own score when the scan reports
+        #                      one, otherwise fall back to density (default)
+        #   "density"        - always use the local severity-weighted density
+        #   "veracode_score" - always use Veracode's score; GRAY when absent
+        "findings_model": "auto",
+
+        # --- Absolute severity floor. Never normalized by app size, because a
+        # single critical is a single critical whether the app ships 5 modules
+        # or 500. Size must not be able to dilute severity. Applies under every
+        # findings model, so a clean score can never mask an open critical.
+        "very_high_orange": 1,   # >= this many open Very High -> at least ORANGE
+        "very_high_red": 3,      # >= this many open Very High -> RED
+        "high_orange": 1,        # >= this many open High      -> at least ORANGE
+        "high_red": 5,           # >= this many open High      -> RED
+
+        # --- Veracode score thresholds (0-100, higher is better).
+        "score_green": 80,       # >= this -> GREEN
+        "score_yellow": 60,      # >= this -> YELLOW, below -> RED
+
+        # --- Size-normalized volume, used when no Veracode score is available.
+        # Flaws are severity-weighted first so 100 lows never equal 20 highs.
+        "severity_weights": {"very_high": 10.0, "high": 5.0, "medium": 1.0, "low": 0.1},
+
+        # Denominator: "analysis_mb" | "selected_modules" | "none".
+        # analysis_mb is the default. It comes from the detailedreport's
+        # analysis_size_bytes, so it already covers only what Veracode actually
+        # analyzed, and it scales continuously with code volume.
+        # selected_modules is also correctly scoped (analyzed entry points) but
+        # far coarser: a single fat JAR divides by 1.
+        # Raw total module count is deliberately NOT offered. It counts
+        # dependencies, and it would let an app failing check #29 (excessive
+        # modules) dilute its own flaw density and look safer on this axis
+        # while failing a scan-health check for the same reason.
+        "density_basis": "analysis_mb",
+        "min_basis": 1.0,        # floor on the denominator; stops tiny apps exploding
+
+        # Weighted flaws per unit of basis. Calibrate against your own tenant:
+        # aggregate_tenant() reports the median and p90 density of each run.
+        "density_yellow": 2.0,
+        "density_red": 8.0,
     },
 
     # Attention Score weights. Any component whose input is unavailable is
@@ -1633,6 +1680,19 @@ CHECK_CATALOG: dict[int, tuple[str, str]] = {
     31: ("Analysis or upload size over threshold", "medium"),
 }
 
+DEFAULT_CHECK_CATEGORIES: dict[int, str] = {
+    1: "Packaging", 2: "Module Selection", 3: "Flaw Analysis",
+    4: "Fatal Errors", 5: "Fatal Errors", 6: "Packaging",
+    7: "Packaging", 8: "Packaging", 9: "SCA",
+    10: "Module Selection", 11: "Packaging", 12: "Module Quality",
+    13: "Module Quality", 14: "Fatal Errors", 15: "Module Selection",
+    16: "Security Risk", 17: "Security Risk", 18: "Packaging",
+    19: "Packaging", 20: "Packaging", 21: "Packaging",
+    22: "Packaging", 23: "Packaging", 24: "Module Selection",
+    25: "Module Selection", 26: "Module Selection", 27: "Packaging",
+    28: "Packaging", 29: "Module Selection", 30: "Scan Recency",
+    31: "Packaging",
+}
 
 
 # ==========================================================================
@@ -1730,6 +1790,16 @@ class ApplicationHealth:
     open_policy_flaws: int = 0
     flaw_severity_available: bool = False
 
+    veracode_score: int | None = None      # Veracode's own 0-100 scan score
+    veracode_rating: str = ""
+    policy_status: str = ""
+    findings_basis: str = ""               # which signal drove the findings axis
+
+    weighted_flaw_load: float = 0.0
+    flaw_density: float | None = None      # None when the basis is unavailable
+    density_basis_value: float = 0.0
+    density_basis_label: str = ""
+
     sca_component_count: int = 0
     sca_status: str = "Unknown"          # Present | Missing | Unknown
     analysis_size_mb: float = 0.0
@@ -1822,22 +1892,106 @@ def _issue_count_risk(n: int, bounds: dict) -> str:
     return "RED"
 
 
+def flaw_weighted_load(app: ApplicationHealth, cfg: dict) -> float:
+    """Severity-weighted count of open flaws.
+
+    Weighting happens before any normalization so that a large pile of low
+    findings can never add up to a handful of high ones.
+    """
+    w = cfg["flaws"]["severity_weights"]
+    return (w["very_high"] * (app.critical_flaws or 0)
+            + w["high"] * (app.high_flaws or 0)
+            + w["medium"] * (app.medium_flaws or 0)
+            + w["low"] * (app.low_flaws or 0))
+
+
+def flaw_density_basis(app: ApplicationHealth, cfg: dict) -> tuple[float, str]:
+    """Denominator used to normalize flaw volume for application size."""
+    basis = cfg["flaws"]["density_basis"]
+    if basis == "analysis_mb":
+        return app.analysis_size_mb, "MB analyzed"
+    if basis == "selected_modules":
+        return float(app.selected_modules), "selected module"
+    return 1.0, "application"
+
+
+def _join_basis(existing: str, addition: str) -> str:
+    return f"{existing}; {addition}" if existing else addition
+
+
+def _severity_floor(app: ApplicationHealth, cfg: dict) -> str:
+    """Risk implied by severity alone, before any size normalization.
+
+    This is a floor, not a ratio. Application size can never pull it down, and
+    no favourable score can mask it.
+    """
+    t = cfg["flaws"]
+    vh, hi = app.critical_flaws or 0, app.high_flaws or 0
+    if vh >= t["very_high_red"] or hi >= t["high_red"]:
+        return "RED"
+    if vh >= t["very_high_orange"] or hi >= t["high_orange"]:
+        return "ORANGE"
+    return "GREEN"
+
+
 def _flaw_risk(app: ApplicationHealth, cfg: dict) -> str:
-    """Security-findings risk. GRAY when severity data is unavailable, because
-    a flaw total without severities cannot be classified honestly."""
-    if not app.ever_scanned:
-        return "GRAY"
-    if not app.flaw_severity_available:
+    """Security-findings risk.
+
+    Severity floor first, then a volume signal that accounts for application
+    size. The volume signal is Veracode's own scan score where the scan reports
+    one, since that is already severity-weighted and size-adjusted, and a local
+    severity-weighted density otherwise.
+
+    GRAY when severity data is unavailable, because a flaw total without
+    severities cannot be classified honestly.
+    """
+    if not app.ever_scanned or not app.flaw_severity_available:
         return "GRAY"
     t = cfg["flaws"]
-    vh = app.critical_flaws or 0
-    hi = app.high_flaws or 0
-    open_total = app.open_policy_flaws
-    if vh >= t["very_high_red"] or hi >= t["high_red"] or open_total >= t["total_open_red"]:
+    floor = _severity_floor(app, cfg)
+    vh, hi = app.critical_flaws or 0, app.high_flaws or 0
+    if floor != "GREEN":
+        parts = []
+        if vh:
+            parts.append(f"{vh} open very-high")
+        if hi:
+            parts.append(f"{hi} open high")
+        app.findings_basis = "Severity floor: " + ", ".join(parts)
+    if floor == "RED":
         return "RED"
-    if vh >= t["very_high_yellow"] or hi >= t["high_yellow"] or open_total >= t["total_open_yellow"]:
-        return "ORANGE" if (vh or hi) else "YELLOW"
-    return "GREEN"
+
+    model = t.get("findings_model", "auto")
+    use_score = (app.veracode_score is not None
+                 and model in ("auto", "veracode_score"))
+
+    if use_score:
+        app.findings_basis = _join_basis(app.findings_basis, f"Veracode score {app.veracode_score}")
+        sc = app.veracode_score
+        if sc < t["score_yellow"]:
+            return "RED"
+        if sc < t["score_green"]:
+            return _worst(floor, "YELLOW")
+        return floor
+
+    if model == "veracode_score":
+        # Explicitly requested but unavailable. Do not silently substitute.
+        app.findings_basis = _join_basis(app.findings_basis, "Veracode score unavailable")
+        return floor if floor != "GREEN" else "GRAY"
+
+    if app.flaw_density is None:
+        # Cannot normalize. Report unknown rather than assuming a large flaw
+        # count is fine, but never discard a severity signal already in hand.
+        app.findings_basis = _join_basis(app.findings_basis, "Size unknown; volume not normalized")
+        if floor != "GREEN":
+            return floor
+        return "GRAY" if app.weighted_flaw_load > 0 else "GREEN"
+
+    app.findings_basis = _join_basis(app.findings_basis, f"{app.flaw_density} weighted flaws per {app.density_basis_label}")
+    if app.flaw_density >= t["density_red"]:
+        return "RED"
+    if app.flaw_density >= t["density_yellow"]:
+        return _worst(floor, "YELLOW")
+    return floor
 
 
 def _sca_risk(status: str) -> str:
@@ -1879,7 +2033,7 @@ def build_application_health(
     renamed applications are still tracked, falling back to name.
     """
     cfg = cfg or DASHBOARD_CONFIG
-    cats = check_categories or CHECK_CATEGORIES
+    cats = check_categories or DEFAULT_CHECK_CATEGORIES
     issue_records = issue_records or []
     prev_rows = prev_rows or {}
 
@@ -1953,6 +2107,9 @@ def build_application_health(
             total_flaws=_i(row.get("Total Flaws")),
             open_policy_flaws=_i(row.get("Open Affecting Policy")),
             flaw_severity_available=sev_available,
+            veracode_score=(_i(row.get("Veracode Score")) if str(row.get("Veracode Score", "")).strip() != "" else None),
+            veracode_rating=str(row.get("Veracode Rating", "") or ""),
+            policy_status=str(row.get("Policy Status", "") or ""),
             sca_component_count=sca_count,
             sca_status=sca_status,
             analysis_size_mb=_f(row.get("Analysis Size (MB)")),
@@ -2023,6 +2180,13 @@ def build_application_health(
             _health_risk(app.health_status),
             _issue_count_risk(app.high_severity_issue_count, cfg["high_severity_issues"]),
         ) if ever_scanned else "GRAY"
+        if app.flaw_severity_available:
+            app.weighted_flaw_load = round(flaw_weighted_load(app, cfg), 2)
+            basis_val, basis_lbl = flaw_density_basis(app, cfg)
+            app.density_basis_value, app.density_basis_label = basis_val, basis_lbl
+            if basis_val > 0:
+                app.flaw_density = round(
+                    app.weighted_flaw_load / max(basis_val, cfg["flaws"]["min_basis"]), 2)
         app.security_findings_risk = _flaw_risk(app, cfg)
         app.quadrant = _quadrant(app)
 
@@ -2114,16 +2278,34 @@ def compute_attention_score(app: ApplicationHealth,
         vh, hi = app.critical_flaws or 0, app.high_flaws or 0
         frac = 0.0
         bits: list[str] = []
+        # Severity contributes absolutely; size never dilutes it.
         if vh:
-            frac = max(frac, _clamp(0.6 + 0.4 * (vh / max(t["very_high_red"], 1))))
+            frac = max(frac, _clamp(0.7 + 0.3 * (vh / max(3 * t["very_high_red"], 1))))
             bits.append(f"{vh} open very-high flaw(s)")
         if hi:
             frac = max(frac, _clamp(0.4 + 0.4 * (hi / max(t["high_red"], 1))))
             bits.append(f"{hi} open high flaw(s)")
-        if app.open_policy_flaws >= t["total_open_yellow"]:
-            frac = max(frac, _clamp(app.open_policy_flaws / max(t["total_open_red"], 1)))
-            bits.append(f"{app.open_policy_flaws} open policy-affecting flaws")
-        reason = ", ".join(bits) if bits else "No open very-high or high flaws"
+        # Volume contributes relative to application size. Veracode's own score
+        # already accounts for both severity and size, so prefer it.
+        if app.veracode_score is not None:
+            if app.veracode_score < t["score_green"]:
+                frac = max(frac, _clamp((t["score_green"] - app.veracode_score)
+                                        / max(t["score_green"], 1)))
+                bits.append(f"Veracode score {app.veracode_score}"
+                            + (f" (rating {app.veracode_rating})" if app.veracode_rating else ""))
+        elif app.flaw_density is not None:
+            if app.flaw_density >= t["density_yellow"]:
+                frac = max(frac, _clamp(app.flaw_density / max(t["density_red"], 0.01)))
+                bits.append(f"{app.flaw_density} weighted flaws per "
+                            f"{app.density_basis_label} ({app.weighted_flaw_load} weighted "
+                            f"across {app.density_basis_value:g})")
+        elif app.weighted_flaw_load > 0:
+            frac = max(frac, 0.5)
+            bits.append("Flaw volume cannot be normalized; application size is unknown")
+        if _policy_level(app.policy_status) == "RED":
+            frac = max(frac, 0.6)
+            bits.append(f"Policy status: {app.policy_status}")
+        reason = ", ".join(bits) if bits else "No open very-high or high flaws, low flaw volume"
         parts.append(("Security findings", w["flaw_weight"], frac, reason))
 
     # 4. High-severity scan-health checks
@@ -2221,6 +2403,14 @@ class TenantMetrics:
     avg_flaws_per_app: float = 0.0
     avg_scan_age: float | None = None
     median_scan_age: float | None = None
+    policy_pass: int = 0
+    policy_conditional: int = 0
+    policy_fail: int = 0
+    policy_unknown: int = 0
+    with_veracode_score: int = 0
+    median_flaw_density: float | None = None
+    p90_flaw_density: float | None = None
+    density_basis_label: str = ""
     total_sca_components: int = 0
     total_upload_mb: float = 0.0
     total_analysis_mb: float = 0.0
@@ -2234,8 +2424,24 @@ class TenantMetrics:
         return _pct(self.fresh, self.total_apps)
 
     @property
+    def policy_pass_pct(self) -> float:
+        """Share of profiles with a known policy outcome that passed.
+        Unknown outcomes are excluded from the denominator rather than counted
+        as failures."""
+        known = self.policy_pass + self.policy_conditional + self.policy_fail
+        return _pct(self.policy_pass, known)
+
+    @property
     def healthy_pct(self) -> float:
         return _pct(self.good, self.total_apps)
+
+
+def _percentile(sorted_vals: list[float], p: float) -> float:
+    """Nearest-rank percentile. Deterministic, no numpy dependency."""
+    if not sorted_vals:
+        return 0.0
+    k = max(0, min(len(sorted_vals) - 1, int(math.ceil(p / 100.0 * len(sorted_vals))) - 1))
+    return round(sorted_vals[k], 2)
 
 
 def aggregate_tenant(apps: Sequence[ApplicationHealth], cfg: dict | None = None) -> TenantMetrics:
@@ -2264,6 +2470,13 @@ def aggregate_tenant(apps: Sequence[ApplicationHealth], cfg: dict | None = None)
             else:
                 m.stale += 1
 
+        pl = _policy_level(a.policy_status)
+        m.policy_pass += pl == "GREEN"
+        m.policy_conditional += pl == "YELLOW"
+        m.policy_fail += pl == "RED"
+        m.policy_unknown += pl == "GRAY"
+        m.with_veracode_score += a.veracode_score is not None
+
         m.with_high_severity_issues += a.high_severity_issue_count > 0
         if a.flaw_severity_available:
             m.critical_flaws += a.critical_flaws or 0
@@ -2284,6 +2497,12 @@ def aggregate_tenant(apps: Sequence[ApplicationHealth], cfg: dict | None = None)
         m.quadrants[a.quadrant] = m.quadrants.get(a.quadrant, 0) + 1
         m.trends[a.health_trend] = m.trends.get(a.health_trend, 0) + 1
 
+    dens = sorted(a.flaw_density for a in apps if a.flaw_density is not None)
+    if dens:
+        m.median_flaw_density = _percentile(dens, 50)
+        m.p90_flaw_density = _percentile(dens, 90)
+        m.density_basis_label = next(a.density_basis_label for a in apps
+                                     if a.flaw_density is not None)
     m.avg_flaws_per_app = round(m.total_flaws / len(apps), 1) if apps else 0.0
     if ages:
         m.avg_scan_age = round(sum(ages) / len(ages), 1)
@@ -2345,7 +2564,7 @@ def build_issue_heatmap(issues: Sequence[HealthIssue], total_apps: int,
         rows.append({
             "Check #": num,
             "Issue": label,
-            "Category": group[0].category if group else CHECK_CATEGORIES.get(num, "Other"),
+            "Category": group[0].category if group else DEFAULT_CHECK_CATEGORIES.get(num, "Other"),
             "Severity": sev,
             "Apps Affected": n,
             "Total Apps": total_apps,
@@ -2451,6 +2670,15 @@ def build_heatmap_rows(apps: Sequence[ApplicationHealth],
             "High Flaws": high,
             "Medium Flaws": med,
             "Low Flaws": low,
+            "Veracode Score": a.veracode_score if a.veracode_score is not None else "N/A",
+            "Veracode Rating": a.veracode_rating or "N/A",
+            "Policy Status": a.policy_status or "Unknown",
+            "Findings Basis": a.findings_basis or "N/A",
+            "Weighted Flaws": a.weighted_flaw_load if a.flaw_severity_available else "N/A",
+            "Flaw Density": (a.flaw_density if a.flaw_density is not None
+                             else ("N/A" if a.flaw_severity_available else "Unknown")),
+            "Density Basis": (f"{a.density_basis_value:g} {a.density_basis_label}"
+                              if a.flaw_severity_available else "Unknown"),
             "Total Flaws": a.total_flaws if a.ever_scanned else "N/A",
             "Open Policy Flaws": a.open_policy_flaws if a.ever_scanned else "N/A",
             "SCA": a.sca_status,
@@ -2472,6 +2700,9 @@ def build_heatmap_rows(apps: Sequence[ApplicationHealth],
             "_lv_Scan Age": _scan_age_risk(a.scan_age_days, cfg),
             "_lv_Scan Age Bucket": _scan_age_risk(a.scan_age_days, cfg),
             "_lv_Findings Risk": a.security_findings_risk,
+            "_lv_Flaw Density": _density_level(a, cfg),
+            "_lv_Veracode Score": _score_level(a.veracode_score, cfg),
+            "_lv_Policy Status": _policy_level(a.policy_status),
             "_lv_Very High Flaws": _sev_cell_level(crit, 1, 1),
             "_lv_High Flaws": _sev_cell_level(high, 1, cfg["flaws"]["high_red"]),
             "_lv_SCA": _sca_risk(a.sca_status),
@@ -2487,6 +2718,41 @@ def build_heatmap_rows(apps: Sequence[ApplicationHealth],
         }
         rows.append(row)
     return rows
+
+
+def _score_level(score: int | None, cfg: dict) -> str:
+    if score is None:
+        return "GRAY"
+    t = cfg["flaws"]
+    if score >= t["score_green"]:
+        return "GREEN"
+    if score >= t["score_yellow"]:
+        return "YELLOW"
+    return "RED"
+
+
+def _policy_level(status: str) -> str:
+    s = (status or "").strip().lower()
+    if not s:
+        return "GRAY"
+    if s.startswith("pass"):
+        return "GREEN"
+    if "conditional" in s:
+        return "YELLOW"
+    if "did not pass" in s or s.startswith("fail"):
+        return "RED"
+    return "GRAY"
+
+
+def _density_level(app: ApplicationHealth, cfg: dict) -> str:
+    if app.flaw_density is None:
+        return "GRAY"
+    t = cfg["flaws"]
+    if app.flaw_density >= t["density_red"]:
+        return "RED"
+    if app.flaw_density >= t["density_yellow"]:
+        return "YELLOW"
+    return "GREEN"
 
 
 def _sev_cell_level(v: Any, yellow_at: int, red_at: int) -> str:
@@ -2703,8 +2969,11 @@ def _write_exec_sheet(wb: Workbook, apps: Sequence[ApplicationHealth],
         ("HIGH-SEV ISSUES", f"{m.with_high_severity_issues:,} / {m.total_apps:,}",
          f"{_pct(m.with_high_severity_issues, m.total_apps)}% of tenant",
          "RED" if m.with_high_severity_issues else "GREEN"),
-        ("OPEN POLICY FLAWS", f"{m.open_policy_flaws:,}",
-         f"avg {m.avg_flaws_per_app} flaws per app", "GRAY"),
+        ("POLICY FAILING", f"{m.policy_fail:,} / {m.policy_pass + m.policy_conditional + m.policy_fail:,}",
+         (f"{m.policy_pass_pct}% of evaluated apps pass"
+          if (m.policy_pass + m.policy_conditional + m.policy_fail)
+          else "no policy outcome reported"),
+         "RED" if m.policy_fail else ("GRAY" if not m.policy_pass else "GREEN")),
         ("VERY HIGH / HIGH", f"{m.critical_flaws:,} / {m.high_flaws:,}",
          (f"{m.flaw_severity_unavailable} app(s) lack severity data"
           if m.flaw_severity_unavailable else "open flaws across tenant"),
@@ -2867,6 +3136,8 @@ _HEATMAP_WIDTHS = {
     "Priority": 20, "Scan Health": 11, "Scan Age": 9, "Scan Age Bucket": 13,
     "Findings Risk": 13, "Very High Flaws": 11, "High Flaws": 9, "Medium Flaws": 11,
     "Low Flaws": 9, "Total Flaws": 10, "Open Policy Flaws": 12, "SCA": 10,
+    "Weighted Flaws": 11, "Flaw Density": 11, "Density Basis": 18,
+    "Veracode Score": 11, "Veracode Rating": 11, "Policy Status": 15, "Findings Basis": 26,
     "SCA Components": 12, "Health Issues": 11, "High-Severity Issues": 13,
     "Upload Size (MB)": 13, "Last Scan": 20, "Previous Health": 13, "Change": 9,
     "Trend": 11, "Quadrant": 15,
@@ -3171,16 +3442,13 @@ def main() -> None:
             # Dashboard layer: consumes the rows already built above. No extra API calls.
             bundle = None
             if args.dashboard:
-                if _dash is None:
-                    log.warning("[!] --dashboard requested but dashboard.py is not importable")
-                else:
-                    bundle = generate_dashboard(
-                        health_rows=h_rows, issue_records=[asdict(a) for a in all_ai],
-                        prev_rows=prev_data, check_categories=CHECK_CATEGORIES,
-                        prev_issue_counts=(_load_previous_agg(args.previous_report)
-                                           if args.previous_report else None))
-                    log.info("[*] Dashboard: %d profiles scored, %d structured issues",
-                             len(bundle["apps"]), len(bundle["issues"]))
+                bundle = generate_dashboard(
+                    health_rows=h_rows, issue_records=[asdict(a) for a in all_ai],
+                    prev_rows=prev_data, check_categories=CHECK_CATEGORIES,
+                    prev_issue_counts=(_load_previous_agg(args.previous_report)
+                                       if args.previous_report else None))
+                log.info("[*] Dashboard: %d profiles scored, %d structured issues",
+                         len(bundle["apps"]), len(bundle["issues"]))
 
             fmt = args.output_format
             if fmt == "xlsx":
