@@ -45,37 +45,34 @@ export VERACODE_API_KEY_SECRET=YOUR_API_KEY_SECRET
 
 ```bash
 # All apps, default Excel output
-python veracode_scan_health_tenant.py
+python script.py
 
-# Test with 10 apps
-python veracode_scan_health_tenant.py --max-apps 10
+# Limit to the first 10 apps
+python script.py --max-apps 10
 
 # Filter to specific apps
-python veracode_scan_health_tenant.py --app-name-filter "^MyApp.*"
-
-# Include sandboxes, EU region
-python veracode_scan_health_tenant.py --include-sandboxes --region eu
+python script.py --app-name-filter "^MyApp.*"
 
 # Parallel execution with 4 workers
-python veracode_scan_health_tenant.py --parallel 4 --delay 0.2
+python script.py --parallel 4 --delay 0.2
 
 # JSON output
-python veracode_scan_health_tenant.py --output-format json --output results.json
+python script.py --output-format json --output results.json
 
 # Trend analysis against last week's report
-python veracode_scan_health_tenant.py --previous-report last_week.xlsx
+python script.py --previous-report last_week.xlsx
 
 # Resume a partial run
-python veracode_scan_health_tenant.py --resume partial_output.xlsx
+python script.py --resume partial_output.xlsx
 
 # Dry run (list apps only)
-python veracode_scan_health_tenant.py --dry-run
+python script.py --dry-run
 
 # Skip specific checks
-python veracode_scan_health_tenant.py --skip-checks 1,17,30
+python script.py --skip-checks 1,17,30
 
-# Self-test (verify checks work against mock data)
-python veracode_scan_health_tenant.py --self-test
+# Executive dashboard (adds 3 sheets to the front of the workbook)
+python script.py --dashboard
 ```
 
 ---
@@ -99,7 +96,26 @@ python veracode_scan_health_tenant.py --self-test
 | `--log-level` | `INFO` | Logging level: `DEBUG`, `INFO`, or `WARNING` |
 | `--timeout` | `120` | Per-request HTTP timeout in seconds |
 | `--skip-checks` | None | Comma-separated check numbers to skip (e.g. `1,17,30`) |
-| `--self-test` | `false` | Run checks against a mock fixture and verify expected output |
+| `--dashboard` | `false` | Add the executive dashboard sheets. See [DASHBOARD.md](DASHBOARD.md) |
+| `--dashboard-output` | None | Dashboard workbook path. Only used with `--output-format csv` or `json` |
+
+---
+
+## Executive Dashboard
+
+`--dashboard` prepends three sheets to the workbook for leadership reporting. The seven sheets below are unchanged.
+
+| Sheet | Contents |
+|---|---|
+| **Executive Dashboard** | KPI cards, health distribution, attention bands, priority matrix, top organisational issues, tenant trend, applications requiring attention |
+| **App Heatmap** | One row per profile, colour-coded, autofilter and frozen panes |
+| **Issue Heatmap** | All 31 checks with prevalence, severity, and trend |
+
+Each application gets an **Attention Score** (0-100) for prioritisation. It does not replace the Good/Fair/Poor classification, and it is explainable: every score lists its drivers (e.g. `Scan health is POOR (+27); 7 open very-high flaws (+23); scan is 260 days old (+18)`). Thresholds and weights are configurable in `DASHBOARD_CONFIG`.
+
+Scan health and security findings are shown as separate dimensions. A healthy scan does not mean an application has no vulnerabilities, and poor scan health with a low flaw count is not evidence of safety. Applications with no published scan are reported as Unknown in grey, never as healthy.
+
+With `--output-format csv` or `json`, the dashboard is written as a separate workbook via `--dashboard-output`.
 
 ---
 
@@ -147,9 +163,10 @@ The tool runs 31 individual checks, each identified by number. All checks can be
 
 ### Excel (default)
 
-Seven sheets:
+Seven sheets. `--dashboard` prepends three more, leaving these unchanged: **Executive
+Dashboard**, **App Heatmap** and **Issue Heatmap**. See [DASHBOARD.md](DASHBOARD.md).
 
-1. **Scan Health Summary**: One row per app/sandbox. Includes health status, flaw breakdown, selected module names, SCA component count, scan age bucket, total upload size, health trend, issues, recommendations, and platform URLs. Health and Scan Age Bucket columns are conditionally formatted.
+1. **Scan Health Summary**: One row per app/sandbox. Includes health status, flaw breakdown, selected module names, SCA component count, scan age bucket, total upload size, health trend, issues, recommendations, platform URLs, and an open-flaw severity breakdown (Very High / High / Medium / Low) with a `Flaw Severity Data` availability flag. Health and Scan Age Bucket columns are conditionally formatted.
 
 2. **Module Details**: One row per module per build with selection status, dependency flag, fatal errors, third-party classification, platform, compiler, size, and prescan issues.
 
