@@ -10,6 +10,7 @@ Requirements:
 
 from __future__ import annotations
 
+import os
 import sys
 import csv
 import json
@@ -105,8 +106,6 @@ _AGE_CLR = {"<7d": "C6EFCE", "7-30d": "C6EFCE", "30-90d": "FFEB9C", "90d+": "FFC
 class Issue:
     severity: str
     description: str
-    check_num: int = 0
-    check_name: str = ""
     check_num: int = 0
     check_name: str = ""
 
@@ -443,29 +442,127 @@ def _fancy_match_modules(modules: list[dict], patterns: list[str], selected_only
     return found
 
 # ==========================================================================
+# Checkpointing
+# ==========================================================================
+
+class Checkpoint:
+    """Append-only JSONL checkpoint, flushed and fsync'd after every profile.
+
+    One JSON record per completed application profile. Because the record is
+    written and fsync'd before the next profile starts, a run that dies for any
+    reason (auth failure, network partition, Ctrl-C, OOM, node reboot) loses at
+    most the profile in flight. Restarting with the same checkpoint path skips
+    everything already recorded and carries the earlier rows into the report.
+
+    The format is deliberately line-oriented so a truncated final record from a
+    hard kill costs one profile rather than the whole file, and so the raw data
+    remains recoverable with jq if the workbook write itself ever fails.
+    """
+    VERSION = 1
+    _KEYS = ("health", "modules", "files", "recs", "trends", "agg")
+
+    def __init__(self, path: str | None) -> None:
+        self.path = Path(path) if path else None
+        self._lock = threading.Lock()
+        self._fh = None
+        self.done_keys: set[tuple[str, str]] = set()
+        self.rows: dict[str, list[dict]] = {k: [] for k in self._KEYS}
+        self.records_written = 0
+        if self.path and self.path.exists():
+            self._load()
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.path, "a", encoding="utf-8")
+
+    def _load(self) -> None:
+        bad = 0
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    # Truncated tail from a hard kill. Costs one profile, which
+                    # will simply be re-collected on this run.
+                    bad += 1
+                    continue
+                for k in self._KEYS:
+                    self.rows[k].extend(rec.get(k, []))
+                for key in rec.get("keys", []):
+                    self.done_keys.add((str(key[0]), str(key[1])))
+        log.info("[*] Checkpoint %s: resumed %d profile(s), %d row(s)%s",
+                 self.path, len(self.done_keys),
+                 sum(len(v) for v in self.rows.values()),
+                 f", discarded {bad} truncated record(s)" if bad else "")
+
+    def record(self, keys: Iterable[tuple[str, str]], **rowsets: list[dict]) -> None:
+        keys = [(str(a), str(b)) for a, b in keys]
+        rec: dict[str, Any] = {
+            "v": self.VERSION,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "keys": [list(k) for k in keys],
+        }
+        for k in self._KEYS:
+            rec[k] = rowsets.get(k, []) or []
+        line = json.dumps(rec, default=str)
+        with self._lock:
+            for k in self._KEYS:
+                self.rows[k].extend(rec[k])
+            self.done_keys.update(keys)
+            if self._fh is None:
+                return
+            self._fh.write(line + "\n")
+            self._fh.flush()
+            try:
+                os.fsync(self._fh.fileno())
+            except OSError as e:
+                # Never let a checkpoint problem take down the collection run.
+                log.warning("Checkpoint fsync failed: %s", e)
+            self.records_written += 1
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fh:
+                try:
+                    self._fh.close()
+                finally:
+                    self._fh = None
+
+
+# ==========================================================================
 # API Client
 # ==========================================================================
 
 class AuthError(Exception):
-    """Raised on 401/403 to signal credential issues."""
+    """Raised only when authentication cannot possibly succeed.
+    """
+
+
+class TransientAuthError(Exception):
+    """A 401/403 that survived the full per-request retry window
+    """
+
 
 class VeracodeClient:
     """Veracode API client with request-level pacing and adaptive backoff.
 
-    Pacing is applied per HTTP request, not per application. Each application
-    costs 6+ calls, so spacing only the applications leaves every call inside an
-    application unthrottled, which is what overwhelms the API on large tenants.
+    Pacing is applied per HTTP request, not per application. 
     """
 
     def __init__(self, region: str = "commercial", timeout: int = 120,
                  pool_size: int = 10, rate_delay: float = 0.15,
-                 max_retries: int = 8, backoff_factor: float = 2.0) -> None:
+                 max_retries: int = 8, backoff_factor: float = 2.0,
+                 auth_retry_base: float = 30.0, auth_retry_cap: float = 300.0,
+                 auth_retry_window: float = 3600.0,
+                 net_retries: int = 5) -> None:
         self._cfg = REGIONS[region]
         self._timeout = timeout
         self._s = requests.Session()
         self._s.auth = RequestsAuthPluginVeracodeHMAC()
-        self._s.headers["User-Agent"] = "veracode-scan-health-py/3.0"
-                     
+        self._s.headers["User-Agent"] = "veracode-scan-health-py/3.1"
+
         retry = Retry(total=max_retries, backoff_factor=backoff_factor,
                       status_forcelist=(429, 500, 502, 503, 504),
                       allowed_methods=("GET",),
@@ -484,6 +581,16 @@ class VeracodeClient:
         self._cooldown_until = 0.0
         self.throttle_events = 0        # observed 429/503 responses
         self.request_count = 0
+
+        # --- authentication retry state
+        self._auth_base = max(1.0, auth_retry_base)
+        self._auth_cap = max(self._auth_base, auth_retry_cap)
+        self._auth_window = max(0.0, auth_retry_window)
+        self._net_retries = max(0, net_retries)
+        self.auth_retry_events = 0
+        self.auth_give_ups = 0
+        self.net_retry_events = 0
+        self.first_call_done = False
 
     # ------------------------------------------------------------------
     # Pacing
@@ -531,30 +638,84 @@ class VeracodeClient:
                     f", Retry-After: {retry_after:g}s" if retry_after is not None else "",
                     cooldown, new_delay, self.throttle_events)
 
+    # ------------------------------------------------------------------
+    # Transport
+    # ------------------------------------------------------------------
+    def _auth_wait(self, attempt: int) -> float:
+        """Exponential backoff for authentication retries, capped."""
+        return min(self._auth_cap, self._auth_base * (2 ** max(0, attempt - 1)))
+
     def _get(self, url: str, params: dict | None) -> requests.Response:
-        self._pace()
-        r = self._s.get(url, params=params, timeout=self._timeout)
-        with self._rate_lock:
-            self.request_count += 1
-        if r.status_code in (429, 503):
-            self._note_throttle(r)
-        return r
+        """GET with pacing, adaptive throttle handling, and retry on auth and
+        connection failures.
+        """
+        auth_attempt = 0
+        auth_waited = 0.0
+        net_attempt = 0
+        while True:
+            self._pace()
+            try:
+                r = self._s.get(url, params=params, timeout=self._timeout)
+            except requests.RequestException as e:
+                net_attempt += 1
+                if net_attempt > self._net_retries:
+                    raise
+                with self._rate_lock:
+                    self.net_retry_events += 1
+                wait = min(60.0, 2.0 ** net_attempt)
+                log.warning("[!] Network error on %s (%s: %s). Retry %d/%d in %.0fs.",
+                            url, type(e).__name__, e, net_attempt, self._net_retries, wait)
+                time.sleep(wait)
+                continue
+
+            with self._rate_lock:
+                self.request_count += 1
+
+            if r.status_code in (429, 503):
+                self._note_throttle(r)
+
+            if r.status_code in (401, 403):
+                auth_attempt += 1
+                wait = self._auth_wait(auth_attempt)
+                body = (r.text or "")[:200]
+                if not self.first_call_done:
+                    # Nothing has ever succeeded. Credentials are probably just
+                    # wrong; fail fast instead of burning the whole window.
+                    if auth_attempt >= 3:
+                        raise AuthError(
+                            f"HTTP {r.status_code} from {r.url} on the first API calls of "
+                            f"this run. Credentials are missing, expired, or lack the "
+                            f"required permissions. Response: {body}")
+                elif auth_waited + wait > self._auth_window:
+                    with self._rate_lock:
+                        self.auth_give_ups += 1
+                    raise TransientAuthError(
+                        f"HTTP {r.status_code} from {r.url} persisted for "
+                        f"{auth_waited / 60:.0f} minutes. Abandoning this request; the "
+                        f"run continues and completed work is checkpointed. "
+                        f"Response: {body}")
+                with self._rate_lock:
+                    self.auth_retry_events += 1
+                log.error("[!] HTTP %d (auth) on %s. Attempt %d, retrying in %.0fs "
+                          "(%.0f/%.0f min of the retry window used). The run is NOT "
+                          "aborting; %s",
+                          r.status_code, url, auth_attempt, wait,
+                          auth_waited / 60, self._auth_window / 60,
+                          "check whether the API credentials were rotated or revoked.")
+                time.sleep(wait)
+                auth_waited += wait
+                continue
+
+            if r.ok:
+                self.first_call_done = True
+            return r
 
     def close(self) -> None: self._s.close()
     def __enter__(self) -> "VeracodeClient": return self
     def __exit__(self, *a: object) -> None: self.close()
 
-    def _check_auth(self, resp: requests.Response) -> None:
-        if resp.status_code in (401, 403):
-            body = resp.text[:200] if resp.text else ""
-            raise AuthError(
-                f"HTTP {resp.status_code} from {resp.url}. "
-                f"API credentials may be expired or lack required permissions. "
-                f"Response: {body}")
-
     def _xml(self, ep: str, params: dict | None = None) -> ET.Element:
         r = self._get(f"{self._cfg['xml']}/{ep}", params)
-        self._check_auth(r)
         r.raise_for_status()
         # Parse bytes, not r.text: the XML declaration is authoritative, while
         # r.text falls back to charset guessing when the server sends no
@@ -563,7 +724,6 @@ class VeracodeClient:
 
     def _rest(self, path: str, params: dict | None = None) -> dict:
         r = self._get(f"{self._cfg['rest']}{path}", params)
-        self._check_auth(r)
         r.raise_for_status()
         return r.json()
 
@@ -572,6 +732,7 @@ class VeracodeClient:
 
     def get_apps(self) -> list[dict]:
         apps: list[dict] = []; page = 0
+        d: dict = {}
         while True:
             d = self._rest("/applications", {"page": page, "size": 500})
             emb = d.get("_embedded", {}).get("applications", [])
@@ -1359,7 +1520,8 @@ def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
 
     key = (app["name"], "")
     if resume_keys and key in resume_keys:
-        log.debug("    Skipping (resume): %s", app["name"]); return rs, ms, fs, rrs, ais, ts
+        log.debug("    Skipping (already checkpointed): %s", app["name"])
+        return rs, ms, fs, rrs, ais, ts
 
     builds = client.get_builds(lid)
     if not builds:
@@ -1387,7 +1549,7 @@ def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
 
 
 # ==========================================================================
-# Resume
+# Resume (legacy xlsx path; the JSONL checkpoint above supersedes this)
 # ==========================================================================
 
 def _load_prior_rows(path: str, sheet: str) -> list[dict]:
@@ -1510,18 +1672,6 @@ def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict
     Groups issues by (check_num, check_name) so each row represents one type of
     problem across the tenant. Uses the real check metadata rather than regex
     guesswork on serialized strings.
-
-    Output columns:
-      - Check #: the check number for reference
-      - Check Name: machine-readable check name
-      - Category: Packaging / Module Selection / Fatal Errors / etc.
-      - Severity: highest severity observed for this check across all apps
-      - Apps Affected: count of unique apps that triggered this check
-      - % of Tenant: percentage of total apps
-      - Affected App Names: comma-separated, max 10 then "and N others"
-      - Business Units Affected: unique BUs with this issue
-      - Sample Issue: one representative issue description (shortest, for clarity)
-      - Top Recommendation: the recommendation linked to this check
     """
     if not agg_issues:
         return []
@@ -3464,7 +3614,7 @@ def _write_issue_heatmap_sheet(wb: Workbook, issue_rows: list[dict],
 
 
 # ==========================================================================
-# Top-level entry point used by script.py
+# Top-level dashboard entry point
 # ==========================================================================
 
 def generate_dashboard(health_rows: Sequence[dict],
@@ -3508,12 +3658,13 @@ def _print_summary(health: list[dict]) -> None:
     good = sum(1 for r in health if r.get("Health")=="Good")
     fair = sum(1 for r in health if r.get("Health")=="Fair")
     poor = sum(1 for r in health if r.get("Health")=="Poor")
-    print(f"\nTenant Summary: {tot} apps - Good: {good}, Fair: {fair}, Poor: {poor}")
+    err = sum(1 for r in health if r.get("Scan Status")=="Error")
+    print(f"\nTenant Summary: {tot} apps - Good: {good}, Fair: {fair}, Poor: {poor}, Error: {err}")
     counter: Counter[str] = Counter()
     for r in health:
         txt = r.get("Issues","")
         if txt == "None": continue
-        for part in txt.split("; "):
+        for part in str(txt).split("; "):
             clean = re.sub(r'\[(?:HIGH|MEDIUM|LOW)\]\s*', '', part).strip()
             clean = re.sub(r'"[^"]*"', '(name)', clean)
             if clean: counter[clean] += 1
@@ -3524,7 +3675,7 @@ def _print_summary(health: list[dict]) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Veracode Tenant-Wide Scan Health v3.0")
+    p = argparse.ArgumentParser(description="Veracode Tenant-Wide Scan Health v3.1")
     p.add_argument("--output", default=f"scan_health_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
     p.add_argument("--output-format", choices=["xlsx","csv","json"], default="xlsx")
     p.add_argument("--max-apps", type=int, default=0)
@@ -3545,7 +3696,9 @@ def main() -> None:
     p.add_argument("--region", choices=["commercial","eu"], default="commercial")
     p.add_argument("--app-name-filter", default=None, help="Regex to filter app names")
     p.add_argument("--parallel", type=int, default=1, help="Concurrent workers (default 1)")
-    p.add_argument("--resume", default=None, help="Path to prior partial xlsx to skip processed apps")
+    p.add_argument("--resume", default=None,
+                   help="Path to a prior xlsx to skip already-processed apps. Legacy; the "
+                        "JSONL checkpoint resumes automatically and is far more reliable.")
     p.add_argument("--previous-report", default=None, help="Path to prior xlsx for trend analysis")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--log-level", choices=["DEBUG","INFO","WARNING"], default="INFO")
@@ -3556,6 +3709,27 @@ def main() -> None:
     p.add_argument("--dashboard-output", default=None,
                    help="Dashboard workbook path. Only used when --output-format is csv or "
                         "json; with xlsx the dashboard sheets are added to the main report")
+    # --- durability
+    p.add_argument("--checkpoint", default=None,
+                   help="JSONL checkpoint path (default: <output>.ckpt.jsonl). Written and "
+                        "fsync'd after every application. Rerun with the same path to resume "
+                        "exactly where the previous run stopped.")
+    p.add_argument("--no-checkpoint", action="store_true",
+                   help="Disable incremental checkpointing. Not recommended: a failure then "
+                        "loses the entire run.")
+    p.add_argument("--restart", action="store_true",
+                   help="Ignore and overwrite any existing checkpoint, starting from scratch.")
+    # --- auth retry
+    p.add_argument("--auth-retry-base", type=float, default=30.0,
+                   help="Initial backoff in seconds after a 401/403 (default 30)")
+    p.add_argument("--auth-retry-cap", type=float, default=300.0,
+                   help="Maximum single backoff in seconds between auth retries (default 300)")
+    p.add_argument("--auth-retry-window", type=float, default=3600.0,
+                   help="Total seconds to keep retrying a single request through 401/403 "
+                        "before giving up on THAT REQUEST ONLY (default 3600). The run "
+                        "itself never aborts on a mid-run auth failure.")
+    p.add_argument("--net-retries", type=int, default=5,
+                   help="Retries for connection-level failures per request (default 5)")
     args = p.parse_args()
 
     # Validate numeric options up front; bad values otherwise fail deep into a
@@ -3574,6 +3748,14 @@ def main() -> None:
         p.error("--timeout must be >= 1")
     if args.max_apps < 0:
         p.error("--max-apps must be >= 0")
+    if args.auth_retry_base <= 0:
+        p.error("--auth-retry-base must be > 0")
+    if args.auth_retry_cap < args.auth_retry_base:
+        p.error("--auth-retry-cap must be >= --auth-retry-base")
+    if args.auth_retry_window < 0:
+        p.error("--auth-retry-window must be >= 0")
+    if args.net_retries < 0:
+        p.error("--net-retries must be >= 0")
     if args.app_name_filter:
         try:
             re.compile(args.app_name_filter)
@@ -3589,20 +3771,36 @@ def main() -> None:
         skip_checks = {int(x.strip()) for x in args.skip_checks.split(",")}
         log.info("[*] Skipping checks: %s", sorted(skip_checks))
 
-    resume_keys: set[tuple[str, str]] | None = None
+    # ---- legacy xlsx resume (optional; superseded by the JSONL checkpoint)
+    resume_keys: set[tuple[str, str]] = set()
     prior: dict[str, list[dict]] = {}
     if args.resume:
         resume_keys = _load_resume_keys(args.resume)
-        for _sheet, _key in (("Scan Health Summary", "health"), ("Module Details", "modules"),
-                             ("Uploaded Files", "files"), ("Recommendations", "recs"),
-                             ("Trends", "trends")):
-            prior[_key] = _load_prior_rows(args.resume, _sheet)
-        log.info("[*] Resume: %d profiles already processed, carrying forward %d prior rows",
+        for _sheet_name, _key in (("Scan Health Summary", "health"), ("Module Details", "modules"),
+                                  ("Uploaded Files", "files"), ("Recommendations", "recs"),
+                                  ("Trends", "trends")):
+            prior[_key] = _load_prior_rows(args.resume, _sheet_name)
+        log.info("[*] Resume xlsx: %d profiles already processed, carrying forward %d prior rows",
                  len(resume_keys), sum(len(v) for v in prior.values()))
         if Path(args.resume).resolve() == Path(args.output).resolve():
             log.error("--resume and --output are the same file (%s). Refusing to run: the "
                       "resumed report would overwrite the results being read.", args.output)
             sys.exit(2)
+
+    # ---- checkpoint
+    ckpt_path = None if args.no_checkpoint else (
+        args.checkpoint or f"{Path(args.output).with_suffix('')}.ckpt.jsonl")
+    if ckpt_path and args.restart and Path(ckpt_path).exists():
+        backup = f"{ckpt_path}.{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
+        Path(ckpt_path).rename(backup)
+        log.warning("[*] --restart: existing checkpoint moved to %s", backup)
+    ckpt = Checkpoint(ckpt_path)
+    if ckpt_path is None:
+        log.warning("[!] Checkpointing is DISABLED. A failure at any point will lose the "
+                    "entire run.")
+    else:
+        log.info("[*] Checkpoint: %s (written after every application)", ckpt_path)
+    skip_set: set[tuple[str, str]] = set(ckpt.done_keys) | resume_keys
 
     prev_data: dict | None = None
     if args.previous_report:
@@ -3611,154 +3809,226 @@ def main() -> None:
 
     name_filter = re.compile(args.app_name_filter) if args.app_name_filter else None
 
-    try:
-        with VeracodeClient(args.region, timeout=args.timeout,
-                            pool_size=max(10, args.parallel * 2),
-                            rate_delay=args.request_delay,
-                            max_retries=args.max_retries,
-                            backoff_factor=args.retry_backoff) as client:
-            log.info("[*] Region: %s", args.region)
-            apps = client.get_apps()
-            log.info("[*] Found %d apps", len(apps))
+    failures: list[str] = []
 
-            if name_filter:
-                apps = [a for a in apps if name_filter.search(a["name"])]
-                log.info("[*] Filtered to %d apps", len(apps))
-            if args.max_apps:
-                apps = apps[:args.max_apps]
+    def _finalize(client: VeracodeClient | None) -> None:
+        """Write the report from whatever is durable. Called from a finally
+        block, so it runs on every exit path including auth failure and
+        Ctrl-C."""
+        h_rows = prior.get("health", []) + ckpt.rows["health"]
+        if not h_rows:
+            log.warning("[!] No application rows collected; nothing to write.")
+            return
+        m_rows = prior.get("modules", []) + ckpt.rows["modules"]
+        f_rows = prior.get("files", []) + ckpt.rows["files"]
+        r_rows = prior.get("recs", []) + ckpt.rows["recs"]
+        t_rows = prior.get("trends", []) + ckpt.rows["trends"]
+        agg_records = ckpt.rows["agg"]
+        agg = _build_aggregation([AggIssue(**d) for d in agg_records], len(h_rows))
 
-            if args.request_delay <= 0 and len(apps) > 100:
-                log.warning("[!] --request-delay is 0, so %d applications (~%d API requests) "
-                            "will be sent with no pacing. This can overload the platform. "
-                            "Consider --request-delay 0.15 or higher.",
-                            len(apps), len(apps) * 6)
+        log.info("[*] Writing %d health / %d module / %d file / %d rec / %d trend rows...",
+                 len(h_rows), len(m_rows), len(f_rows), len(r_rows), len(t_rows))
 
-            if args.dry_run:
-                print(f"Would process {len(apps)} apps:")
-                for a in apps:
-                    print(f"  {a['name']} (id={a.get('legacy_id')})")
-                return
-
-            all_sr: list[ScanResult] = []; all_mr: list[ModuleRow] = []
-            all_fr: list[FileRow] = []; all_rr: list[RecommendationRow] = []
-            all_ai: list[AggIssue] = []; all_tr: list[TrendRow] = []
-            failures: list[str] = []
-            stop = threading.Event()
-            lock = threading.Lock()
-            delay_lock = threading.Lock()
-            next_slot = 0.0
-
-            def _do_app(idx_app: tuple[int, dict]) -> None:
-                if stop.is_set():
-                    return
-                idx, app = idx_app
-                log.info("[%d/%d] %s (id=%s)", idx, len(apps), app["name"], app.get("legacy_id"))
-                try:
-                    sr, mr, fr, rr, ai, tr = _process_app(
-                        client, app, args.skip_no_scan, args.include_sandboxes,
-                        skip_checks, prev_data, resume_keys)
-                    with lock:
-                        all_sr.extend(sr); all_mr.extend(mr); all_fr.extend(fr)
-                        all_rr.extend(rr); all_ai.extend(ai); all_tr.extend(tr)
-                    for s in sr:
-                        sb = f' [{s.sandbox}]' if s.sandbox else ""
-                        log.info("    %s | Issues: %d%s", s.health, s.total_issues, sb)
-                except AuthError as e:
-                    log.error("Authentication failed: %s", e)
-                    stop.set()
-                    raise
-                except Exception as e:
-                    log.warning("    [!] Failed: %s: %s", type(e).__name__, e)
-                    with lock:
-                        failures.append(app["name"])
-                        all_sr.append(_error_result(app, app.get("legacy_id", 0),
-                                                    f"{type(e).__name__}: {e}"))
-                if args.delay > 0:
-                    # Global pacing without serialising the workers: hold the
-                    # lock only long enough to claim the next slot, then sleep
-                    # outside it. Previously every worker queued on a lock held
-                    # for the full sleep, so throughput collapsed to 1/delay
-                    # regardless of --parallel.
-                    with delay_lock:
-                        nonlocal next_slot
-                        now = time.monotonic()
-                        next_slot = max(now, next_slot) + args.delay
-                        wait = next_slot - now
-                    if wait > 0:
-                        time.sleep(wait)
-
-            if args.parallel > 1:
-                pool = ThreadPoolExecutor(max_workers=args.parallel)
-                try:
-                    futs = {pool.submit(_do_app, (i, a)): a for i, a in enumerate(apps, 1)}
-                    for fut in as_completed(futs):
-                        try: fut.result()
-                        except AuthError:
-                            # Cancel the queue instead of letting the executor
-                            # drain thousands of doomed requests on shutdown.
-                            for f in futs: f.cancel()
-                            stop.set()
-                            raise
-                        except Exception as e: log.warning("Worker error: %s", e)
-                finally:
-                    pool.shutdown(wait=True, cancel_futures=True)
-            else:
-                for i, app in enumerate(apps, 1):
-                    if stop.is_set(): break
-                    _do_app((i, app))
-
-            # Build output rows
-            h_rows = prior.get("health", []) + [s.to_row() for s in all_sr]
-            m_rows = prior.get("modules", []) + [m.to_row() for m in all_mr]
-            f_rows = prior.get("files", []) + [f.to_row() for f in all_fr]
-            r_rows = prior.get("recs", []) + [r.to_row() for r in all_rr]
-            t_rows = prior.get("trends", []) + [t.to_row() for t in all_tr]
-            agg = _build_aggregation(all_ai, len(h_rows))
-
-            log.info("\n[*] Writing %d health / %d module / %d file / %d rec / %d trend rows...",
-                     len(h_rows), len(m_rows), len(f_rows), len(r_rows), len(t_rows))
-
-            # Dashboard layer: consumes the rows already built above. No extra API calls.
-            bundle = None
-            if args.dashboard:
+        # Dashboard layer: consumes the rows already built above. No extra API calls.
+        bundle = None
+        if args.dashboard:
+            try:
                 bundle = generate_dashboard(
-                    health_rows=h_rows, issue_records=[asdict(a) for a in all_ai],
+                    health_rows=h_rows, issue_records=agg_records,
                     prev_rows=prev_data, check_categories=CHECK_CATEGORIES,
                     prev_issue_counts=(_load_previous_agg(args.previous_report)
                                        if args.previous_report else None))
                 log.info("[*] Dashboard: %d profiles scored, %d structured issues",
                          len(bundle["apps"]), len(bundle["issues"]))
+            except Exception as e:
+                log.warning("Dashboard generation failed, core report unaffected: %s", e)
 
-            fmt = args.output_format
-            if fmt == "xlsx":
-                write_excel(h_rows, m_rows, f_rows, r_rows, t_rows, agg, args.output,
-                            dash_bundle=bundle)
-            elif fmt == "csv":
-                write_csv(h_rows, m_rows, f_rows, r_rows, t_rows, agg, args.output)
-            elif fmt == "json":
-                write_json(h_rows, m_rows, f_rows, t_rows, args.output)
+        fmt = args.output_format
+        if fmt == "xlsx":
+            write_excel(h_rows, m_rows, f_rows, r_rows, t_rows, agg, args.output,
+                        dash_bundle=bundle)
+        elif fmt == "csv":
+            write_csv(h_rows, m_rows, f_rows, r_rows, t_rows, agg, args.output)
+        elif fmt == "json":
+            write_json(h_rows, m_rows, f_rows, t_rows, args.output)
 
-            # For csv/json the dashboard has nowhere to live, so it gets its own workbook.
-            if bundle is not None and fmt != "xlsx":
-                xp = args.dashboard_output or f"{Path(args.output).with_suffix('')}_dashboard.xlsx"
-                write_dashboard_xlsx(xp, bundle)
-                log.info("[+] Dashboard workbook: %s", xp)
+        # For csv/json the dashboard has nowhere to live, so it gets its own workbook.
+        if bundle is not None and fmt != "xlsx":
+            xp = args.dashboard_output or f"{Path(args.output).with_suffix('')}_dashboard.xlsx"
+            write_dashboard_xlsx(xp, bundle)
+            log.info("[+] Dashboard workbook: %s", xp)
 
+        if client is not None:
             if client.throttle_events:
                 log.warning("[!] Rate limited %d time(s) during this run; final request "
                             "spacing was %.2fs across %d requests. Consider raising "
                             "--request-delay or lowering --parallel next time.",
                             client.throttle_events, client._rate_delay, client.request_count)
-            if failures:
-                log.warning("[!] %d application(s) could not be retrieved and are marked "
-                            "'Error' in the report (not 'No Scan'): %s",
-                            len(failures), ", ".join(failures[:10])
-                            + (" ..." if len(failures) > 10 else ""))
-            _print_summary(h_rows)
+            if client.auth_retry_events:
+                log.warning("[!] %d authentication retry event(s) occurred. %d request(s) "
+                            "were eventually abandoned. Check whether the API credentials "
+                            "were rotated or revoked mid-run.",
+                            client.auth_retry_events, client.auth_give_ups)
+            if client.net_retry_events:
+                log.warning("[!] %d network-level retry event(s) occurred.",
+                            client.net_retry_events)
+        if failures:
+            log.warning("[!] %d application(s) could not be retrieved and are marked "
+                        "'Error' in the report (not 'No Scan'): %s",
+                        len(failures), ", ".join(failures[:10])
+                        + (" ..." if len(failures) > 10 else ""))
+        _print_summary(h_rows)
+
+    client: VeracodeClient | None = None
+    exit_code = 0
+    try:
+        client = VeracodeClient(args.region, timeout=args.timeout,
+                                pool_size=max(10, args.parallel * 2),
+                                rate_delay=args.request_delay,
+                                max_retries=args.max_retries,
+                                backoff_factor=args.retry_backoff,
+                                auth_retry_base=args.auth_retry_base,
+                                auth_retry_cap=args.auth_retry_cap,
+                                auth_retry_window=args.auth_retry_window,
+                                net_retries=args.net_retries)
+        log.info("[*] Region: %s", args.region)
+        apps = client.get_apps()
+        log.info("[*] Found %d apps", len(apps))
+
+        if name_filter:
+            apps = [a for a in apps if name_filter.search(a["name"])]
+            log.info("[*] Filtered to %d apps", len(apps))
+        if args.max_apps:
+            apps = apps[:args.max_apps]
+
+        if skip_set:
+            remaining = [a for a in apps if (a["name"], "") not in skip_set]
+            log.info("[*] %d of %d profiles already recorded; %d remaining",
+                     len(apps) - len(remaining), len(apps), len(remaining))
+
+        if args.request_delay <= 0 and len(apps) > 100:
+            log.warning("[!] --request-delay is 0, so %d applications (~%d API requests) "
+                        "will be sent with no pacing. This can overload the platform. "
+                        "Consider --request-delay 0.15 or higher.",
+                        len(apps), len(apps) * 6)
+
+        if args.dry_run:
+            print(f"Would process {len(apps)} apps:")
+            for a in apps:
+                print(f"  {a['name']} (id={a.get('legacy_id')})")
+            ckpt.close()
+            return
+
+        stop = threading.Event()
+        lock = threading.Lock()
+        delay_lock = threading.Lock()
+        next_slot = 0.0
+
+        def _do_app(idx_app: tuple[int, dict]) -> None:
+            if stop.is_set():
+                return
+            idx, app = idx_app
+            if (app["name"], "") in skip_set:
+                log.debug("[%d/%d] %s (already checkpointed)", idx, len(apps), app["name"])
+                return
+            log.info("[%d/%d] %s (id=%s)", idx, len(apps), app["name"], app.get("legacy_id"))
+            try:
+                sr, mr, fr, rr, ai, tr = _process_app(
+                    client, app, args.skip_no_scan, args.include_sandboxes,
+                    skip_checks, prev_data, skip_set)
+                # Even when nothing came back (skip-no-scan), record the key so a
+                # resumed run does not re-fetch this profile.
+                keys = [(s.app_name, s.sandbox) for s in sr] or [(app["name"], "")]
+                ckpt.record(keys,
+                            health=[s.to_row() for s in sr],
+                            modules=[m.to_row() for m in mr],
+                            files=[f.to_row() for f in fr],
+                            recs=[r.to_row() for r in rr],
+                            trends=[t.to_row() for t in tr],
+                            agg=[asdict(a) for a in ai])
+                for s in sr:
+                    sb = f' [{s.sandbox}]' if s.sandbox else ""
+                    log.info("    %s | Issues: %d%s", s.health, s.total_issues, sb)
+            except AuthError as e:
+                # Only raised when authentication has never succeeded at all.
+                log.error("Authentication failed: %s", e)
+                stop.set()
+                raise
+            except Exception as e:
+                log.warning("    [!] Failed: %s: %s", type(e).__name__, e)
+                with lock:
+                    failures.append(app["name"])
+                ckpt.record([(app["name"], "")],
+                            health=[_error_result(app, app.get("legacy_id", 0),
+                                                  f"{type(e).__name__}: {e}").to_row()])
+            if args.delay > 0:
+                # Global pacing without serialising the workers: hold the lock
+                # only long enough to claim the next slot, then sleep outside it.
+                with delay_lock:
+                    nonlocal next_slot
+                    now = time.monotonic()
+                    next_slot = max(now, next_slot) + args.delay
+                    wait = next_slot - now
+                if wait > 0:
+                    time.sleep(wait)
+
+        try:
+            if args.parallel > 1:
+                pool = ThreadPoolExecutor(max_workers=args.parallel)
+                try:
+                    futs = {pool.submit(_do_app, (i, a)): a for i, a in enumerate(apps, 1)}
+                    for fut in as_completed(futs):
+                        try:
+                            fut.result()
+                        except AuthError:
+                            # Cancel the queue instead of letting the executor
+                            # drain thousands of doomed requests on shutdown.
+                            for f in futs:
+                                f.cancel()
+                            stop.set()
+                            raise
+                        except Exception as e:
+                            log.warning("Worker error: %s", e)
+                finally:
+                    pool.shutdown(wait=True, cancel_futures=True)
+            else:
+                for i, app in enumerate(apps, 1):
+                    if stop.is_set():
+                        break
+                    _do_app((i, app))
+        except AuthError as e:
+            exit_code = 1
+            log.error("FATAL: %s", e)
+            log.error("[*] %d profile(s) are already durable in the checkpoint; writing a "
+                      "partial report now. Fix the credentials and rerun the same command "
+                      "to continue from here.", len(ckpt.done_keys))
+        except KeyboardInterrupt:
+            exit_code = 130
+            log.warning("[!] Interrupted. %d profile(s) are durable in the checkpoint; "
+                        "writing a partial report.", len(ckpt.done_keys))
 
     except AuthError as e:
+        # Raised during get_apps(): credentials are wrong from the outset.
+        exit_code = 1
         log.error("FATAL: %s", e)
-        raise SystemExit(1)
+    except KeyboardInterrupt:
+        exit_code = 130
+        log.warning("[!] Interrupted before collection started.")
+    finally:
+        ckpt.close()
+        try:
+            _finalize(client)
+        except Exception as e:
+            log.error("Report write failed: %s", e)
+            if ckpt_path:
+                log.error("Collected data is intact at %s. Rerun the same command to "
+                          "regenerate the report without re-scanning.", ckpt_path)
+            exit_code = exit_code or 3
+        if client is not None:
+            client.close()
+
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
