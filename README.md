@@ -1,7 +1,5 @@
 # Veracode Tenant-Wide Scan Health
 
-**v4.0**
-
 A Python tool that evaluates the health of every SAST scan across all application profiles in a Veracode tenant and exports the results to Excel, CSV, or JSON.
 
 This is a port of [veracode/scan_health](https://github.com/veracode/scan_health) (Go, v2.47), re-engineered to operate in bulk across an entire tenant. All health checks, pattern lists, thresholds, severity classifications, and recommendation strings from the original Go tool are preserved and individually callable. The output includes scan health summary, module details, uploaded files, per-app recommendations, tenant-level issue aggregation, an executive dashboard, and optional trend analysis against a prior run.
