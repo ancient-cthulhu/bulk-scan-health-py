@@ -3896,11 +3896,6 @@ def _print_summary(health: list[dict]) -> None:
 
 def _plan_note(n_apps: int, sandboxes: bool, budget: float) -> str:
     """Estimate runtime from the published limits and the real call mix.
-
-    Per policy profile the tool now costs 4 requests: getbuildinfo (fast path),
-    detailedreport, getfilelist, getprescanresults. Exactly one of those lands
-    in the 80/min bucket and three in the 250/min bucket, so at any budget the
-    two ceilings bind at almost the same point (80 vs 250/3 = 83 profiles/min).
     """
     per_app = 4.0
     if sandboxes:
@@ -3912,7 +3907,7 @@ def _plan_note(n_apps: int, sandboxes: bool, budget: float) -> str:
     apps_per_min = min(report_rpm / report_calls, xml_rpm / max(xml_calls, 0.001))
     secs = n_apps / apps_per_min * 60.0 if apps_per_min else 0.0
     return (f"~{per_app:.0f} requests/profile, {apps_per_min:.0f} profiles/min at "
-            f"{budget:.0f}% of the published limits: estimated {_hms(secs)} for "
+            f"{budget:.0f}% of the limits: estimated {_hms(secs)} for "
             f"{n_apps:,} profiles")
 
 
@@ -4167,7 +4162,7 @@ def main() -> None:
                                 max_retries=args.max_retries,
                                 backoff_factor=args.retry_backoff,
                                 auth_retry_window=args.auth_retry_window)
-        log.info("[*] Region: %s | rate budget %.0f%% of published limits "
+        log.info("[*] Region: %s | rate budget %.0f%% of limits "
                  "(report %.0f/min, xml %.0f/min, rest %.0f/min)",
                  args.region, args.rate_budget,
                  *(client.limiter.buckets[b].target_rpm for b in ("report", "xml", "rest")))
