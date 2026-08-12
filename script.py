@@ -457,9 +457,15 @@ class Checkpoint:
     The format is deliberately line-oriented so a truncated final record from a
     hard kill costs one profile rather than the whole file, and so the raw data
     remains recoverable with jq if the workbook write itself ever fails.
+
+    Module and file rows are deliberately NOT carried here. On a 14,000-profile
+    tenant those run to millions of rows, which would exhaust memory and blow
+    past Excel's row ceiling anyway. They stream straight to CSV via
+    DetailWriter instead. What stays in memory is bounded at roughly one row
+    per profile.
     """
-    VERSION = 1
-    _KEYS = ("health", "modules", "files", "recs", "trends", "agg")
+    VERSION = 2
+    _KEYS = ("health", "recs", "trends", "agg")
 
     def __init__(self, path: str | None) -> None:
         self.path = Path(path) if path else None
@@ -531,148 +537,302 @@ class Checkpoint:
                     self._fh = None
 
 
+class DetailWriter:
+    """Streams per-module and per-file rows to CSV as they are produced.
+
+    These are the only unbounded outputs in the tool: a large tenant produces
+    tens of thousands of module rows and millions of file rows. Buffering them
+    in memory to build a workbook at the end costs gigabytes and then silently
+    truncates at Excel's 1,048,576-row ceiling. Streaming to CSV keeps memory
+    flat, keeps every row, and makes the data greppable during the run.
+
+    Files are opened in append mode so a resumed run continues the same CSVs.
+    """
+
+    def __init__(self, base_path: str, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self._lock = threading.Lock()
+        self._writers: dict[str, Any] = {}
+        self._handles: dict[str, Any] = {}
+        self.counts: dict[str, int] = {"modules": 0, "files": 0}
+        self.paths: dict[str, str] = {}
+        if not enabled:
+            return
+        stem = Path(base_path).with_suffix("")
+        for kind, fields in (
+            ("modules", list(ModuleRow().to_row().keys())),
+            ("files", list(FileRow().to_row().keys())),
+        ):
+            p = Path(f"{stem}_{kind}.csv")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            new = not p.exists() or p.stat().st_size == 0
+            fh = open(p, "a", newline="", encoding="utf-8")
+            w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+            if new:
+                w.writeheader()
+                fh.flush()
+            self._handles[kind] = fh
+            self._writers[kind] = w
+            self.paths[kind] = str(p)
+
+    def write(self, kind: str, rows: list[dict]) -> None:
+        if not self.enabled or not rows:
+            return
+        with self._lock:
+            w = self._writers[kind]
+            for r in rows:
+                w.writerow({k: _safe_cell(v) for k, v in r.items()})
+            self.counts[kind] += len(rows)
+            self._handles[kind].flush()
+
+    def close(self) -> None:
+        with self._lock:
+            for fh in self._handles.values():
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            self._handles.clear()
+            self._writers.clear()
+
+
+# ==========================================================================
+# Rate limiting
+# ==========================================================================
+
+class _Bucket:
+    """One endpoint class with its own published per-minute ceiling."""
+
+    def __init__(self, name: str, limit_rpm: int, budget_pct: float) -> None:
+        self.name = name
+        self.limit_rpm = float(limit_rpm)
+        self.target_rpm = max(1.0, self.limit_rpm * budget_pct / 100.0)
+        self.rpm = self.target_rpm
+        self.next_slot = 0.0
+        self.cooldown_until = 0.0
+        self.throttles = 0
+        self.requests = 0
+        self.last_change = 0.0
+
+
+class RateLimiter:
+    """Per-endpoint-class pacing against Veracode's published rate limits.
+
+    Veracode publishes three separate ceilings, all per IP address:
+        Flaw Report / Results XML APIs   80 calls/minute
+        All other XML APIs              250 calls/minute
+        All REST APIs                   500 calls/minute
+
+    A single global limiter has to be tuned for the tightest of the three, so
+    the 250/min bucket ends up running at a fraction of what it is allowed.
+    Pacing each class against its own ceiling is both faster and more accurate
+    about what is actually being consumed.
+
+    Requests within a bucket are spaced evenly rather than burst, so traffic
+    never spikes at the start of a minute window.
+
+    On a 429 the offending bucket halves its rate immediately (multiplicative
+    decrease), honours Retry-After, then recovers additively toward the
+    configured budget. Other buckets are untouched, because their ceilings are
+    independent.
+    """
+
+    LIMITS: dict[str, int] = {"report": 80, "xml": 250, "rest": 500}
+
+    # The Flaw Report and Results XML APIs share the tighter 80/min ceiling.
+    REPORT_ENDPOINTS: frozenset[str] = frozenset({
+        "detailedreport.do", "summaryreport.do", "generateflawreport.do",
+        "downloadflawreport.do", "detailedreportpdf.do", "summaryreportpdf.do",
+        "thirdpartyreportpdf.do", "sharedreport.do", "sharedreportpdf.do",
+        "getsharedreportinfo.do", "getsharedreportlist.do",
+    })
+
+    RECOVERY_INTERVAL = 30.0     # seconds between additive recovery steps
+
+    def __init__(self, budget_pct: float = 70.0) -> None:
+        self.budget_pct = max(1.0, min(100.0, budget_pct))
+        self._lock = threading.Lock()
+        self.buckets = {n: _Bucket(n, lim, self.budget_pct)
+                        for n, lim in self.LIMITS.items()}
+        self.started = time.monotonic()
+
+    @classmethod
+    def classify(cls, endpoint: str) -> str:
+        return "report" if endpoint in cls.REPORT_ENDPOINTS else "xml"
+
+    def _recover(self, b: _Bucket, now: float) -> None:
+        """Additive increase back toward the configured budget after a 429."""
+        if b.rpm >= b.target_rpm or now - b.last_change < self.RECOVERY_INTERVAL:
+            return
+        b.rpm = min(b.target_rpm, b.rpm + max(1.0, b.target_rpm * 0.1))
+        b.last_change = now
+        log.debug("Rate bucket '%s' recovering to %.0f/min", b.name, b.rpm)
+
+    def acquire(self, cls_name: str) -> None:
+        """Reserve the next slot in this bucket, then sleep outside the lock so
+        workers are paced without being serialised behind each other."""
+        b = self.buckets[cls_name]
+        with self._lock:
+            now = time.monotonic()
+            self._recover(b, now)
+            start = max(now, b.next_slot, b.cooldown_until)
+            b.next_slot = start + 60.0 / b.rpm
+            b.requests += 1
+            wait = start - now
+        if wait > 0:
+            time.sleep(wait)
+        # A 429 may have extended the cooldown while we were sleeping.
+        while True:
+            with self._lock:
+                extra = b.cooldown_until - time.monotonic()
+            if extra <= 0:
+                return
+            time.sleep(min(extra, 5.0))
+
+    def throttled(self, cls_name: str, retry_after: float | None) -> None:
+        b = self.buckets[cls_name]
+        with self._lock:
+            b.throttles += 1
+            cool = retry_after if retry_after is not None else min(60.0, 5.0 * b.throttles)
+            b.cooldown_until = max(b.cooldown_until, time.monotonic() + cool)
+            b.rpm = max(self.LIMITS[cls_name] * 0.05, b.rpm * 0.5)
+            b.last_change = time.monotonic()
+            new_rpm = b.rpm
+        log.warning("[!] Rate limited on the '%s' bucket%s. Pausing %.0fs and halving "
+                    "that bucket to %.0f/min (limit %d/min). Other buckets unaffected.",
+                    cls_name,
+                    f" (Retry-After {retry_after:g}s)" if retry_after is not None else "",
+                    cool, new_rpm, self.LIMITS[cls_name])
+
+    def report(self) -> list[str]:
+        elapsed_min = max((time.monotonic() - self.started) / 60.0, 1e-6)
+        out: list[str] = []
+        for n, b in self.buckets.items():
+            if not b.requests:
+                continue
+            observed = b.requests / elapsed_min
+            out.append(f"{n}: {b.requests:,} requests, {observed:.0f}/min observed "
+                       f"vs {b.limit_rpm:.0f}/min limit "
+                       f"({_pct(observed, b.limit_rpm):.0f}% of ceiling), "
+                       f"{b.throttles} throttle event(s)")
+        return out
+
+
 # ==========================================================================
 # API Client
 # ==========================================================================
 
 class AuthError(Exception):
-    """Raised only when authentication cannot possibly succeed.
-    """
+    """Raised only when authentication cannot possibly succeed, e.g. the very
+    first call of the run fails after the full retry window. Never raised
+    mid-run: a 401 after ten hours of collection is retried, not fatal."""
 
 
 class TransientAuthError(Exception):
-    """A 401/403 that survived the full per-request retry window
-    """
+    """A 401/403 that survived the full per-request retry window.
+
+    Deliberately NOT a requests.HTTPError, so the per-endpoint handlers below
+    do not swallow it and silently report the application as having no data.
+    It propagates to the worker, which records an explicit 'Error' row and
+    moves on to the next application."""
 
 
 class VeracodeClient:
     """Veracode API client with request-level pacing and adaptive backoff.
 
-    Pacing is applied per HTTP request, not per application. 
+    Pacing is applied per HTTP request, not per application. Each application
+    costs 6+ calls, so spacing only the applications leaves every call inside an
+    application unthrottled, which is what overwhelms the API on large tenants.
+
+    Authentication failures are retried with exponential backoff rather than
+    aborting. HMAC credentials are signed per request, so a 401 mid-run is
+    almost always a transient condition (credential rotation, a brief admin
+    revocation, a WAF or gateway blip). Throwing away hours of collection over
+    one of those is not an acceptable failure mode.
     """
 
+    AUTH_RETRY_BASE = 30.0       # first backoff after a 401/403
+    AUTH_RETRY_CAP = 300.0       # ceiling on a single auth backoff
+    NET_RETRIES = 5              # connection-level retries per request
+
     def __init__(self, region: str = "commercial", timeout: int = 120,
-                 pool_size: int = 10, rate_delay: float = 0.15,
+                 pool_size: int = 16, rate_budget: float = 70.0,
                  max_retries: int = 8, backoff_factor: float = 2.0,
-                 auth_retry_base: float = 30.0, auth_retry_cap: float = 300.0,
-                 auth_retry_window: float = 3600.0,
-                 net_retries: int = 5) -> None:
+                 auth_retry_window: float = 3600.0) -> None:
         self._cfg = REGIONS[region]
         self._timeout = timeout
         self._s = requests.Session()
         self._s.auth = RequestsAuthPluginVeracodeHMAC()
-        self._s.headers["User-Agent"] = "veracode-scan-health-py/3.1"
+        self._s.headers["User-Agent"] = "veracode-scan-health-py/4.0"
 
         retry = Retry(total=max_retries, backoff_factor=backoff_factor,
-                      status_forcelist=(429, 500, 502, 503, 504),
+                      status_forcelist=(500, 502, 503, 504),
                       allowed_methods=("GET",),
                       respect_retry_after_header=True,
                       raise_on_status=False)
-        # Default pool_maxsize is 10
-        pool = max(10, pool_size)
+        # 429 is deliberately absent from status_forcelist: the RateLimiter
+        # handles it, because a blind urllib3 retry would keep the offending
+        # bucket at the same rate and simply collide again.
+        pool = max(16, pool_size)
         self._s.mount("https://", HTTPAdapter(max_retries=retry,
                                               pool_connections=pool, pool_maxsize=pool))
 
-        # --- request pacing and adaptive throttle state
-        self._rate_delay = max(0.0, rate_delay)
-        self._base_delay = max(0.0, rate_delay)
-        self._next_slot = 0.0
+        self.limiter = RateLimiter(rate_budget)
         self._rate_lock = threading.Lock()
-        self._cooldown_until = 0.0
-        self.throttle_events = 0        # observed 429/503 responses
         self.request_count = 0
 
         # --- authentication retry state
-        self._auth_base = max(1.0, auth_retry_base)
-        self._auth_cap = max(self._auth_base, auth_retry_cap)
         self._auth_window = max(0.0, auth_retry_window)
-        self._net_retries = max(0, net_retries)
         self.auth_retry_events = 0
         self.auth_give_ups = 0
         self.net_retry_events = 0
         self.first_call_done = False
 
-    # ------------------------------------------------------------------
-    # Pacing
-    # ------------------------------------------------------------------
-    def _pace(self) -> None:
-        """Space outbound requests globally across all worker threads.
-
-        Reserves the next time slot under a short-lived lock, then sleeps
-        outside it, so workers are paced without being serialised.
-        """
-        while True:
-            with self._rate_lock:
-                now = time.monotonic()
-                start_at = max(now, self._next_slot, self._cooldown_until)
-                if self._rate_delay > 0 or start_at > now:
-                    self._next_slot = start_at + self._rate_delay
-                wait = start_at - now
-            if wait <= 0:
-                return
-            time.sleep(wait)
-            # Re-check: a 429 may have extended the cooldown while we slept.
-            with self._rate_lock:
-                if time.monotonic() >= self._cooldown_until:
-                    return
-
-    def _note_throttle(self, resp: requests.Response) -> None:
-        """React to a rate-limit response by slowing the whole client down.
-
-        urllib3 already retries the individual request.
-        """
-        if resp.status_code not in (429, 503):
-            return
-        retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-        with self._rate_lock:
-            self.throttle_events += 1
-            cooldown = retry_after if retry_after is not None else min(
-                60.0, 2.0 * max(self._rate_delay, 0.5) * self.throttle_events)
-            self._cooldown_until = max(self._cooldown_until,
-                                       time.monotonic() + cooldown)
-            self._rate_delay = min(5.0, max(self._rate_delay * 1.5, 0.2))
-            new_delay = self._rate_delay
-        log.warning("[!] Rate limited (HTTP %d)%s. Pausing %.1fs and increasing "
-                    "request spacing to %.2fs (throttle event #%d).",
-                    resp.status_code,
-                    f", Retry-After: {retry_after:g}s" if retry_after is not None else "",
-                    cooldown, new_delay, self.throttle_events)
+    @property
+    def throttle_events(self) -> int:
+        return sum(b.throttles for b in self.limiter.buckets.values())
 
     # ------------------------------------------------------------------
     # Transport
     # ------------------------------------------------------------------
     def _auth_wait(self, attempt: int) -> float:
         """Exponential backoff for authentication retries, capped."""
-        return min(self._auth_cap, self._auth_base * (2 ** max(0, attempt - 1)))
+        return min(self.AUTH_RETRY_CAP, self.AUTH_RETRY_BASE * (2 ** max(0, attempt - 1)))
 
-    def _get(self, url: str, params: dict | None) -> requests.Response:
-        """GET with pacing, adaptive throttle handling, and retry on auth and
+    def _get(self, url: str, params: dict | None, bucket: str) -> requests.Response:
+        """GET with per-bucket pacing, throttle handling, and retry on auth and
         connection failures.
+
+        A 401/403 is retried for up to the configured window before this single
+        request is abandoned. The run itself is never abandoned: the caller
+        records the affected application as 'Error' and continues, and every
+        completed application is already durable in the checkpoint.
         """
         auth_attempt = 0
         auth_waited = 0.0
         net_attempt = 0
         while True:
-            self._pace()
+            self.limiter.acquire(bucket)
             try:
                 r = self._s.get(url, params=params, timeout=self._timeout)
             except requests.RequestException as e:
                 net_attempt += 1
-                if net_attempt > self._net_retries:
+                if net_attempt > self.NET_RETRIES:
                     raise
                 with self._rate_lock:
                     self.net_retry_events += 1
                 wait = min(60.0, 2.0 ** net_attempt)
                 log.warning("[!] Network error on %s (%s: %s). Retry %d/%d in %.0fs.",
-                            url, type(e).__name__, e, net_attempt, self._net_retries, wait)
+                            url, type(e).__name__, e, net_attempt, self.NET_RETRIES, wait)
                 time.sleep(wait)
                 continue
 
             with self._rate_lock:
                 self.request_count += 1
 
-            if r.status_code in (429, 503):
-                self._note_throttle(r)
+            if r.status_code == 429:
+                self.limiter.throttled(bucket, _parse_retry_after(r.headers.get("Retry-After")))
+                continue        # re-paced at the reduced rate
 
             if r.status_code in (401, 403):
                 auth_attempt += 1
@@ -715,7 +875,7 @@ class VeracodeClient:
     def __exit__(self, *a: object) -> None: self.close()
 
     def _xml(self, ep: str, params: dict | None = None) -> ET.Element:
-        r = self._get(f"{self._cfg['xml']}/{ep}", params)
+        r = self._get(f"{self._cfg['xml']}/{ep}", params, RateLimiter.classify(ep))
         r.raise_for_status()
         # Parse bytes, not r.text: the XML declaration is authoritative, while
         # r.text falls back to charset guessing when the server sends no
@@ -723,7 +883,7 @@ class VeracodeClient:
         return ET.fromstring(_NS_B.sub(b"", r.content, count=0))
 
     def _rest(self, path: str, params: dict | None = None) -> dict:
-        r = self._get(f"{self._cfg['rest']}{path}", params)
+        r = self._get(f"{self._cfg['rest']}{path}", params, "rest")
         r.raise_for_status()
         return r.json()
 
@@ -771,13 +931,30 @@ class VeracodeClient:
             log.debug("getsandboxlist.do failed: %s", e); return []
         return [{"id": s.get("sandbox_id",""), "name": s.get("sandbox_name","")} for s in root.findall(".//sandbox")]
 
-    def get_build_info(self, aid: int, bid: str) -> dict | None:
-        """Get build status to determine if scan is published."""
-        try: root = self._xml("getbuildinfo.do", {"app_id": aid, "build_id": bid})
-        except (requests.HTTPError, ET.ParseError): return None
+    def get_build_info(self, aid: int, bid: str | None = None,
+                       sbx: str | None = None) -> dict | None:
+        """Build status and published date.
+
+        Called without a build_id, getbuildinfo.do returns the most recent scan
+        for the profile, which is what this tool wants in the overwhelming
+        majority of cases. That turns build discovery into a single request
+        instead of getbuildlist plus one getbuildinfo per build walked, and it
+        is the single largest reduction in API cost per application.
+        """
+        p: dict = {"app_id": aid}
+        if bid: p["build_id"] = bid
+        if sbx: p["sandbox_id"] = sbx
+        try: root = self._xml("getbuildinfo.do", p)
+        except (requests.HTTPError, ET.ParseError) as e:
+            log.debug("getbuildinfo.do failed for app %s build %s: %s", aid, bid, e)
+            return None
         au = root.find(".//analysis_unit")
         if au is None: return None
-        return {"status": au.get("status",""), "published": au.get("published_date","")}
+        build = root.find(".//build")
+        return {"build_id": (build.get("build_id") if build is not None else bid) or bid or "",
+                "version": unescape(build.get("version", "")) if build is not None else "",
+                "status": au.get("status", ""),
+                "published": au.get("published_date", "")}
 
     def get_detailed_report(self, bid: str) -> dict | None:
         try: root = self._xml("detailedreport.do", {"build_id": bid})
@@ -866,11 +1043,11 @@ class VeracodeClient:
                 "issues": issues, "is_selected": False, "is_ignored": False, "is_third_party": False})
         return mods
 
-    def get_app_info(self, aid: int) -> dict | None:
-        try: root = self._xml("getappinfo.do", {"app_id": aid})
-        except (requests.HTTPError, ET.ParseError): return None
-        a = root.find(".//application")
-        return {"modified": a.get("modified_date","")} if a is not None else None
+    # getappinfo.do is deliberately not called. It was used only to date check
+    # #30 (scan recency) from the profile's modified_date, but detailedreport
+    # already returns the scan's published_date in a response we always fetch.
+    # Published date is also the more honest signal for "not scanned recently":
+    # modified_date moves when anyone edits the profile, which is not a scan.
 
 
 # ==========================================================================
@@ -1256,12 +1433,17 @@ def check_29_module_count(files: list[dict], modules: list[dict], _f: FlawSummar
         recs.append("Follow packaging guidance.")
     return issues, recs
 
-def check_30_regular_scans(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], app_mod: str) -> tuple[list[Issue], list[str]]:
+def check_30_regular_scans(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], last_scan: str) -> tuple[list[Issue], list[str]]:
+    """Scan recency, measured from the published date of this scan.
+
+    Sourced from detailedreport, which is fetched anyway, so this check costs
+    no additional API call.
+    """
     issues: list[Issue] = []; recs: list[str] = []
-    if app_mod:
-        ds = _days_since(app_mod)
+    if last_scan:
+        ds = _days_since(last_scan)
         if ds is not None and ds > STALE_SCAN_DAYS:
-            issues.append(_chk("medium", f"Application not scanned recently (last activity {ds} days ago)."))
+            issues.append(_chk("medium", f"Application not scanned recently (last policy scan {ds} days ago)."))
             recs.append("Regular scanning via automation allows faster response to new issues.")
     return issues, recs
 
@@ -1341,21 +1523,53 @@ def run_checks(files: list[dict], modules: list[dict], flaws: FlawSummary,
 # Orchestration
 # ==========================================================================
 
-def _find_latest_published_build(client: VeracodeClient, aid: int, builds: list[dict]) -> dict | None:
-    """Return the latest build that has published results, searching from newest to oldest."""
+MAX_BUILD_WALK = 5   # cap on how far back to walk when the newest is unpublished
+
+
+def _find_latest_published_build(client: VeracodeClient, aid: int,
+                                 sbx: str | None = None) -> dict | None:
+    """Locate the newest build with published results.
+
+    Fast path (one request): getbuildinfo.do without a build_id returns the most
+    recent scan. If it is published, we are done and never call getbuildlist.
+
+    Slow path: only when the newest scan is unpublished (mid-scan, prescan
+    failed, deleted results). Then we fetch the build list and walk back, but no
+    further than MAX_BUILD_WALK, so a profile with 400 historic builds and no
+    published results costs a bounded number of requests instead of 400.
+    """
+    latest = client.get_build_info(aid, sbx=sbx)
+    if latest and latest.get("published") and latest.get("build_id"):
+        return {"id": latest["build_id"], "ver": latest.get("version", "")}
+
+    builds = client.get_builds(aid, sbx)
+    if not builds:
+        # No list either: fall back to whatever the single lookup returned.
+        if latest and latest.get("build_id"):
+            return {"id": latest["build_id"], "ver": latest.get("version", "")}
+        return None
+
+    newest_id = (latest or {}).get("build_id")
+    walked = 0
     for b in reversed(builds):
-        bi = client.get_build_info(aid, b["id"])
+        if b["id"] == newest_id:
+            continue          # already known to be unpublished
+        walked += 1
+        if walked > MAX_BUILD_WALK:
+            log.debug("app %s: stopped walking builds after %d unpublished",
+                      aid, MAX_BUILD_WALK)
+            break
+        bi = client.get_build_info(aid, b["id"], sbx)
         if bi and bi.get("published"):
             return b
-    # Fallback: return the last build even if not published
-    return builds[-1] if builds else None
+    # Nothing published: return the newest build so prescan diagnostics still run.
+    return builds[-1]
 
 
-def _process_build(client: VeracodeClient, app: dict, builds: list[dict],
+def _process_build(client: VeracodeClient, app: dict, build: dict,
                    legacy_id: int, sandbox_name: str = "",
                    skip_checks: set[int] | None = None,
                    prev_data: dict | None = None) -> tuple[ScanResult, list[ModuleRow], list[FileRow], list[RecommendationRow], list[AggIssue], TrendRow | None]:
-    build = _find_latest_published_build(client, legacy_id, builds)
     if build is None:
         sr = _empty_result(app, legacy_id, sandbox_name)
         sr.issues_text = "[HIGH] No published build found"
@@ -1366,8 +1580,6 @@ def _process_build(client: VeracodeClient, app: dict, builds: list[dict],
     dr = client.get_detailed_report(bid)
     files = client.get_files(legacy_id, bid)
     prescan = client.get_prescan(legacy_id, bid)
-    app_info = client.get_app_info(legacy_id)
-    app_mod_date = (app_info or {}).get("modified","") if not sandbox_name else ""
 
     if dr is None:
         fl = FlawSummary()
@@ -1389,9 +1601,13 @@ def _process_build(client: VeracodeClient, app: dict, builds: list[dict],
     tri_url = f"{base}/auth/index.jsp#ReviewResultsStaticFlaws:{acct}:{aid_str}:{bid}:{an_id}:{sau}::::{sbx_id}" if acct else ""
 
     scan_meta = {"review_url": rev_url, "triage_url": tri_url, "analysis_size": dr.get("analysis_size",0)}
+    # Check #30 gets the scan's own published date. Sandboxes are excluded:
+    # sandbox scans are developer iterations and are not the signal for whether
+    # an application is under regular policy scanning.
+    recency_date = dr.get("published", "") if not sandbox_name else ""
     issues, recs, check_recs = run_checks(files, modules, fl, scan_meta,
                               dr.get("sca_on",False), dr.get("sca_comps",[]),
-                              app_mod_date, skip_checks)
+                              recency_date, skip_checks)
 
     hi = sum(1 for i in issues if i.severity=="high")
     mi = sum(1 for i in issues if i.severity=="medium")
@@ -1523,13 +1739,13 @@ def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
         log.debug("    Skipping (already checkpointed): %s", app["name"])
         return rs, ms, fs, rrs, ais, ts
 
-    builds = client.get_builds(lid)
-    if not builds:
+    build = _find_latest_published_build(client, lid)
+    if build is None:
         if skip_no: return rs, ms, fs, rrs, ais, ts
         rs.append(_empty_result(app, lid))
         return rs, ms, fs, rrs, ais, ts
 
-    sr, mr, fr, rr, ai, tr = _process_build(client, app, builds, lid,
+    sr, mr, fr, rr, ai, tr = _process_build(client, app, build, lid,
                                          skip_checks=skip_checks, prev_data=prev_data)
     rs.append(sr); ms.extend(mr); fs.extend(fr); rrs.extend(rr); ais.extend(ai)
     if tr: ts.append(tr)
@@ -1538,9 +1754,9 @@ def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
         for sb in client.get_sandboxes(lid):
             sb_key = (app["name"], sb["name"])
             if resume_keys and sb_key in resume_keys: continue
-            sb_builds = client.get_builds(lid, sb["id"])
-            if not sb_builds: continue
-            sr2, mr2, fr2, rr2, ai2, tr2 = _process_build(client, app, sb_builds, lid, sb["name"],
+            sb_build = _find_latest_published_build(client, lid, sb["id"])
+            if sb_build is None: continue
+            sr2, mr2, fr2, rr2, ai2, tr2 = _process_build(client, app, sb_build, lid, sb["name"],
                                                        skip_checks=skip_checks, prev_data=prev_data)
             rs.append(sr2); ms.extend(mr2); fs.extend(fr2); rrs.extend(rr2); ais.extend(ai2)
             if tr2: ts.append(tr2)
@@ -1549,47 +1765,51 @@ def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
 
 
 # ==========================================================================
-# Resume (legacy xlsx path; the JSONL checkpoint above supersedes this)
+# Progress
 # ==========================================================================
 
-def _load_prior_rows(path: str, sheet: str) -> list[dict]:
-    """Read a sheet from a prior run back into row dicts, so a resumed run can
-    carry earlier results forward instead of emitting only the remainder."""
-    rows: list[dict] = []
-    try:
-        wb = load_workbook(path, read_only=True)
-        if sheet not in wb.sheetnames:
-            wb.close(); return rows
-        ws = wb[sheet]
-        it = ws.iter_rows(values_only=True)
-        headers = [str(h) if h is not None else "" for h in next(it, ())]
-        if not headers:
-            wb.close(); return rows
-        for r in it:
-            if r is None or all(v is None for v in r):
-                continue
-            rows.append({h: v for h, v in zip(headers, r) if h})
-        wb.close()
-    except Exception as e:
-        log.warning("Could not read '%s' from %s: %s", sheet, path, e)
-    return rows
+class Progress:
+    """Throughput and ETA reporting for runs measured in hours."""
+
+    def __init__(self, total: int, already_done: int = 0, every: int = 25,
+                 every_seconds: float = 120.0) -> None:
+        self.total = total
+        self.done = 0
+        self.errors = 0
+        self.skipped = already_done
+        self.every = max(1, every)
+        self.every_seconds = every_seconds
+        self.started = time.monotonic()
+        self._last = self.started
+        self._lock = threading.Lock()
+
+    def tick(self, error: bool = False) -> None:
+        with self._lock:
+            self.done += 1
+            if error:
+                self.errors += 1
+            now = time.monotonic()
+            due = (self.done % self.every == 0) or (now - self._last >= self.every_seconds)
+            if not due:
+                return
+            self._last = now
+            elapsed = now - self.started
+            rate = self.done / elapsed * 60.0 if elapsed > 0 else 0.0
+            remaining = self.total - self.done
+            eta = remaining / rate * 60.0 if rate > 0 else 0.0
+            log.info("[=] %d/%d profiles (%.1f%%) | %.1f/min | %d error(s) | "
+                     "elapsed %s | ETA %s",
+                     self.done, self.total, _pct(self.done, self.total),
+                     rate, self.errors, _hms(elapsed), _hms(eta) if rate else "unknown")
 
 
-def _load_resume_keys(path: str) -> set[tuple[str, str]]:
-    keys: set[tuple[str, str]] = set()
-    try:
-        wb = load_workbook(path, read_only=True)
-        ws = wb["Scan Health Summary"]
-        headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
-        ai = headers.index("App Name") if "App Name" in headers else -1
-        si = headers.index("Sandbox") if "Sandbox" in headers else -1
-        if ai >= 0:
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                keys.add((str(row[ai] or ""), str(row[si] or "") if si >= 0 else ""))
-        wb.close()
-    except Exception as e:
-        log.warning("Could not load resume file: %s", e)
-    return keys
+def _hms(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m{sec:02d}s" if m else f"{sec}s"
 
 
 # ==========================================================================
@@ -3674,72 +3894,159 @@ def _print_summary(health: list[dict]) -> None:
             print(f"  [{count}x] {pattern[:100]}")
 
 
+def _plan_note(n_apps: int, sandboxes: bool, budget: float) -> str:
+    """Estimate runtime from the published limits and the real call mix.
+
+    Per policy profile the tool now costs 4 requests: getbuildinfo (fast path),
+    detailedreport, getfilelist, getprescanresults. Exactly one of those lands
+    in the 80/min bucket and three in the 250/min bucket, so at any budget the
+    two ceilings bind at almost the same point (80 vs 250/3 = 83 profiles/min).
+    """
+    per_app = 4.0
+    if sandboxes:
+        per_app += 1.0 + 4.0        # sandbox list, plus one sandbox on average
+    report_rpm = RateLimiter.LIMITS["report"] * budget / 100.0
+    xml_rpm = RateLimiter.LIMITS["xml"] * budget / 100.0
+    report_calls = 1.0 + (1.0 if sandboxes else 0.0)
+    xml_calls = per_app - report_calls
+    apps_per_min = min(report_rpm / report_calls, xml_rpm / max(xml_calls, 0.001))
+    secs = n_apps / apps_per_min * 60.0 if apps_per_min else 0.0
+    return (f"~{per_app:.0f} requests/profile, {apps_per_min:.0f} profiles/min at "
+            f"{budget:.0f}% of the published limits: estimated {_hms(secs)} for "
+            f"{n_apps:,} profiles")
+
+
+def _print_summary(health: list[dict]) -> None:
+    tot = len(health)
+    good = sum(1 for r in health if r.get("Health")=="Good")
+    fair = sum(1 for r in health if r.get("Health")=="Fair")
+    poor = sum(1 for r in health if r.get("Health")=="Poor")
+    err = sum(1 for r in health if r.get("Scan Status")=="Error")
+    print(f"\nTenant Summary: {tot} apps - Good: {good}, Fair: {fair}, Poor: {poor}, Error: {err}")
+    counter: Counter[str] = Counter()
+    for r in health:
+        txt = r.get("Issues","")
+        if txt == "None": continue
+        for part in str(txt).split("; "):
+            clean = re.sub(r'\[(?:HIGH|MEDIUM|LOW)\]\s*', '', part).strip()
+            clean = re.sub(r'"[^"]*"', '(name)', clean)
+            if clean: counter[clean] += 1
+    if counter:
+        print("Top issues:")
+        for pattern, count in counter.most_common(3):
+            print(f"  [{count}x] {pattern[:100]}")
+
+
+# Flags that existed in earlier versions and no longer do anything. Accepted
+# silently-with-a-warning rather than rejected, so scheduled jobs do not start
+# hard-failing on an upgrade.
+_RETIRED_FLAGS = {
+    "--request-delay": "replaced by --rate-budget, which paces each endpoint "
+                       "class against its own published limit",
+    "--delay": "removed: it paced applications, not requests, and was always "
+               "non-binding behind the request pacer",
+    "--resume": "removed: the JSONL checkpoint resumes automatically",
+    "--no-checkpoint": "removed: checkpointing is always on",
+    "--auth-retry-base": "removed: fixed at 30s",
+    "--auth-retry-cap": "removed: fixed at 300s",
+    "--net-retries": "removed: fixed at 5",
+}
+
+
+def _strip_retired(argv: list[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        name = a.split("=", 1)[0]
+        if name in _RETIRED_FLAGS:
+            log.warning("[!] %s is retired and ignored: %s", name, _RETIRED_FLAGS[name])
+            if "=" not in a and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1      # consume its value
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
 def main() -> None:
-    p = argparse.ArgumentParser(description="Veracode Tenant-Wide Scan Health v3.1")
+    p = argparse.ArgumentParser(
+        description="Veracode Tenant-Wide Scan Health v4.0",
+        epilog="Rate limits are per IP address, not per credential. If CI runners or "
+               "other automation share this host's egress IP, lower --rate-budget.")
     p.add_argument("--output", default=f"scan_health_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
     p.add_argument("--output-format", choices=["xlsx","csv","json"], default="xlsx")
-    p.add_argument("--max-apps", type=int, default=0)
-    p.add_argument("--request-delay", type=float, default=0.15,
-                   help="Seconds between individual API requests, applied globally across "
-                        "all workers (default 0.15, about 6-7 requests/sec). This is the "
-                        "setting that throttles the API: each application costs 6+ requests. "
-                        "Raise it to be gentler; 0 disables pacing entirely (not recommended).")
-    p.add_argument("--max-retries", type=int, default=8,
-                   help="Retry attempts for 429/5xx responses (default 8)")
-    p.add_argument("--retry-backoff", type=float, default=2.0,
-                   help="Exponential backoff factor between retries (default 2.0)")
-    p.add_argument("--delay", type=float, default=0.5,
-                   help="Seconds between applications. Note: paces applications, not "
-                        "individual requests; use --request-delay to throttle the API.")
-    p.add_argument("--skip-no-scan", action="store_true")
-    p.add_argument("--include-sandboxes", action="store_true")
     p.add_argument("--region", choices=["commercial","eu"], default="commercial")
-    p.add_argument("--app-name-filter", default=None, help="Regex to filter app names")
-    p.add_argument("--parallel", type=int, default=1, help="Concurrent workers (default 1)")
-    p.add_argument("--resume", default=None,
-                   help="Path to a prior xlsx to skip already-processed apps. Legacy; the "
-                        "JSONL checkpoint resumes automatically and is far more reliable.")
-    p.add_argument("--previous-report", default=None, help="Path to prior xlsx for trend analysis")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--log-level", choices=["DEBUG","INFO","WARNING"], default="INFO")
+
+    # --- pacing
+    p.add_argument("--rate-budget", type=float, default=70.0, metavar="PCT",
+                   help="Share of Veracode's published per-IP rate limits to consume, "
+                        "per endpoint class (default 70). Each class is paced against its "
+                        "own ceiling: 80/min for detailedreport and the other Results XML "
+                        "APIs, 250/min for the remaining XML APIs, 500/min for REST. "
+                        "Lower this if other automation shares your egress IP.")
+    p.add_argument("--parallel", type=int, default=8, metavar="N",
+                   help="Concurrent workers (default 8). This does NOT raise the request "
+                        "rate, which is fixed by --rate-budget. It exists so that slow "
+                        "responses (detailedreport on a large application can take tens of "
+                        "seconds) do not leave the rate budget unused.")
+    p.add_argument("--max-retries", type=int, default=8,
+                   help="Retry attempts for 5xx responses (default 8). 429 is handled by "
+                        "the rate limiter, not by blind retry.")
+    p.add_argument("--retry-backoff", type=float, default=2.0,
+                   help="Exponential backoff factor for 5xx retries (default 2.0)")
     p.add_argument("--timeout", type=int, default=120)
+    p.add_argument("--auth-retry-window", type=float, default=3600.0, metavar="SECONDS",
+                   help="How long to keep retrying a single request through 401/403 before "
+                        "abandoning THAT REQUEST (default 3600). The run never aborts on a "
+                        "mid-run auth failure.")
+
+    # --- scope
+    p.add_argument("--max-apps", type=int, default=0)
+    p.add_argument("--app-name-filter", default=None, help="Regex to filter app names")
+    p.add_argument("--include-sandboxes", action="store_true",
+                   help="Also evaluate sandbox scans. Roughly doubles runtime.")
+    p.add_argument("--skip-no-scan", action="store_true")
     p.add_argument("--skip-checks", default=None, help="Comma-separated check numbers to skip")
-    p.add_argument("--dashboard", action="store_true",
-                   help="Generate the executive dashboard (heatmaps, KPIs, attention scores)")
+
+    # --- output
+    p.add_argument("--detail", choices=["csv","xlsx","none"], default="csv",
+                   help="Where per-module and per-file rows go. 'csv' (default) streams them "
+                        "to companion CSVs during the run: constant memory, no row cap. "
+                        "'xlsx' buffers them into the workbook, which is fine for small "
+                        "tenants but will exhaust memory and hit Excel's 1,048,576-row "
+                        "ceiling on a large one. 'none' discards them.")
+    p.add_argument("--no-dashboard", action="store_true",
+                   help="Skip the executive dashboard sheets. The dashboard costs no API "
+                        "calls, so it is on by default.")
     p.add_argument("--dashboard-output", default=None,
-                   help="Dashboard workbook path. Only used when --output-format is csv or "
-                        "json; with xlsx the dashboard sheets are added to the main report")
+                   help="Dashboard workbook path, used only when --output-format is csv or json")
+    p.add_argument("--previous-report", default=None, help="Path to prior xlsx for trend analysis")
+
     # --- durability
     p.add_argument("--checkpoint", default=None,
                    help="JSONL checkpoint path (default: <output>.ckpt.jsonl). Written and "
-                        "fsync'd after every application. Rerun with the same path to resume "
-                        "exactly where the previous run stopped.")
-    p.add_argument("--no-checkpoint", action="store_true",
-                   help="Disable incremental checkpointing. Not recommended: a failure then "
-                        "loses the entire run.")
+                        "fsync'd after every profile. Rerun the same command to resume.")
     p.add_argument("--restart", action="store_true",
-                   help="Ignore and overwrite any existing checkpoint, starting from scratch.")
-    # --- auth retry
-    p.add_argument("--auth-retry-base", type=float, default=30.0,
-                   help="Initial backoff in seconds after a 401/403 (default 30)")
-    p.add_argument("--auth-retry-cap", type=float, default=300.0,
-                   help="Maximum single backoff in seconds between auth retries (default 300)")
-    p.add_argument("--auth-retry-window", type=float, default=3600.0,
-                   help="Total seconds to keep retrying a single request through 401/403 "
-                        "before giving up on THAT REQUEST ONLY (default 3600). The run "
-                        "itself never aborts on a mid-run auth failure.")
-    p.add_argument("--net-retries", type=int, default=5,
-                   help="Retries for connection-level failures per request (default 5)")
-    args = p.parse_args()
+                   help="Move any existing checkpoint aside and start from scratch")
 
-    # Validate numeric options up front; bad values otherwise fail deep into a
-    # long run (or, for parallel<1, raise inside ThreadPoolExecutor).
+    p.add_argument("--dry-run", action="store_true",
+                   help="List the profiles that would be processed, with a runtime estimate")
+    p.add_argument("--log-level", choices=["DEBUG","INFO","WARNING"], default="INFO")
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S",
+                        force=True)
+    args = p.parse_args(_strip_retired(sys.argv[1:]))
+
     if args.parallel < 1:
         p.error("--parallel must be >= 1")
-    if args.delay < 0:
-        p.error("--delay must be >= 0")
-    if args.request_delay < 0:
-        p.error("--request-delay must be >= 0")
+    if not 1 <= args.rate_budget <= 100:
+        p.error("--rate-budget must be between 1 and 100")
+    if args.rate_budget > 85:
+        log.warning("[!] --rate-budget %.0f%% leaves little headroom for other consumers "
+                    "of this egress IP and makes 429s likely.", args.rate_budget)
     if args.max_retries < 0:
         p.error("--max-retries must be >= 0")
     if args.retry_backoff < 0:
@@ -3748,59 +4055,37 @@ def main() -> None:
         p.error("--timeout must be >= 1")
     if args.max_apps < 0:
         p.error("--max-apps must be >= 0")
-    if args.auth_retry_base <= 0:
-        p.error("--auth-retry-base must be > 0")
-    if args.auth_retry_cap < args.auth_retry_base:
-        p.error("--auth-retry-cap must be >= --auth-retry-base")
     if args.auth_retry_window < 0:
         p.error("--auth-retry-window must be >= 0")
-    if args.net_retries < 0:
-        p.error("--net-retries must be >= 0")
     if args.app_name_filter:
         try:
             re.compile(args.app_name_filter)
         except re.error as e:
             p.error(f"--app-name-filter is not a valid regex: {e}")
 
-    logging.basicConfig(level=getattr(logging, args.log_level),
-                        format="%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S",
-                        force=True)
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
 
     skip_checks: set[int] = set()
     if args.skip_checks:
-        skip_checks = {int(x.strip()) for x in args.skip_checks.split(",")}
+        try:
+            skip_checks = {int(x.strip()) for x in args.skip_checks.split(",") if x.strip()}
+        except ValueError:
+            p.error("--skip-checks must be comma-separated integers")
         log.info("[*] Skipping checks: %s", sorted(skip_checks))
 
-    # ---- legacy xlsx resume (optional; superseded by the JSONL checkpoint)
-    resume_keys: set[tuple[str, str]] = set()
-    prior: dict[str, list[dict]] = {}
-    if args.resume:
-        resume_keys = _load_resume_keys(args.resume)
-        for _sheet_name, _key in (("Scan Health Summary", "health"), ("Module Details", "modules"),
-                                  ("Uploaded Files", "files"), ("Recommendations", "recs"),
-                                  ("Trends", "trends")):
-            prior[_key] = _load_prior_rows(args.resume, _sheet_name)
-        log.info("[*] Resume xlsx: %d profiles already processed, carrying forward %d prior rows",
-                 len(resume_keys), sum(len(v) for v in prior.values()))
-        if Path(args.resume).resolve() == Path(args.output).resolve():
-            log.error("--resume and --output are the same file (%s). Refusing to run: the "
-                      "resumed report would overwrite the results being read.", args.output)
-            sys.exit(2)
-
     # ---- checkpoint
-    ckpt_path = None if args.no_checkpoint else (
-        args.checkpoint or f"{Path(args.output).with_suffix('')}.ckpt.jsonl")
-    if ckpt_path and args.restart and Path(ckpt_path).exists():
+    ckpt_path = args.checkpoint or f"{Path(args.output).with_suffix('')}.ckpt.jsonl"
+    if args.restart and Path(ckpt_path).exists():
         backup = f"{ckpt_path}.{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
         Path(ckpt_path).rename(backup)
         log.warning("[*] --restart: existing checkpoint moved to %s", backup)
     ckpt = Checkpoint(ckpt_path)
-    if ckpt_path is None:
-        log.warning("[!] Checkpointing is DISABLED. A failure at any point will lose the "
-                    "entire run.")
-    else:
-        log.info("[*] Checkpoint: %s (written after every application)", ckpt_path)
-    skip_set: set[tuple[str, str]] = set(ckpt.done_keys) | resume_keys
+    log.info("[*] Checkpoint: %s (fsync'd after every profile)", ckpt_path)
+    skip_set: set[tuple[str, str]] = set(ckpt.done_keys)
+
+    detail = DetailWriter(args.output, enabled=args.detail == "csv")
+    buffered_mods: list[dict] = []
+    buffered_files: list[dict] = []
 
     prev_data: dict | None = None
     if args.previous_report:
@@ -3808,30 +4093,25 @@ def main() -> None:
         log.info("[*] Previous report: %d apps loaded for trend analysis", len(prev_data))
 
     name_filter = re.compile(args.app_name_filter) if args.app_name_filter else None
-
     failures: list[str] = []
 
-    def _finalize(client: VeracodeClient | None) -> None:
-        """Write the report from whatever is durable. Called from a finally
-        block, so it runs on every exit path including auth failure and
-        Ctrl-C."""
-        h_rows = prior.get("health", []) + ckpt.rows["health"]
+    def _finalize(client: "VeracodeClient | None") -> None:
+        """Write the report from whatever is durable. Runs in a finally block,
+        so it executes on every exit path including auth failure and Ctrl-C."""
+        h_rows = ckpt.rows["health"]
         if not h_rows:
             log.warning("[!] No application rows collected; nothing to write.")
             return
-        m_rows = prior.get("modules", []) + ckpt.rows["modules"]
-        f_rows = prior.get("files", []) + ckpt.rows["files"]
-        r_rows = prior.get("recs", []) + ckpt.rows["recs"]
-        t_rows = prior.get("trends", []) + ckpt.rows["trends"]
+        r_rows = ckpt.rows["recs"]
+        t_rows = ckpt.rows["trends"]
         agg_records = ckpt.rows["agg"]
         agg = _build_aggregation([AggIssue(**d) for d in agg_records], len(h_rows))
 
-        log.info("[*] Writing %d health / %d module / %d file / %d rec / %d trend rows...",
-                 len(h_rows), len(m_rows), len(f_rows), len(r_rows), len(t_rows))
+        log.info("[*] Writing %d health / %d rec / %d trend rows...",
+                 len(h_rows), len(r_rows), len(t_rows))
 
-        # Dashboard layer: consumes the rows already built above. No extra API calls.
         bundle = None
-        if args.dashboard:
+        if not args.no_dashboard:
             try:
                 bundle = generate_dashboard(
                     health_rows=h_rows, issue_records=agg_records,
@@ -3845,33 +4125,32 @@ def main() -> None:
 
         fmt = args.output_format
         if fmt == "xlsx":
-            write_excel(h_rows, m_rows, f_rows, r_rows, t_rows, agg, args.output,
-                        dash_bundle=bundle)
+            write_excel(h_rows, buffered_mods, buffered_files, r_rows, t_rows, agg,
+                        args.output, dash_bundle=bundle)
         elif fmt == "csv":
-            write_csv(h_rows, m_rows, f_rows, r_rows, t_rows, agg, args.output)
+            write_csv(h_rows, buffered_mods, buffered_files, r_rows, t_rows, agg, args.output)
         elif fmt == "json":
-            write_json(h_rows, m_rows, f_rows, t_rows, args.output)
+            write_json(h_rows, buffered_mods, buffered_files, t_rows, args.output)
 
-        # For csv/json the dashboard has nowhere to live, so it gets its own workbook.
         if bundle is not None and fmt != "xlsx":
             xp = args.dashboard_output or f"{Path(args.output).with_suffix('')}_dashboard.xlsx"
             write_dashboard_xlsx(xp, bundle)
             log.info("[+] Dashboard workbook: %s", xp)
 
+        if detail.enabled:
+            for kind, path in detail.paths.items():
+                log.info("[+] %s: %s (%d rows appended this run)",
+                         kind.capitalize(), path, detail.counts[kind])
+
         if client is not None:
-            if client.throttle_events:
-                log.warning("[!] Rate limited %d time(s) during this run; final request "
-                            "spacing was %.2fs across %d requests. Consider raising "
-                            "--request-delay or lowering --parallel next time.",
-                            client.throttle_events, client._rate_delay, client.request_count)
+            for line in client.limiter.report():
+                log.info("[*] Rate %s", line)
             if client.auth_retry_events:
-                log.warning("[!] %d authentication retry event(s) occurred. %d request(s) "
-                            "were eventually abandoned. Check whether the API credentials "
-                            "were rotated or revoked mid-run.",
+                log.warning("[!] %d authentication retry event(s); %d request(s) abandoned. "
+                            "Check whether the API credentials were rotated or revoked mid-run.",
                             client.auth_retry_events, client.auth_give_ups)
             if client.net_retry_events:
-                log.warning("[!] %d network-level retry event(s) occurred.",
-                            client.net_retry_events)
+                log.warning("[!] %d network-level retry event(s).", client.net_retry_events)
         if failures:
             log.warning("[!] %d application(s) could not be retrieved and are marked "
                         "'Error' in the report (not 'No Scan'): %s",
@@ -3883,15 +4162,15 @@ def main() -> None:
     exit_code = 0
     try:
         client = VeracodeClient(args.region, timeout=args.timeout,
-                                pool_size=max(10, args.parallel * 2),
-                                rate_delay=args.request_delay,
+                                pool_size=max(16, args.parallel * 2),
+                                rate_budget=args.rate_budget,
                                 max_retries=args.max_retries,
                                 backoff_factor=args.retry_backoff,
-                                auth_retry_base=args.auth_retry_base,
-                                auth_retry_cap=args.auth_retry_cap,
-                                auth_retry_window=args.auth_retry_window,
-                                net_retries=args.net_retries)
-        log.info("[*] Region: %s", args.region)
+                                auth_retry_window=args.auth_retry_window)
+        log.info("[*] Region: %s | rate budget %.0f%% of published limits "
+                 "(report %.0f/min, xml %.0f/min, rest %.0f/min)",
+                 args.region, args.rate_budget,
+                 *(client.limiter.buckets[b].target_rpm for b in ("report", "xml", "rest")))
         apps = client.get_apps()
         log.info("[*] Found %d apps", len(apps))
 
@@ -3901,88 +4180,79 @@ def main() -> None:
         if args.max_apps:
             apps = apps[:args.max_apps]
 
-        if skip_set:
-            remaining = [a for a in apps if (a["name"], "") not in skip_set]
-            log.info("[*] %d of %d profiles already recorded; %d remaining",
-                     len(apps) - len(remaining), len(apps), len(remaining))
-
-        if args.request_delay <= 0 and len(apps) > 100:
-            log.warning("[!] --request-delay is 0, so %d applications (~%d API requests) "
-                        "will be sent with no pacing. This can overload the platform. "
-                        "Consider --request-delay 0.15 or higher.",
-                        len(apps), len(apps) * 6)
+        pending = [a for a in apps if (a["name"], "") not in skip_set]
+        if len(pending) != len(apps):
+            log.info("[*] %d already checkpointed, %d remaining",
+                     len(apps) - len(pending), len(pending))
+        log.info("[*] Plan: %s", _plan_note(len(pending), args.include_sandboxes,
+                                            args.rate_budget))
 
         if args.dry_run:
-            print(f"Would process {len(apps)} apps:")
-            for a in apps:
+            print(f"Would process {len(pending)} apps:")
+            for a in pending:
                 print(f"  {a['name']} (id={a.get('legacy_id')})")
-            ckpt.close()
+            ckpt.close(); detail.close()
             return
 
         stop = threading.Event()
         lock = threading.Lock()
-        delay_lock = threading.Lock()
-        next_slot = 0.0
+        progress = Progress(len(pending), already_done=len(skip_set))
 
         def _do_app(idx_app: tuple[int, dict]) -> None:
             if stop.is_set():
                 return
             idx, app = idx_app
-            if (app["name"], "") in skip_set:
-                log.debug("[%d/%d] %s (already checkpointed)", idx, len(apps), app["name"])
-                return
-            log.info("[%d/%d] %s (id=%s)", idx, len(apps), app["name"], app.get("legacy_id"))
+            log.debug("[%d/%d] %s (id=%s)", idx, len(pending), app["name"], app.get("legacy_id"))
+            errored = False
             try:
                 sr, mr, fr, rr, ai, tr = _process_app(
                     client, app, args.skip_no_scan, args.include_sandboxes,
                     skip_checks, prev_data, skip_set)
-                # Even when nothing came back (skip-no-scan), record the key so a
-                # resumed run does not re-fetch this profile.
+                mod_rows = [m.to_row() for m in mr]
+                file_rows = [f.to_row() for f in fr]
+                if args.detail == "csv":
+                    # Written before the checkpoint record, so a crash can only
+                    # ever leave detail rows for a profile that is replayed.
+                    detail.write("modules", mod_rows)
+                    detail.write("files", file_rows)
+                elif args.detail == "xlsx":
+                    with lock:
+                        buffered_mods.extend(mod_rows)
+                        buffered_files.extend(file_rows)
+                # Even when nothing came back (--skip-no-scan), record the key so
+                # a resumed run does not re-fetch this profile.
                 keys = [(s.app_name, s.sandbox) for s in sr] or [(app["name"], "")]
                 ckpt.record(keys,
                             health=[s.to_row() for s in sr],
-                            modules=[m.to_row() for m in mr],
-                            files=[f.to_row() for f in fr],
                             recs=[r.to_row() for r in rr],
                             trends=[t.to_row() for t in tr],
                             agg=[asdict(a) for a in ai])
                 for s in sr:
                     sb = f' [{s.sandbox}]' if s.sandbox else ""
-                    log.info("    %s | Issues: %d%s", s.health, s.total_issues, sb)
+                    log.debug("    %s | Issues: %d%s", s.health, s.total_issues, sb)
             except AuthError as e:
-                # Only raised when authentication has never succeeded at all.
                 log.error("Authentication failed: %s", e)
                 stop.set()
                 raise
             except Exception as e:
-                log.warning("    [!] Failed: %s: %s", type(e).__name__, e)
+                errored = True
+                log.warning("    [!] %s: %s: %s", app["name"], type(e).__name__, e)
                 with lock:
                     failures.append(app["name"])
                 ckpt.record([(app["name"], "")],
                             health=[_error_result(app, app.get("legacy_id", 0),
                                                   f"{type(e).__name__}: {e}").to_row()])
-            if args.delay > 0:
-                # Global pacing without serialising the workers: hold the lock
-                # only long enough to claim the next slot, then sleep outside it.
-                with delay_lock:
-                    nonlocal next_slot
-                    now = time.monotonic()
-                    next_slot = max(now, next_slot) + args.delay
-                    wait = next_slot - now
-                if wait > 0:
-                    time.sleep(wait)
+            progress.tick(error=errored)
 
         try:
             if args.parallel > 1:
                 pool = ThreadPoolExecutor(max_workers=args.parallel)
                 try:
-                    futs = {pool.submit(_do_app, (i, a)): a for i, a in enumerate(apps, 1)}
+                    futs = {pool.submit(_do_app, (i, a)): a for i, a in enumerate(pending, 1)}
                     for fut in as_completed(futs):
                         try:
                             fut.result()
                         except AuthError:
-                            # Cancel the queue instead of letting the executor
-                            # drain thousands of doomed requests on shutdown.
                             for f in futs:
                                 f.cancel()
                             stop.set()
@@ -3992,23 +4262,22 @@ def main() -> None:
                 finally:
                     pool.shutdown(wait=True, cancel_futures=True)
             else:
-                for i, app in enumerate(apps, 1):
+                for i, app in enumerate(pending, 1):
                     if stop.is_set():
                         break
                     _do_app((i, app))
         except AuthError as e:
             exit_code = 1
             log.error("FATAL: %s", e)
-            log.error("[*] %d profile(s) are already durable in the checkpoint; writing a "
-                      "partial report now. Fix the credentials and rerun the same command "
-                      "to continue from here.", len(ckpt.done_keys))
+            log.error("[*] %d profile(s) are durable in the checkpoint; writing a partial "
+                      "report. Fix the credentials and rerun the same command to continue.",
+                      len(ckpt.done_keys))
         except KeyboardInterrupt:
             exit_code = 130
-            log.warning("[!] Interrupted. %d profile(s) are durable in the checkpoint; "
+            log.warning("[!] Interrupted. %d profile(s) durable in the checkpoint; "
                         "writing a partial report.", len(ckpt.done_keys))
 
     except AuthError as e:
-        # Raised during get_apps(): credentials are wrong from the outset.
         exit_code = 1
         log.error("FATAL: %s", e)
     except KeyboardInterrupt:
@@ -4016,13 +4285,13 @@ def main() -> None:
         log.warning("[!] Interrupted before collection started.")
     finally:
         ckpt.close()
+        detail.close()
         try:
             _finalize(client)
         except Exception as e:
             log.error("Report write failed: %s", e)
-            if ckpt_path:
-                log.error("Collected data is intact at %s. Rerun the same command to "
-                          "regenerate the report without re-scanning.", ckpt_path)
+            log.error("Collected data is intact at %s. Rerun the same command to regenerate "
+                      "the report without re-scanning.", ckpt_path)
             exit_code = exit_code or 3
         if client is not None:
             client.close()
