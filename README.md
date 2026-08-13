@@ -54,10 +54,10 @@ python scan_health.py
 # Estimate runtime and list what would be processed
 python scan_health.py --dry-run
 
-# Conservative pacing for a shared egress IP (VPN, corporate NAT)
+# Conservative pacing
 python scan_health.py --rate-budget 20
 
-# Overnight window on a dedicated IP
+# Faster turnaround, heavier API use
 python scan_health.py --rate-budget 50 --parallel 8
 
 # Limit to the first 10 apps
