@@ -1,4 +1,4 @@
-"""Analytics for the app report. Pure functions, no I/O."""
+"""Analytics for the app report."""
 
 from __future__ import annotations
 
@@ -17,27 +17,17 @@ if TYPE_CHECKING:
     from .app_report import AppReport, BuildRef, BuildSnapshot
 
 ANALYTICS_CONFIG: dict[str, Any] = {
-    # Duration regression: latest above median + k * 1.4826 * MAD AND above
-    # ratio * median of the baseline window.
+    # Regression: above median + k * 1.4826 * MAD and above ratio * median.
     "regression_mad_k": 3.0,
     "regression_ratio": 1.5,
     "min_baseline_points": 4,
-    # Probable drivers below this relative change are not listed.
     "driver_min_change": 0.10,
-    # Engine effect: total flaws moved by more than this share with the same
-    # selected modules and a new engine version.
     "engine_effect_change": 0.15,
-    # Scan staleness, days since the latest published policy scan.
     "stale_days": 30,
-    # Failure rate above which the action plan raises a P1.
     "failure_rate_p1": 0.20,
     "evidence_limit": 25,
 }
 
-
-# ==========================================================================
-# Small statistics (stdlib)
-# ==========================================================================
 
 def median(xs: Sequence[float]) -> float:
     """Median of a non-empty list."""
@@ -61,9 +51,7 @@ def percentile(xs: Sequence[float], p: float) -> float:
 
 
 def theil_sen(ys: list[float]) -> tuple[float, float] | None:
-    """(slope, intercept) of the Theil-Sen line through (i, ys[i]). Robust to
-    outliers: the slope is the median of all pairwise slopes. None for < 2
-    points."""
+    """(slope, intercept) of the Theil-Sen line through (i, ys[i])."""
     n = len(ys)
     if n < 2:
         return None
@@ -84,10 +72,6 @@ def _dt(s: str | None) -> datetime | None:
         return None
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
-
-# ==========================================================================
-# Model
-# ==========================================================================
 
 @dataclass
 class DurationPoint:
@@ -115,8 +99,8 @@ class DurationStats:
     baseline_n: int = 0
     baseline_median: float | None = None
     baseline_mad: float | None = None
-    threshold: float | None = None           # seconds; regression above this
-    status: str = "Insufficient history"     # Regression | Normal | Insufficient history | Unavailable
+    threshold: float | None = None
+    status: str = "Insufficient history"
     reason: str = ""
     slope_min_per_scan: float | None = None
     window_change_pct: float | None = None
@@ -134,7 +118,7 @@ class CadenceStats:
     longest_gap: tuple[str, str] | None = None
     scans_last_30d: int = 0
     scans_last_90d: int = 0
-    attempts: list[dict[str, Any]] = field(default_factory=list)   # timeline points
+    attempts: list[dict[str, Any]] = field(default_factory=list)
     failure_rate: float | None = None
     failure_rate_note: str = ""
 
@@ -162,7 +146,7 @@ class FindingsRow:
 
 @dataclass
 class FindingsTrend:
-    rows: list[FindingsRow] = field(default_factory=list)        # oldest first
+    rows: list[FindingsRow] = field(default_factory=list)
     events: list[dict[str, str]] = field(default_factory=list)
     engine_effect: str = ""
 
@@ -195,7 +179,7 @@ class CheckHistory:
     check_num: int
     check_name: str
     label: str
-    statuses: list[tuple[str, str]] = field(default_factory=list)   # (build_id, status), oldest first
+    statuses: list[tuple[str, str]] = field(default_factory=list)
     lifecycle: str = "Unknown"
     consecutive_failing: int = 0
 
@@ -203,17 +187,17 @@ class CheckHistory:
 @dataclass
 class Verdict:
     name: str
-    level: str      # GREEN | YELLOW | ORANGE | RED | GRAY
+    level: str
     value: str
     reason: str
 
 
 @dataclass
 class ActionItem:
-    priority: str            # P1 | P2 | P3
+    priority: str
     title: str
     owner_role: str
-    effort: str              # S | M | L (estimate)
+    effort: str
     category: str
     why: str
     evidence: list[str] = field(default_factory=list)
@@ -238,18 +222,9 @@ class Analysis:
     modules: list[dict[str, Any]]
 
 
-# ==========================================================================
-# Duration
-# ==========================================================================
-
 def duration_stats(builds: list[BuildSnapshot], baseline_window: int,
                    cfg: dict[str, Any] | None = None) -> DurationStats:
-    """Duration trend, baseline and regression flag.
-
-    builds: newest first, as collected. The baseline is the previous
-    `baseline_window` published builds excluding the latest, median and MAD,
-    and needs min_baseline_points of them.
-    """
+    """Duration trend, baseline and regression flag."""
     cfg = cfg or ANALYTICS_CONFIG
     st = DurationStats()
     timed = [b for b in reversed(builds) if b.analysis_seconds is not None]
@@ -312,8 +287,8 @@ def _pct_str(r: float | None) -> str:
 
 def _drivers(builds: list[BuildSnapshot], base_pts: list[DurationPoint],
              cfg: dict[str, Any]) -> tuple[list[str], bool]:
-    """Probable drivers of the latest build's duration, ranked by relative
-    change against the baseline builds. Correlation, not causation."""
+    """Probable drivers of the latest build's duration, ranked by relative change against the baseline
+    builds."""
     latest = builds[0]
     base_ids = {p.build_id for p in base_pts}
     base = [b for b in builds if b.build_id in base_ids]
@@ -343,10 +318,6 @@ def _drivers(builds: list[BuildSnapshot], base_pts: list[DurationPoint],
     return out, sized
 
 
-# ==========================================================================
-# Cadence
-# ==========================================================================
-
 def cadence_stats(builds: list[BuildSnapshot], others: list[BuildRef],
                   now: datetime | None = None) -> CadenceStats:
     """How regularly published scans happen, and how often attempts fail."""
@@ -372,7 +343,8 @@ def cadence_stats(builds: list[BuildSnapshot], others: list[BuildRef],
         cs.median_interval_days = round(median([g for g, _ in gaps]), 1)
         g, i = max(gaps)
         cs.max_interval_days = round(g, 1)
-        cs.longest_gap = (dated[i][0].date().isoformat(), dated[i + 1][0].date().isoformat())
+        if g >= 1.0:
+            cs.longest_gap = (dated[i][0].date().isoformat(), dated[i + 1][0].date().isoformat())
     failed = sum(1 for o in others if o.status_class in ("failed", "cancelled"))
     attempted = len(dated) + failed
     if failed and attempted:
@@ -383,10 +355,6 @@ def cadence_stats(builds: list[BuildSnapshot], others: list[BuildRef],
                                 "upload, so the build list cannot show them")
     return cs
 
-
-# ==========================================================================
-# Findings
-# ==========================================================================
 
 def findings_trend(builds: list[BuildSnapshot], cfg: dict[str, Any] | None = None) -> FindingsTrend:
     """Per-build findings, timeline events and the engine-effect flag."""
@@ -434,10 +402,6 @@ def findings_trend(builds: list[BuildSnapshot], cfg: dict[str, Any] | None = Non
         prev = b
     return ft
 
-
-# ==========================================================================
-# Diffs, latest vs previous
-# ==========================================================================
 
 def _ext(name: str) -> str:
     suf = PurePosixPath(name.replace("\\", "/")).suffix.lower()
@@ -494,13 +458,9 @@ def diffs(builds: list[BuildSnapshot]) -> Diffs:
     return d
 
 
-# ==========================================================================
-# Check history
-# ==========================================================================
-
 def check_history(builds: list[BuildSnapshot]) -> list[CheckHistory]:
-    """Status of every check across builds where checks ran, with a lifecycle
-    label for the latest build: New, Recurring, Regressed, Resolved, Never seen."""
+    """Status of every check across builds where checks ran, with a lifecycle label for the latest
+    build: New, Recurring, Regressed, Resolved, Never seen."""
     ran = [b for b in reversed(builds) if b.checks_ran]
     out: list[CheckHistory] = []
     for num, name, _ in sh.CHECK_REGISTRY:
@@ -532,10 +492,6 @@ def check_history(builds: list[BuildSnapshot]) -> list[CheckHistory]:
     return out
 
 
-# ==========================================================================
-# Evidence (single-app only; the bulk path never calls this)
-# ==========================================================================
-
 def _files(files: list[dict[str, Any]], pats: list[str]) -> list[str]:
     return sh._fancy_match_files(files, pats)
 
@@ -545,9 +501,8 @@ def _mods(mods: list[dict[str, Any]], pred: Any) -> list[str]:
 
 
 def evidence_for(num: int, files: list[dict[str, Any]], modules: list[dict[str, Any]]) -> list[str]:
-    """The concrete files or modules check `num` judges, computed on the same
-    state the check sees (called from the observer's before hook) with the
-    same pattern lists and predicates. Empty when the check has no item list."""
+    """The concrete files or modules check `num` judges, computed on the same state the check sees
+    (called from the observer's before hook) with the same pattern lists and predicates."""
     dn, java = sh._is_dotnet, sh._is_java
     st = sh._has_status
     def plain(m: dict[str, Any]) -> bool:
@@ -637,13 +592,9 @@ def evidence_for(num: int, files: list[dict[str, Any]], modules: list[dict[str, 
     return []
 
 
-# ==========================================================================
-# Verdicts
-# ==========================================================================
-
 def findings_risk(b: BuildSnapshot) -> tuple[str, str]:
-    """(level, reason) from the dashboard's own findings scoring, so the
-    single-app verdict and the tenant dashboard agree."""
+    """(level, reason) from the dashboard's own findings scoring, so the single-app verdict and the
+    tenant dashboard agree."""
     if b.open_by_severity is None:
         return "GRAY", "Flaw severity breakdown unavailable for this build"
     cfg = sh.DASHBOARD_CONFIG
@@ -688,7 +639,6 @@ def verdicts(report: AppReport, dur: DurationStats, cad: CadenceStats,
         out.append(Verdict("Freshness", "GRAY", "Sandbox",
                            "Scan recency applies to policy scans only"))
     elif b.is_latest_build is False:
-        # A linked older scan (--scan): check #30 is not evaluated either.
         out.append(Verdict("Freshness", "GRAY", "Not latest",
                            "A newer scan exists in this context; recency is not evaluated"))
     elif cad.days_since_last is None:
@@ -705,11 +655,6 @@ def verdicts(report: AppReport, dur: DurationStats, cad: CadenceStats,
     return out
 
 
-# ==========================================================================
-# Action plan
-# ==========================================================================
-
-# check -> (owner, effort estimate, category)
 _CHECK_META: dict[int, tuple[str, str, str]] = {
     1: ("Build/Release Engineer", "S", "Scan performance"),
     2: ("AppSec", "S", "Results accuracy"),
@@ -842,10 +787,6 @@ def action_plan(report: AppReport, dur: DurationStats, cad: CadenceStats,
     items.sort(key=lambda a: (rank[a.priority], -a.consecutive_failing, a.check_num or 0))
     return items
 
-
-# ==========================================================================
-# Module table and entry point
-# ==========================================================================
 
 def _sev_counts(s: Any) -> list[int | None]:
     """[Very High, High, Medium, Low] from numflawssev5..0 (Low = 0-2)."""
