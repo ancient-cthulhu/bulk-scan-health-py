@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import difflib
+import fnmatch
 import gzip
 import html
 import json
@@ -33,35 +34,28 @@ SCHEMA_VERSION = "1.0"
 TOOL_NAME = "scan_health.py single-application report"
 
 EXIT_OK = 0
-EXIT_FATAL = 1          # authentication or an API failure that stops the run
-EXIT_RESOLVE = 2        # zero or ambiguous application / sandbox match
-EXIT_WRITE = 3          # report write failed
+EXIT_FATAL = 1
+EXIT_RESOLVE = 2
+EXIT_WRITE = 3
 EXIT_INTERRUPT = 130
 
 APP_REPORT_CONFIG: dict[str, Any] = {
-    # --history is clamped to this, and so is --history-since.
     "history_hard_cap": 50,
-    # Builds that are not published (in progress, failed, cancelled) are walked
-    # past while looking for published ones. This bounds that walk.
     "max_unpublished_walk": 10,
-    # Flaw-bearing reports change as mitigations are approved, so they expire.
+    # Reports carry mitigation state, which changes after publication.
     "report_cache_ttl_hours": 24,
+    # Access-scoping teams, not owners; --hide-teams adds more patterns.
+    "hidden_teams": ("Service Delivery - *",),
 }
 
-# Endpoints whose raw responses may be cached, keyed by build.
 CACHEABLE_ENDPOINTS: frozenset[str] = frozenset({
     "getbuildinfo.do", "detailedreport.do", "summaryreport.do",
     "getfilelist.do", "getprescanresults.do",
 })
-# Reports carry mitigation state, which changes after publication.
 _GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _DIGITS_RE = re.compile(r"^\d{1,12}$")
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
-
-# ==========================================================================
-# Errors
-# ==========================================================================
 
 class ResolutionError(Exception):
     """The requested application or sandbox matched zero or several profiles."""
@@ -72,9 +66,7 @@ class ResolutionError(Exception):
 
 
 class AccessDenied(ResolutionError):
-    """The API refused the credentials (401/403) while the link or name was
-    being checked. Raised at once instead of retrying for the auth window, so
-    a wrong link, account or region is reported in seconds, not after an hour."""
+    """The API refused the credentials (401/403) while the link or name was being checked."""
 
 
 def access_denied_message(status: int, what: str, region: str) -> str:
@@ -85,9 +77,7 @@ def access_denied_message(status: int, what: str, region: str) -> str:
 
 
 class ApiUnreachable(ResolutionError):
-    """The Veracode API could not be reached while the link or name was being
-    checked. Raised after one retry, so a network, proxy or region problem is
-    reported in seconds instead of after minutes of connection retries."""
+    """The Veracode API could not be reached while the link or name was being checked."""
 
 
 def unreachable_message(url: str, exc: Exception, region: str) -> str:
@@ -98,18 +88,14 @@ def unreachable_message(url: str, exc: Exception, region: str) -> str:
 
 
 class FatalAPIError(Exception):
-    """An API failure that leaves nothing meaningful to report (for example the
-    application lookup itself failing)."""
+    """An API failure that leaves nothing meaningful to report (for example the application lookup
+    itself failing)."""
 
-
-# ==========================================================================
-# Small helpers
-# ==========================================================================
 
 def term_safe(s: object) -> str:
-    """Strip control characters before printing attacker-controllable names
-    (profile, sandbox, module and file names) to a terminal, so an embedded
-    escape sequence cannot rewrite the operator's screen."""
+    """Strip control characters before printing attacker-controllable names (profile, sandbox, module
+    and file names) to a terminal, so an embedded escape sequence cannot rewrite the operator's
+    screen."""
     return _CTRL_RE.sub("?", str(s))
 
 
@@ -142,17 +128,13 @@ def parse_iso(s: str | None) -> datetime | None:
 
 
 def _txt(el: ET.Element, name: str) -> str | None:
-    """Text attribute, unescaped. Veracode's XML entity-escapes names a second
-    time inside attributes (a "/" arrives as "&#x2f;"), so after XML parsing
-    the value still needs html.unescape, as the bulk parsers already do.
-    None when the attribute is absent."""
+    """Text attribute, unescaped."""
     v = el.get(name)
     return None if v is None else html.unescape(v)
 
 
 def _bool_attr(v: str | None) -> bool | None:
-    """'true'/'false' to bool. Anything else, including absent, is None so a
-    missing attribute is never reported as False."""
+    """'true'/'false' to bool."""
     if v is None:
         return None
     lv = v.strip().lower()
@@ -167,8 +149,8 @@ _SEEN_UNKNOWN: set[tuple[str, str]] = set()
 
 
 def _log_unknown_attrs(element: str, el: ET.Element, known: frozenset[str]) -> None:
-    """DEBUG-log attributes not in the documented or observed set, once each,
-    so new platform fields are noticed without being parsed on guesswork."""
+    """DEBUG-log attributes not in the documented or observed set, once each, so new platform fields
+    are noticed without being parsed on guesswork."""
     for k in el.attrib:
         if k.startswith("{") or k in known:
             continue
@@ -178,16 +160,12 @@ def _log_unknown_attrs(element: str, el: ET.Element, known: frozenset[str]) -> N
             log.debug("Unmapped attribute %s/@%s (value not parsed)", element, k)
 
 
-# ==========================================================================
-# Model
-# ==========================================================================
-
 @dataclass
 class DataNote:
     """One entry in the report's Data Notes: a source, a gap, or a caveat."""
     topic: str
     message: str
-    level: str = "info"          # info | warning
+    level: str = "info"
 
 
 @dataclass
@@ -205,17 +183,13 @@ class AppInfo:
 
 @dataclass
 class BuildRef:
-    """One build from getbuildlist, enriched with getbuildinfo.
-
-    Documented build attributes are kept verbatim; booleans are None when the
-    attribute was absent, never False.
-    """
+    """One build from getbuildlist, enriched with getbuildinfo."""
     build_id: str
     version: str = ""
     policy_updated_date: str | None = None
     analysis_type: str | None = None
     status: str = ""
-    status_class: str = "unknown"   # published | failed | cancelled | incomplete | in_progress | unknown
+    status_class: str = "unknown"
     published: str | None = None
     engine_version: str | None = None
     submitter: str | None = None
@@ -235,9 +209,7 @@ class BuildRef:
 
 @dataclass
 class FlawStatus:
-    """The flaw-status element. Seen in summaryreport examples and in observed
-    detailedreport responses; it is not formally documented, so every field is
-    optional."""
+    """The flaw-status element."""
     new: int | None = None
     reopen: int | None = None
     open: int | None = None
@@ -250,9 +222,7 @@ class FlawStatus:
 
 @dataclass
 class ModuleStat:
-    """static-analysis/modules/module. numflawssevN semantics (open only, or all
-    statuses) are not documented, so they are reported as the platform's
-    per-module counts and never used as open-flaw counts."""
+    """static-analysis/modules/module."""
     name: str
     compiler: str = ""
     os: str = ""
@@ -270,19 +240,18 @@ class CheckOutcome:
     label: str
     category: str
     max_severity: str
-    status: str                      # Pass | Fail | Skipped | N/A | Error | Unavailable | Not run
-    severity: str = ""               # worst emitted severity when Fail
+    status: str
+    severity: str = ""
     issues: list[str] = field(default_factory=list)
     recommendations: list[str] = field(default_factory=list)
-    reason: str = ""                 # why N/A, Skipped, Error, Unavailable or Not run
-    evidence: list[str] = field(default_factory=list)   # filled in phase 3
+    reason: str = ""
+    evidence: list[str] = field(default_factory=list)
     evidence_total: int | None = None
 
 
 @dataclass
 class BuildDetail:
-    """Per-build lists that are too heavy for JSON but needed for diffs and
-    evidence. Kept in memory only."""
+    """Per-build lists that are too heavy for JSON but needed for diffs and evidence."""
     files: list[dict[str, Any]] = field(default_factory=list)
     prescan_modules: list[dict[str, Any]] = field(default_factory=list)
     merged_modules: list[dict[str, Any]] = field(default_factory=list)
@@ -295,7 +264,7 @@ class BuildSnapshot:
     version: str = ""
     sandbox: str = ""
     is_latest: bool = False
-    mode: str = "full"               # full | light (the latest build is always full)
+    mode: str = "full"
     status: str = ""
     submitted: str | None = None
     published: str | None = None
@@ -319,14 +288,13 @@ class BuildSnapshot:
     platform: str | None = None
     lifecycle_stage: str | None = None
     business_criticality: str | None = None
-    teams: str | None = None
     first_build_submitted_date: str | None = None
     last_update_time: str | None = None
     total_flaws: int | None = None
     flaws_not_mitigated: int | None = None
     flaw_status: FlawStatus | None = None
     flaw_status_source: str | None = None
-    open_by_severity: dict[str, int] | None = None     # None when unavailable
+    open_by_severity: dict[str, int] | None = None
     open_policy_flaws: int | None = None
     mitigated_flaws: int | None = None
     modules: list[ModuleStat] = field(default_factory=list)
@@ -340,7 +308,7 @@ class BuildSnapshot:
     sca_components: list[str] = field(default_factory=list)
     checks: list[CheckOutcome] = field(default_factory=list)
     checks_ran: bool = False
-    health: str = "Unavailable"      # Good | Fair | Poor | Unavailable
+    health: str = "Unavailable"
     high_issues: int | None = None
     medium_issues: int | None = None
     review_url: str = ""
@@ -352,7 +320,7 @@ class BuildSnapshot:
     detail: BuildDetail | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON-ready dict. The heavy in-memory detail is excluded."""
+        """JSON-ready dict."""
         d = asdict(self)
         d.pop("detail", None)
         return d
@@ -365,13 +333,13 @@ class AppReport:
     context: dict[str, Any]
     parameters: dict[str, Any]
     generated: str = field(default_factory=lambda: utc_now_iso())
-    builds: list[BuildSnapshot] = field(default_factory=list)       # published, newest first
-    other_builds: list[BuildRef] = field(default_factory=list)      # not published
-    history_status: str = "Unknown"   # Complete | Partial | Unavailable | Latest only
+    builds: list[BuildSnapshot] = field(default_factory=list)
+    other_builds: list[BuildRef] = field(default_factory=list)
+    history_status: str = "Unknown"
     data_notes: list[DataNote] = field(default_factory=list)
     collection: dict[str, Any] = field(default_factory=dict)
     complete: bool = True
-    analysis: Any = None          # app_report_analytics.Analysis, set after collection
+    analysis: Any = None
 
     @property
     def latest(self) -> BuildSnapshot | None:
@@ -384,35 +352,14 @@ class AppReport:
             self.data_notes.append(n)
 
 
-# ==========================================================================
-# Raw response cache
-# ==========================================================================
-
 class ResponseCache:
-    """Gzip-compressed raw API responses under <root>/<region>/<app_id>/<build_id>/.
-
-    By default <root> is ./scan_health_cache in the directory the tool is run
-    from, next to the reports. Contents are sensitive (file names, flaw
-    details): on POSIX every directory the cache creates is 0700 and every file
-    0600, so the contents stay private even when the parent directory is not.
-    On Windows those bits do not apply and the folder inherits the parent's
-    access rights. The cache never changes the permissions of a directory it
-    did not create, and never stops a run: if it cannot be used, the run
-    continues without it. Writes are atomic (temp file + rename), so a crash
-    never leaves a truncated entry that a later run would trust.
-
-    Published file lists, prescan results and build info are immutable once
-    published. detailedreport and summaryreport expire after a TTL because
-    mitigations change them; the caller forces a refetch for the latest build.
-    """
+    """Gzip-compressed raw API responses under <root>/<region>/<app_id>/<build_id>/."""
 
     def __init__(self, root: Path | None, mode: str = "use",
                  ttl_hours: float = 24.0, history_root: Path | None = None) -> None:
         if mode not in ("use", "refresh", "off"):
             raise ValueError(f"bad cache mode {mode!r}")
         self.root = root
-        # Per-app history lives apart from the disposable responses when a
-        # history_root is given (the default layout); otherwise under root.
         self.history_root = history_root
         self.mode = mode if root is not None else "off"
         self.ttl_seconds = ttl_hours * 3600.0
@@ -425,8 +372,6 @@ class ResponseCache:
                 created = not self.root.exists()
                 self._ensure_dir(self.root)
                 if created:
-                    # Keep the cache out of version control if the tool is run
-                    # inside a repository.
                     (self.root / ".gitignore").write_text("# Created by scan_health.py\n*\n",
                                                           encoding="utf-8")
             except OSError as e:
@@ -436,8 +381,7 @@ class ResponseCache:
 
     @staticmethod
     def _ensure_dir(path: Path) -> None:
-        """Create each missing level with mode 0700. os.makedirs only applies
-        the mode to the leaf on Python 3.7+, so levels are created one by one."""
+        """Create each missing level with mode 0700."""
         missing: list[Path] = []
         p = path
         while not p.exists():
@@ -448,14 +392,12 @@ class ResponseCache:
         for d in reversed(missing):
             with contextlib.suppress(FileExistsError):
                 d.mkdir(mode=0o700)
-            # mkdir's mode is filtered by the umask; set it explicitly. A
-            # no-op on Windows and on filesystems without POSIX permissions.
+            # mkdir's mode is filtered by the umask; set it explicitly (no-op on Windows).
             with contextlib.suppress(OSError):
                 os.chmod(d, 0o700)
 
     def path(self, region: str, app_id: str, build_id: str, endpoint: str) -> Path:
-        """Cache path for one response. Every component is validated so a
-        hostile build id can never escape the cache root."""
+        """Cache path for one response."""
         if self.root is None:
             raise RuntimeError("cache disabled")
         if region not in sh.REGIONS:
@@ -489,13 +431,12 @@ class ResponseCache:
         return data
 
     def write(self, p: Path, data: bytes) -> None:
-        """Atomic, private write. Failures are logged and never fatal."""
+        """Atomic, private write."""
         if self.mode == "off":
             return
         try:
             self._ensure_dir(p.parent)
-            # mkstemp creates the file 0600 on POSIX. (os.fchmod is not
-            # available on Windows before Python 3.13, so it is not used.)
+            # mkstemp is 0600 on POSIX; os.fchmod is missing on Windows before 3.13.
             fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".tmp_", suffix=".gz")
             try:
                 with os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
@@ -511,8 +452,8 @@ class ResponseCache:
             log.warning("Cache write failed for %s: %s", p, e)
 
     def history_path(self, app_guid: str) -> Path | None:
-        """<history_root>/<app_guid>.jsonl, or <root>/<app_guid>/history.jsonl
-        without a history_root (then None when caching is off)."""
+        """<history_root>/<app_guid>.jsonl, or <root>/<app_guid>/history.jsonl without a history_root
+        (then None when caching is off)."""
         if not _GUID_RE.match(app_guid):
             return None
         if self.history_root is not None:
@@ -522,8 +463,7 @@ class ResponseCache:
         return self.root / app_guid.lower() / "history.jsonl"
 
     def append_history(self, app_guid: str, record: dict[str, Any]) -> Path | None:
-        """Append one point-in-time snapshot so trends survive builds being
-        deleted on the platform. Returns the path written, or None."""
+        """Append one point-in-time snapshot so trends survive builds being deleted on the platform."""
         hp = self.history_path(app_guid)
         if hp is None:
             return None
@@ -547,13 +487,9 @@ class ResponseCache:
             return None
 
 
-# ==========================================================================
-# Fetching
-# ==========================================================================
-
 @dataclass
 class FetchResult:
-    """Outcome of one XML request. Exactly one of root / error is meaningful."""
+    """Outcome of one XML request."""
     endpoint: str
     root: ET.Element | None = None
     error: str = ""
@@ -566,10 +502,8 @@ class FetchResult:
 
 
 class Fetcher:
-    """Every XML request in single-application mode goes through here, and from
-    here through VeracodeClient._get. Adds the raw-response cache, per-bucket
-    call accounting, and an explicit distinction between "the API said there is
-    nothing" and "the request failed"."""
+    """Every XML request in single-application mode goes through here, and from here through
+    VeracodeClient._get."""
 
     def __init__(self, client: sh.VeracodeClient, cache: ResponseCache, region: str) -> None:
         self.client = client
@@ -577,24 +511,13 @@ class Fetcher:
         self.region = region
         self.calls: dict[str, int] = {"report": 0, "xml": 0, "rest": 0}
         self.errors: list[str] = []
-        # While the link or name is being resolved, a 401/403 is reported at
-        # once (AccessDenied); afterwards the normal auth retry window applies
-        # so a credential rotation mid-run does not lose the run.
+        # While resolving, 401/403 stops at once; afterwards the auth window covers credential
+        # rotation.
         self.fail_fast = False
 
     def xml(self, endpoint: str, params: dict[str, Any], *, app_id: str,
             build_id: str | None = None, cache_policy: str = "none") -> FetchResult:
-        """Fetch one XML endpoint.
-
-        cache_policy:
-          none       never cached
-          immutable  read without expiry, write on success
-          ttl        read if younger than the TTL, write on success
-          refresh    skip the read, write on success
-          read_only  read without expiry, never write; the caller decides after
-                     inspecting the response and calls store() (used for
-                     getbuildinfo, which is immutable only once published)
-        """
+        """Fetch one XML endpoint."""
         if cache_policy not in ("none", "immutable", "ttl", "refresh", "read_only"):
             raise ValueError(f"bad cache policy {cache_policy!r}")
         cpath: Path | None = None
@@ -634,8 +557,7 @@ class Fetcher:
             root = sh.parse_xml_bytes(r.content)
         except ET.ParseError as e:
             return self._fail(endpoint, f"unparseable XML: {e}")
-        # The XML APIs report many errors as HTTP 200 with an <error> body.
-        # Treating that as an empty result would turn "failed" into "absent".
+        # XML APIs report errors as HTTP 200 with an <error> body; never read as empty.
         if root.tag == "error":
             return self._fail(endpoint, f"API error: {(root.text or '').strip()[:200]}")
         if cpath is not None and cache_policy in ("immutable", "ttl", "refresh"):
@@ -654,10 +576,7 @@ class Fetcher:
 
     def rest(self, path: str, params: dict[str, Any] | None = None,
              auth_retry: bool | None = None) -> dict[str, Any]:
-        """REST GET through the client. Raises on failure. auth_retry=False
-        returns a 401/403 at once (raised here as HTTPError) instead of
-        retrying for the whole auth window; use it for optional lookups.
-        Left at None, a 401/403 while resolving raises AccessDenied."""
+        """REST GET through the client."""
         self.calls["rest"] += 1
         retry = (not self.fail_fast) if auth_retry is None else auth_retry
         url = f"{self.client._cfg['rest']}{path}"
@@ -681,14 +600,14 @@ class Fetcher:
         return FetchResult(endpoint, error=msg)
 
 
-# ==========================================================================
-# Application and sandbox resolution
-# ==========================================================================
+def visible_teams(teams: list[str], extra: str | None = None) -> list[str]:
+    """Teams minus hidden name patterns (case-insensitive, * wildcard)."""
+    pats = [*APP_REPORT_CONFIG["hidden_teams"], *(x.strip() for x in (extra or "").split(",") if x.strip())]
+    return [t for t in teams if not any(fnmatch.fnmatchcase(t.casefold(), x.casefold()) for x in pats)]
+
 
 def normalise_application(a: dict[str, Any]) -> AppInfo:
-    """REST application JSON to AppInfo. Uses the same field paths as
-    scan_health.VeracodeClient.get_apps, plus business_criticality and teams
-    when present (logged at DEBUG when absent; never invented)."""
+    """REST application JSON to AppInfo."""
     p = a.get("profile") or {}
     pols = p.get("policies") or []
     teams_raw = p.get("teams")
@@ -753,14 +672,7 @@ def closest_names(name: str, names: list[str], n: int = 5) -> list[str]:
 
 
 def resolve_app(fetcher: Fetcher, args: argparse.Namespace) -> tuple[AppInfo, list[DataNote]]:
-    """Resolve --app / --app-id / --app-guid to exactly one profile.
-
-    --app uses the documented ?name= filter (a substring match per the docs, with
-    case sensitivity unstated), then matches exactly and case-insensitively on
-    the client. When that finds nothing, the full listing is fetched both to
-    retry the exact match (in case the server filter is case-sensitive) and to
-    offer the five closest names.
-    """
+    """Resolve --app / --app-id / --app-guid to exactly one profile."""
     notes: list[DataNote] = []
     if args.app_guid is not None:
         guid = str(args.app_guid).strip()
@@ -807,8 +719,7 @@ def _describe(a: AppInfo) -> str:
 
 
 def resolve_sandbox(fetcher: Fetcher, app: AppInfo, name: str) -> dict[str, str]:
-    """Exact, case-insensitive sandbox match. Failure to list sandboxes is an
-    error, not "no such sandbox"."""
+    """Exact, case-insensitive sandbox match."""
     fr = fetcher.xml("getsandboxlist.do", {"app_id": app.legacy_id}, app_id=str(app.legacy_id))
     if not fr.ok or fr.root is None:
         raise FatalAPIError(f"Could not list sandboxes: {fr.error}")
@@ -824,8 +735,7 @@ def resolve_sandbox(fetcher: Fetcher, app: AppInfo, name: str) -> dict[str, str]
 
 
 def resolve_sandbox_by_id(fetcher: Fetcher, app_id: int, sandbox_id: str) -> dict[str, str]:
-    """The sandbox with this id on this application, from getsandboxlist.do.
-    Also proves the sandbox belongs to the app the link names."""
+    """The sandbox with this id on this application, from getsandboxlist.do."""
     fr = fetcher.xml("getsandboxlist.do", {"app_id": app_id}, app_id=str(app_id))
     if not fr.ok or fr.root is None:
         raise FatalAPIError(f"Could not list sandboxes: {fr.error}")
@@ -834,10 +744,6 @@ def resolve_sandbox_by_id(fetcher: Fetcher, app_id: int, sandbox_id: str) -> dic
             return s
     raise ResolutionError(f"No sandbox with sandbox_id {sandbox_id} on app_id {app_id}")
 
-
-# ==========================================================================
-# Build enumeration
-# ==========================================================================
 
 _BUILD_KNOWN = frozenset({
     "build_id", "version", "submitter", "platform", "lifecycle_stage", "policy_name",
@@ -849,13 +755,7 @@ _AU_KNOWN = frozenset({"analysis_type", "status", "engine_version", "published_d
 
 
 def classify_status(status: str, published: str | None) -> str:
-    """Map a getbuildinfo analysis_unit status to a coarse class.
-
-    The documented values are Incomplete, Prescan Failed, Prescan Submitted,
-    Prescan Success, No Modules Defined, Results Ready, Scan in Process, Vendor
-    Confirmation and Vendor Reviewing. Spelling varies between pages ("Pre-Scan",
-    "In Process"), so matching ignores case, spaces and hyphens.
-    """
+    """Map a getbuildinfo analysis_unit status to a coarse class."""
     s = re.sub(r"[\s\-_]", "", (status or "").lower())
     if published or s == "resultsready":
         return "published"
@@ -871,9 +771,7 @@ def classify_status(status: str, published: str | None) -> str:
 
 
 def parse_build_info_full(root: ET.Element, build_id: str) -> BuildRef:
-    """getbuildinfo.do with every documented build and analysis_unit attribute.
-    published_date is not on the docs page but is parsed by Veracode's own
-    scan_health tool, so it is treated as observed."""
+    """getbuildinfo.do with every documented build and analysis_unit attribute."""
     b = root.find(".//build")
     au = root.find(".//analysis_unit")
     ref = BuildRef(build_id=build_id)
@@ -907,7 +805,7 @@ def parse_build_info_full(root: ET.Element, build_id: str) -> BuildRef:
 @dataclass
 class Enumeration:
     """Result of walking the build list."""
-    published: list[BuildRef] = field(default_factory=list)     # newest first
+    published: list[BuildRef] = field(default_factory=list)
     other: list[BuildRef] = field(default_factory=list)
     skipped_non_static: int = 0
     list_total: int = 0
@@ -919,16 +817,7 @@ def enumerate_builds(fetcher: Fetcher, app: AppInfo, sandbox_id: str | None,
                      target: int, since: date | None,
                      cfg: dict[str, Any] | None = None,
                      older_than: int | None = None) -> Enumeration:
-    """Find up to `target` published static builds, newest first.
-
-    older_than keeps only builds with a smaller build_id, so --scan can add
-    the builds that came before the linked one without walking newer ones.
-
-    getbuildlist.do does not document its order, so builds are sorted by numeric
-    build_id descending, as Veracode's Go tool does. Each candidate costs one
-    getbuildinfo.do call (cached once published). Non-published builds are kept
-    separately and bounded by max_unpublished_walk.
-    """
+    """Find up to `target` published static builds, newest first."""
     cfg = cfg or APP_REPORT_CONFIG
     en = Enumeration()
     params: dict[str, Any] = {"app_id": app.legacy_id}
@@ -962,8 +851,7 @@ def enumerate_builds(fetcher: Fetcher, app: AppInfo, sandbox_id: str | None,
         info_params: dict[str, Any] = {"app_id": app.legacy_id, "build_id": bid}
         if sandbox_id:
             info_params["sandbox_id"] = sandbox_id
-        # An entry only ever exists for a build that was already published
-        # when it was written, so reading without expiry is safe.
+        # Cached only once published, so reading without expiry is safe.
         ir = fetcher.xml("getbuildinfo.do", info_params, app_id=str(app.legacy_id),
                          build_id=bid, cache_policy="read_only")
         if not ir.ok or ir.root is None:
@@ -995,8 +883,8 @@ def enumerate_builds(fetcher: Fetcher, app: AppInfo, sandbox_id: str | None,
 
 
 def latest_build_fallback(fetcher: Fetcher, app: AppInfo, sandbox_id: str | None) -> BuildRef | None:
-    """When getbuildlist fails: getbuildinfo.do without build_id returns the
-    most recent static scan (documented default)."""
+    """When getbuildlist fails: getbuildinfo.do without build_id returns the most recent static scan
+    (documented default)."""
     params: dict[str, Any] = {"app_id": app.legacy_id}
     if sandbox_id:
         params["sandbox_id"] = sandbox_id
@@ -1009,10 +897,6 @@ def latest_build_fallback(fetcher: Fetcher, app: AppInfo, sandbox_id: str | None
         return None
     return parse_build_info_full(ir.root, bid)
 
-
-# ==========================================================================
-# Report parsing (fields the bulk path does not read)
-# ==========================================================================
 
 _ROOT_KNOWN = frozenset({
     "report_format_version", "account_id", "app_name", "app_id", "analysis_id",
@@ -1042,8 +926,7 @@ _FS_KNOWN = frozenset({
 
 def parse_report_meta(root: ET.Element) -> dict[str, Any]:
     """Fields read from detailedreport.do or summaryreport.do beyond what
-    scan_health.parse_detailed_report extracts. Attribute names are those in
-    Veracode's samples and in observed responses; absent means None."""
+    scan_health.parse_detailed_report extracts."""
     _log_unknown_attrs("report", root, _ROOT_KNOWN)
     sa = root.find("static-analysis")
     if sa is None:
@@ -1059,7 +942,6 @@ def parse_report_meta(root: ET.Element) -> dict[str, Any]:
         "is_latest_build": _bool_attr(root.get("is_latest_build")),
         "legacy_scan_engine": _bool_attr(root.get("legacy_scan_engine")),
         "business_criticality": _txt(root, "business_criticality"),
-        "teams": _txt(root, "teams"),
         "submitter": _txt(root, "submitter"),
         "platform": _txt(root, "platform"),
         "lifecycle_stage": _txt(root, "life_cycle_stage"),
@@ -1112,13 +994,9 @@ def parse_report_meta(root: ET.Element) -> dict[str, Any]:
     return out
 
 
-# ==========================================================================
-# Check outcomes
-# ==========================================================================
-
 class OutcomeRecorder(sh.CheckObserver):
-    """Records each check's result and, before it runs, the items it judges
-    (evidence), computed on exactly the state the check sees."""
+    """Records each check's result and, before it runs, the items it judges (evidence), computed on
+    exactly the state the check sees."""
 
     def __init__(self) -> None:
         self.results: dict[int, tuple[list[sh.Issue], list[str], Exception | None]] = {}
@@ -1128,7 +1006,7 @@ class OutcomeRecorder(sh.CheckObserver):
                modules: list[dict[str, Any]]) -> None:
         try:
             self.evidence[num] = ana.evidence_for(num, files, modules)
-        except Exception as e:      # evidence is best-effort; never affects the check
+        except Exception as e:
             log.debug("Evidence for check #%d failed: %s", num, e)
 
     def after(self, num: int, name: str, issues: list[sh.Issue], recs: list[str],
@@ -1152,12 +1030,7 @@ def run_build_checks(files: list[dict[str, Any]], merged: list[dict[str, Any]],
                      dr: dict[str, Any], scan_meta: dict[str, Any], recency_date: str,
                      skip: set[int], na_reasons: dict[int, str]
                      ) -> tuple[list[CheckOutcome], list[sh.Issue]]:
-    """Run scan_health's 31 checks once, unchanged, and label each outcome.
-
-    Statuses: Fail (issues emitted), Error (the check raised; run_checks logged
-    and swallowed it), Skipped (--skip-checks), N/A (not applicable to this build,
-    reason given), Pass otherwise.
-    """
+    """Run scan_health's 31 checks once, unchanged, and label each outcome."""
     rec = OutcomeRecorder()
     issues, _recs, _check_recs = sh.run_checks(
         files, merged, dr["flaws"], scan_meta, dr.get("sca_on", False),
@@ -1190,12 +1063,7 @@ def run_build_checks(files: list[dict[str, Any]], merged: list[dict[str, Any]],
     return out, issues
 
 
-# ==========================================================================
-# Single scan from a platform link or build id (--scan / --sast)
-# ==========================================================================
-
-# Pages Veracode's own scan_health tool accepts. Every one carries the same
-# fragment layout: Page:account_id:app_id:build_id:analysis_id:...
+# Pages Veracode's scan_health accepts; all use Page:account:app:build:...
 SCAN_PAGES: tuple[str, ...] = (
     "ReviewResultsStaticFlaws", "ReviewResultsAllFlaws", "AnalyzeAppModuleList",
     "StaticOverview", "AnalyzeAppSourceFiles", "ViewReportsResultSummary",
@@ -1209,9 +1077,7 @@ SCAN_HOSTS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class ScanTarget:
-    """What a --scan value identifies. app_id and region are None when only a
-    build id was given. A sandbox page link carries sandbox_id and no build_id:
-    the build is the sandbox's latest published scan."""
+    """What a --scan value identifies."""
     build_id: str
     app_id: int | None = None
     region: str | None = None
@@ -1219,8 +1085,7 @@ class ScanTarget:
     sandbox_id: str | None = None
 
 
-# Sandbox page: #SandboxView:<account_id>:<app_id>:<sandbox_id> (confirmed from
-# a real platform link). Field 3 is a sandbox id, not a build id.
+# #SandboxView:<account>:<app>:<sandbox>; field 3 is a sandbox id, not a build.
 SANDBOX_PAGE = "SandboxView"
 
 
@@ -1237,8 +1102,8 @@ def _sandbox_fields(fields: list[str]) -> tuple[str, str] | None:
 
 
 def clean_link(value: str) -> str:
-    """Undo common copy-and-paste damage: surrounding quotes or angle
-    brackets, and a '#' that an email client or chat tool encoded as %23."""
+    """Undo common copy-and-paste damage: surrounding quotes or angle brackets, and a '#' that an email
+    client or chat tool encoded as %23."""
     v = value.strip().strip("'\"<>").strip()
     if "#" not in v and "%23" in v.lower():
         v = unquote(v)
@@ -1246,10 +1111,9 @@ def clean_link(value: str) -> str:
 
 
 def _location(parts: SplitResult) -> str | None:
-    """The page part of a platform link: the '#' fragment of /auth/index.jsp,
-    or the loc= parameter of a deep link (https://analysiscenter.veracode.com/
-    ?loc=HomeAppProfile:<account>:<app>), which the platform turns into the
-    same fragment after sign-in. None when the link has neither."""
+    """The page part of a platform link: the '#' fragment of /auth/index.jsp, or the loc= parameter of
+    a deep link (https://analysiscenter.veracode.com/ ?loc=HomeAppProfile:<account>:<app>), which
+    the platform turns into the same fragment after sign-in."""
     loc = parse_qs(parts.query).get("loc")
     if loc:
         return loc[0].strip().lstrip("#").rstrip("#")
@@ -1259,9 +1123,7 @@ def _location(parts: SplitResult) -> str | None:
 
 
 def link_problem(value: str, kind: str) -> str:
-    """Why a link cannot be used, in plain words, for kind "scan" (--scan) or
-    "app" (--app). Checked before any API call, so a wrong link is reported
-    at once instead of after a run."""
+    """Why a link cannot be used, in plain words, for kind "scan" (--scan) or "app" (--app)."""
     v = _with_scheme(clean_link(value))
     try:
         parts = urlsplit(v)
@@ -1315,9 +1177,9 @@ def _invalid_link(value: str) -> ValueError:
 
 
 def parse_scan_target(value: str) -> ScanTarget:
-    """Parse a platform scan link or a bare build id, as Veracode's scan_health
-    tool does: https, a known Veracode host, path /auth/index.jsp, a supported
-    page, app id and build id in fragment fields 2 and 3."""
+    """Parse a platform scan link or a bare build id, as Veracode's scan_health tool does: https, a
+    known Veracode host, path /auth/index.jsp, a supported page, app id and build id in fragment
+    fields 2 and 3."""
     v = clean_link(value)
     if v.isdigit():
         if int(v) <= 0 or len(v) > 12:
@@ -1341,15 +1203,13 @@ def parse_scan_target(value: str) -> ScanTarget:
 
 
 def _with_scheme(v: str) -> str:
-    """Browsers hide https:// in the address bar, so a link copied from the
-    visible text may lack it. Add it for Veracode hosts only."""
+    """Browsers hide https:// in the address bar, so a link copied from the visible text may lack it."""
     return "https://" + v if v.lower().startswith("analysiscenter.veracode.") else v
 
 
 def _split_platform_link(v: str, invalid: Callable[[str], ValueError]) -> tuple[str, str]:
-    """(region, page part) of a Veracode Platform link: https, a known Veracode
-    host, and /auth/index.jsp#... or ?loc=... The host must match exactly, so look-alike
-    domains and links merely containing a Veracode URL are rejected."""
+    """(region, page part) of a Veracode Platform link: https, a known Veracode host, and
+    /auth/index.jsp#..."""
     v = _with_scheme(v)
     try:
         parts = urlsplit(v)
@@ -1380,16 +1240,7 @@ def _invalid_app_link(value: str) -> ValueError:
 
 
 def parse_app_link(value: str) -> ScanTarget:
-    """App id and region from any Veracode Platform link that carries them.
-
-    Platform links put the account id and app id in fragment fields 1 and 2:
-    the application page is #HomeAppProfile:<account_id>:<app_id> and the
-    sandbox page #SandboxView:<account_id>:<app_id>:<sandbox_id> (both
-    confirmed from real platform links), and every scan page Veracode's scan_health tool
-    accepts uses Page:account_id:app_id:build_id:... The app id is confirmed
-    against the Applications API before anything runs. build_id is kept when
-    the link points at a scan, so the caller can mention --scan.
-    """
+    """App id and region from any Veracode Platform link that carries them."""
     v = clean_link(value)
     region, fragment = _split_platform_link(v, _invalid_app_link)
     fields = fragment.split(":")
@@ -1418,9 +1269,7 @@ class ScanResolution:
 
 
 def _app_from_rest(fetcher: Fetcher, app_id: int) -> tuple[AppInfo | None, str]:
-    """Profile details by legacy id. Optional: an account limited to the XML
-    APIs (as Veracode's own tool requires) still gets a report, so a 401/403
-    returns at once instead of retrying for the auth window."""
+    """Profile details by legacy id."""
     try:
         d = fetcher.rest("/applications", {"legacy_id": app_id}, auth_retry=False)
     except (requests.RequestException, sh.TransientAuthError) as e:
@@ -1432,21 +1281,14 @@ def _app_from_rest(fetcher: Fetcher, app_id: int) -> tuple[AppInfo | None, str]:
 
 
 def resolve_scan(fetcher: Fetcher, t: ScanTarget) -> ScanResolution:
-    """Identify the application, context and status of one build.
-
-    detailedreport.do is fetched first (it is needed anyway) to learn the
-    app id when only a build id was given, the sandbox, and whether this is
-    the latest build. Its "No report available." means the scan has no
-    published results; that is reported, not treated as a failure.
-    """
+    """Identify the application, context and status of one build."""
     notes: list[DataNote] = []
     bid = t.build_id
     sandbox: dict[str, str] | None = None
     walked: Enumeration | None = None
     context: dict[str, Any]
     if t.sandbox_id and t.app_id:
-        # A sandbox link names a sandbox, not a scan: analyse its latest
-        # published scan, found by the same walk --app uses.
+        # A sandbox link names no scan: use its latest published one.
         sandbox = resolve_sandbox_by_id(fetcher, t.app_id, t.sandbox_id)
         walked = enumerate_builds(fetcher, AppInfo(guid="", legacy_id=t.app_id, name=""),
                                   t.sandbox_id, 1, None)
@@ -1546,7 +1388,6 @@ def resolve_scan(fetcher: Fetcher, t: ScanTarget) -> ScanResolution:
     en = Enumeration(list_total=1)
     (en.published if ref.status_class == "published" else en.other).append(ref)
     if walked is not None:
-        # Newer scans in the sandbox that are not published yet.
         en.other.extend(walked.other)
         en.list_total = walked.list_total
     if ref.status_class != "published":
@@ -1563,10 +1404,6 @@ def resolve_scan(fetcher: Fetcher, t: ScanTarget) -> ScanResolution:
                           is_latest_build=is_latest, notes=notes)
 
 
-# ==========================================================================
-# Snapshot collection
-# ==========================================================================
-
 def _overview_url(base: str, dr: dict[str, Any], bid: str) -> str:
     """StaticOverview deep link, same shape as scan_health.platform_urls."""
     acct = dr.get("account_id", "")
@@ -1581,17 +1418,7 @@ def collect_snapshot(fetcher: Fetcher, app: AppInfo, ref: BuildRef, *,
                      sandbox_name: str = "",
                      recency_applicable: bool | None = None,
                      prefetched_report: FetchResult | None = None) -> BuildSnapshot:
-    """Fetch and assemble one published build.
-
-    full (and always for the latest build): detailedreport + getfilelist +
-    getprescanresults, then all 31 checks. light: summaryreport only.
-    flaw-status is read from whichever report was fetched; when a detailedreport
-    lacks it, summaryreport is fetched as a fallback.
-
-    recency_applicable overrides whether check #30 applies (default: only on
-    the latest build). prefetched_report reuses a report the caller already
-    fetched, so it is not requested twice.
-    """
+    """Fetch and assemble one published build."""
     aid = str(app.legacy_id)
     bid = ref.build_id
     eff_mode = "full" if (is_latest or mode == "full") else "light"
@@ -1695,12 +1522,10 @@ def collect_snapshot(fetcher: Fetcher, app: AppInfo, ref: BuildRef, *,
     scan_meta = {"review_url": snap.review_url, "triage_url": snap.triage_url,
                  "analysis_size": dr.get("analysis_size", 0)}
     na: dict[int, str] = {}
-    # Check #30 measures days since this build was published, against now.
-    # That is meaningful for the latest policy build only; on a historical
-    # build it would always fire. Sandboxes are excluded as in bulk mode.
     if sandbox_name:
         recency = ""
         na[30] = "Sandbox scans are excluded from scan recency (as in bulk mode)"
+    # Check 30 only makes sense on the latest build; on older ones it always fires.
     elif not (is_latest if recency_applicable is None else recency_applicable):
         recency = ""
         na[30] = "Scan recency is only meaningful for the latest build"
@@ -1714,22 +1539,20 @@ def collect_snapshot(fetcher: Fetcher, app: AppInfo, ref: BuildRef, *,
     hi = sum(1 for i in issues if i.severity == "high")
     mi = sum(1 for i in issues if i.severity == "medium")
     snap.high_issues, snap.medium_issues = hi, mi
-    # Same rule as scan_health._process_build.
     snap.health = "Good" if not issues else ("Poor" if hi else ("Fair" if mi else "Good"))
     snap.selected_module_count = sum(1 for m in merged if m.get("is_selected"))
     return snap
 
 
 def _apply_meta(snap: BuildSnapshot, meta: dict[str, Any], source: str) -> None:
-    """Copy report fields onto the snapshot. Report values win over getbuildinfo
-    for policy fields, because the report is the TTL-refreshed source."""
+    """Copy report fields onto the snapshot."""
     if meta.get("version"):
         snap.version = meta["version"]
     snap.submitted = meta.get("submitted")
     if meta.get("published"):
         snap.published = meta["published"]
     for k in ("analysis_size_bytes", "score", "rating", "mitigated_score", "mitigated_rating",
-              "business_criticality", "teams", "first_build_submitted_date",
+              "business_criticality", "first_build_submitted_date",
               "last_update_time", "total_flaws", "flaws_not_mitigated", "is_latest_build"):
         setattr(snap, k, meta.get(k))
     for k in ("engine_version", "policy_name", "policy_version", "policy_compliance_status",
@@ -1757,19 +1580,9 @@ def _apply_meta(snap: BuildSnapshot, meta: dict[str, Any], source: str) -> None:
     snap.sources["policy_compliance_status"] = f"{source} root"
 
 
-# ==========================================================================
-# Planning and budget
-# ==========================================================================
-
 def plan_calls(n_builds: int, mode: str,
                cached_reports: int = 0, cached_xml: int = 0) -> dict[str, int]:
-    """Calls per bucket still to be made for collection.
-
-    full: per build 1 report (detailedreport) + 2 xml (getfilelist,
-    getprescanresults). getbuildinfo calls happen during enumeration, before
-    this plan is made, so they are not included.
-    light: per build 1 report (summaryreport); the latest build is always full.
-    """
+    """Calls per bucket still to be made for collection."""
     if n_builds <= 0:
         return {"report": 0, "xml": 0, "rest": 0}
     if mode == "full":
@@ -1791,8 +1604,7 @@ def estimate_seconds(calls: dict[str, int], budget_pct: float) -> float:
 
 
 def count_cached(fetcher: Fetcher, app: AppInfo, refs: list[BuildRef], mode: str) -> tuple[int, int]:
-    """(reports, xml) responses already in the cache for the planned builds.
-    The latest build's report is always refetched, so it never counts."""
+    """(reports, xml) responses already in the cache for the planned builds."""
     cache = fetcher.cache
     if cache.mode != "use":
         return 0, 0
@@ -1813,10 +1625,6 @@ def count_cached(fetcher: Fetcher, app: AppInfo, refs: list[BuildRef], mode: str
             continue
     return reports, xml
 
-
-# ==========================================================================
-# Render: JSON
-# ==========================================================================
 
 def report_to_dict(report: AppReport) -> dict[str, Any]:
     """The JSON document, built from the same Analysis the HTML renders."""
@@ -1855,7 +1663,7 @@ def report_to_dict(report: AppReport) -> dict[str, Any]:
 
 
 def render_json(report: AppReport) -> str:
-    """Serialise the report. Numbers stay numbers, dates are ISO 8601 UTC."""
+    """Serialise the report."""
     return json.dumps(report_to_dict(report), indent=2, sort_keys=False, default=str)
 
 
@@ -1873,8 +1681,7 @@ def write_atomic(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
-        # mkstemp makes the file 0600; a report is meant to be shared, so give
-        # it the permissions any new file would get under the user's umask.
+        # Reports are shared: normal permissions, not mkstemp's 0600.
         with contextlib.suppress(OSError):
             os.chmod(tmp, 0o666 & ~_current_umask())
         os.replace(tmp, path)
@@ -1883,10 +1690,6 @@ def write_atomic(path: Path, text: str) -> None:
             os.unlink(tmp)
         raise
 
-
-# ==========================================================================
-# Orchestration
-# ==========================================================================
 
 SUPPORTED_FORMATS = ("html", "xlsx", "json", "md")
 IMPLEMENTED_FORMATS = ("html", "json")
@@ -1916,8 +1719,7 @@ def validate_args(args: argparse.Namespace) -> list[str]:
 
 
 def resolve_region(args: argparse.Namespace, scan: ScanTarget | None) -> str:
-    """Region for this run. A --scan link carries its own region; an explicit
-    --region that contradicts it is an error rather than a silent choice."""
+    """Region for this run."""
     explicit = bool(getattr(args, "region_explicit", False))
     if scan is not None and scan.region is not None:
         if explicit and args.region != scan.region:
@@ -1964,14 +1766,7 @@ def history_record(report: AppReport) -> dict[str, Any] | None:
 
 
 def history_status(report: AppReport, target: int, since: date | None, en: Enumeration) -> str:
-    """One label for how much history the report actually holds.
-
-    Unavailable: the build list could not be fetched (a failure, never "no
-    history"). No published builds: the list was fetched and had none. Latest
-    only: --history 0 or 1. Partial: some build is missing data, or collection
-    stopped early. Complete otherwise, including when fewer builds exist than
-    were requested (that is the whole history, and a data note says so).
-    """
+    """One label for how much history the report actually holds."""
     if en.list_error:
         return "Unavailable"
     if not report.builds:
@@ -2001,9 +1796,8 @@ def _standard_notes(report: AppReport) -> None:
 
 def _add_scan_trend(fetcher: Fetcher, app: AppInfo, context: dict[str, Any], en: Enumeration,
                     target: int, since: date | None, report: AppReport) -> None:
-    """Append the published builds before the linked one, in the same policy
-    or sandbox context, so a single scan gets its trend. A failure here only
-    costs the trend; the linked build is still analysed."""
+    """Append the published builds before the linked one, in the same policy or sandbox context, so a
+    single scan gets its trend."""
     if target <= 1 and since is None:
         return
     linked = en.published[0].build_id
@@ -2061,12 +1855,7 @@ def _print_plan(report: AppReport, en: Enumeration, calls: dict[str, int],
 
 
 def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
-    """Entry point from scan_health.main(). Returns the process exit code.
-
-    The report is written on every exit path once the application is resolved,
-    including interruption, and is marked complete=false when collection did
-    not finish.
-    """
+    """Entry point from scan_health.main()."""
     skip = set(skip_checks or set())
     errs = validate_args(args)
     if errs:
@@ -2082,15 +1871,11 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
             scan = parse_scan_target(str(args.scan))
         elif args.app is not None and is_link(str(args.app)):
             app_link = parse_app_link(str(args.app))
-            # From here on, the link behaves exactly like --app-id.
             args = argparse.Namespace(**{**vars(args), "app": None, "app_id": app_link.app_id})
         region = resolve_region(args, scan or app_link)
     except ValueError as e:
         log.error("%s", e)
         return EXIT_RESOLVE
-    # With --scan, --history/--history-since/--history-mode size the trend:
-    # the linked build plus the published builds before it in the same
-    # context. Checks and the action plan stay on the linked build.
 
     cache_mode = "off" if args.no_cache else ("refresh" if args.refresh_cache else "use")
     hist = getattr(args, "history_dir", None)
@@ -2104,7 +1889,7 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
                                auth_retry_window=args.auth_retry_window,
                                report_timeout=getattr(args, "report_timeout", 600))
     fetcher = Fetcher(client, cache, region)
-    fetcher.fail_fast = True                  # until the link or name has resolved
+    fetcher.fail_fast = True
     report: AppReport | None = None
     exit_code = EXIT_OK
     started = time.monotonic()
@@ -2128,6 +1913,7 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
             log.error("Application lookup failed: %s", e)
             return EXIT_FATAL
         app.region = region
+        app.teams = visible_teams(app.teams, getattr(args, "hide_teams", None))
         if not app.legacy_id:
             log.error("Profile %s has no legacy app_id; the XML APIs cannot be used.", app.guid)
             return EXIT_FATAL
@@ -2209,15 +1995,15 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
         cached_r, cached_x = count_cached(fetcher, app, en.published, args.history_mode)
         calls = plan_calls(len(en.published), args.history_mode, cached_r, cached_x)
         if resolved is not None and resolved.report is not None and calls["report"]:
-            calls["report"] -= 1      # already fetched while resolving the link
+            calls["report"] -= 1
         _print_plan(report, en, calls, args.rate_budget, dict(fetcher.calls))
         if args.dry_run:
-            report = None      # dry run writes nothing
+            report = None
             return EXIT_OK
-        fetcher.fail_fast = False             # resolved: normal auth retry from here on
+        fetcher.fail_fast = False
 
         if scan is not None:
-            pass                      # resolve_scan already noted an unpublished build
+            pass
         elif not en.published:
             report.note("History", "No published static build was found in this context. "
                         "This is an absence of results, not a retrieval failure."
@@ -2232,14 +2018,10 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
             snap = collect_snapshot(
                 fetcher, app, ref, is_latest=(i == 0), mode=args.history_mode, skip=skip,
                 sandbox_name=context.get("sandbox_name") or "",
-                # A linked scan is checked for recency only if the platform
-                # says it is the latest build.
                 recency_applicable=(None if resolved is None or i > 0
                                     else resolved.is_latest_build is True),
                 prefetched_report=resolved.report if resolved is not None and i == 0 else None)
-            # File and module lists are only needed for the latest-vs-previous
-            # diff and for evidence; keeping 50 builds of 10k-file uploads in
-            # memory would buy nothing.
+            # Older builds only need summaries; dropping file lists bounds memory.
             if i >= 2:
                 snap.detail = None
             report.builds.append(snap)
@@ -2253,8 +2035,7 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
                                  if scan is None or len(en.published) > 1
                                  else ("Single scan" if report.builds else "No published builds"))
 
-        # history.jsonl tracks the latest build over time; a linked older
-        # build would corrupt that series, and without a GUID there is no key.
+        # Only the latest build with a GUID: a linked older build would corrupt the series.
         rec = history_record(report)
         if resolved is not None and (resolved.is_latest_build is not True or not app.guid):
             rec = None
@@ -2265,7 +2046,7 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
                             "(cache disabled or not writable).")
     except AccessDenied as e:
         print(f"[!] {e}")
-        report = None                         # nothing was collected; no report to write
+        report = None
         exit_code = EXIT_RESOLVE
     except sh.AuthError as e:
         log.error("FATAL: %s", e)
@@ -2308,7 +2089,7 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
 
 
 def default_report_dir(app: AppInfo, build_id: str | None = None) -> Path:
-    """./app_report_<slug>_<UTC timestamp>/, or ..._build<id>_... for --scan."""
+    """./app_report_<slug>_<UTC timestamp>/, or ..._build<id>_..."""
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     mid = f"_build{build_id}" if build_id else ""
     return Path(f"app_report_{slugify(app.name)}{mid}_{ts}")
@@ -2332,7 +2113,7 @@ def _write_outputs(report: AppReport, args: argparse.Namespace, fmts: list[str])
     if report.analysis is None:
         try:
             report.analysis = ana.analyse(report, int(getattr(args, "baseline_window", 10)))
-        except Exception as e:    # a partial report must still be written
+        except Exception as e:
             log.warning("Analysis failed; writing collected data only: %s", e)
             report.note("Analysis", f"Analysis failed ({type(e).__name__}: {e}); "
                         "collected data is still included.", "warning")
