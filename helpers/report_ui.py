@@ -6,7 +6,7 @@ import base64
 import hashlib
 import html
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -78,20 +78,13 @@ STATUS_LEVEL = {"Pass": "GREEN", "Fail": "RED", "Error": "ORANGE", "N/A": "GRAY"
                 "Skipped": "GRAY", "Unavailable": "GRAY", "Not run": "GRAY", "Unknown": "GRAY"}
 
 
-# ==========================================================================
-# SVG charts
-#
-# Each chart is drawn at the size it is displayed (FULL or HALF width) so text
-# renders at roughly 1:1 rather than being scaled up or down.
-# ==========================================================================
-
+# Drawn at display size so text renders about 1:1.
 FULL, HALF = (1040, 260), (500, 230)
 ML, MR, MT, MB = 52, 16, 34, 34
 
 
 def _nice_ticks(vmax: float, n: int = 4, integer: bool = False) -> list[float]:
-    """Round axis ticks from 0. integer=True (counts) never yields a
-    fractional step, so no tick label is a rounded 7.5 shown as 8."""
+    """Round axis ticks from 0."""
     if vmax <= 0:
         return [0.0, 1.0]
     raw = vmax / n
@@ -147,8 +140,7 @@ def line_chart(title: str, labels: list[str], values: list[float | None], tips: 
                fmt: Any, size: tuple[int, int] = FULL, unit: str = "",
                band: tuple[float, float] | None = None,
                threshold: float | None = None, flag_last: str = "") -> str:
-    """Single-series line, optional baseline band and threshold line. The last
-    point is labelled; every point has a hover tooltip."""
+    """Single-series line, optional baseline band and threshold line."""
     w, h = size
     pts = [(i, v) for i, v in enumerate(values) if v is not None]
     if not pts:
@@ -195,8 +187,7 @@ def _bar_path(x: float, y: float, w: float, h: float, r: float) -> str:
 
 def stacked_columns(title: str, labels: list[str], series: list[tuple[str, str, list[int | None]]],
                     tips: list[str], size: tuple[int, int] = HALF) -> str:
-    """Stacked columns, 2px surface gap between segments, rounded top only,
-    total labelled on the cap."""
+    """Stacked columns, 2px surface gap between segments, rounded top only, total labelled on the cap."""
     w, h = size
     totals = [sum((vals[i] or 0) for _, _, vals in series) for i in range(len(labels))]
     if not any(totals):
@@ -256,15 +247,19 @@ def grouped_bars(title: str, labels: list[str], series: list[tuple[str, str, lis
 
 
 def timeline(attempts: list[dict[str, Any]], longest_gap: tuple[str, str] | None) -> tuple[str, int]:
-    """Scan attempts on a time axis: filled = published, hollow = not
-    published. Returns (svg, number of attempts without a date)."""
+    """Scan attempts on a time axis: filled = published, hollow = not published."""
     dated = [(datetime.fromisoformat(a["date"]), a) for a in attempts if a.get("date")]
     undated = len(attempts) - len(dated)
     if not dated:
         return '<p class="na">No dated scan attempts.</p>', undated
     dated.sort(key=lambda t: t[0])
     t0, t1 = dated[0][0], dated[-1][0]
-    span = max((t1 - t0).total_seconds(), 86400.0)
+    first, last = t0, t1
+    # Under a day of history: centre the dots on a one-day axis.
+    if (t1 - t0).total_seconds() < 86400.0:
+        mid = t0 + (t1 - t0) / 2
+        t0, t1 = mid - timedelta(hours=12), mid + timedelta(hours=12)
+    span = (t1 - t0).total_seconds()
     w, h = FULL[0], 86
     inner = w - 2 * ML
 
@@ -273,9 +268,15 @@ def timeline(attempts: list[dict[str, Any]], longest_gap: tuple[str, str] | None
 
     out = [f'<svg viewBox="0 0 {w} {h}" role="img" aria-label="Scan attempts over time">',
            f'<line class="base" x1="{ML}" x2="{w - ML}" y1="44" y2="44"/>']
+    gx = None
     if longest_gap:
-        g0 = max(datetime.fromisoformat(longest_gap[0] + "T00:00:00+00:00"), t0)
-        g1 = min(datetime.fromisoformat(longest_gap[1] + "T00:00:00+00:00"), t1)
+        # Gap ends are calendar dates (midnight): clamp them to the axis.
+        g0, g1 = (min(max(datetime.fromisoformat(g + "T00:00:00+00:00"), first), last)
+                  for g in longest_gap)
+        if x(g1) - x(g0) >= 4:
+            gx = (g0, g1)
+    if gx:
+        g0, g1 = gx
         out.append(f'<line class="gap" x1="{x(g0):.1f}" x2="{x(g1):.1f}" y1="24" y2="24"/>'
                    f'<line class="gap" x1="{x(g0):.1f}" x2="{x(g0):.1f}" y1="20" y2="28"/>'
                    f'<line class="gap" x1="{x(g1):.1f}" x2="{x(g1):.1f}" y1="20" y2="28"/>'
@@ -287,8 +288,12 @@ def timeline(attempts: list[dict[str, Any]], longest_gap: tuple[str, str] | None
         out.append(f'<g><circle class="{cls}" cx="{x(d):.1f}" cy="44" r="5"/>'
                    f'<circle class="hit" cx="{x(d):.1f}" cy="44" r="12"><title>{e(tip)}, '
                    f'{d.date().isoformat()}</title></circle></g>')
-    out.append(f'<text class="tick" x="{ML}" y="74" text-anchor="middle">{t0.date().isoformat()}</text>'
-               f'<text class="tick" x="{w - ML}" y="74" text-anchor="middle">{t1.date().isoformat()}</text>')
+    if first.date() == last.date():
+        out.append(f'<text class="tick" x="{w / 2:.1f}" y="74" text-anchor="middle">'
+                   f'{first.date().isoformat()}</text>')
+    else:
+        out.append(f'<text class="tick" x="{ML}" y="74" text-anchor="middle">{t0.date().isoformat()}</text>'
+                   f'<text class="tick" x="{w - ML}" y="74" text-anchor="middle">{t1.date().isoformat()}</text>')
     out.append("</svg>")
     return "".join(out), undated
 
@@ -301,10 +306,6 @@ def rec_html(text: str) -> str:
     i = text.find(url)
     return e(text[:i]) + link(url, url) + e(text[i + len(url):])
 
-
-# ==========================================================================
-# Page
-# ==========================================================================
 
 CSS = """
 :root{color-scheme:light;
@@ -401,16 +402,10 @@ a{color:inherit;text-decoration:none} main{max-width:none;padding:0}}
 """
 
 
-# ==========================================================================
-# Additions for the tenant report. Kept separate from CSS above so the
-# single-application report stays byte-identical.
-# ==========================================================================
-
 def multi_line_chart(title: str, labels: list[str],
                      series: list[tuple[str, str, list[float | None]]], tips: list[str],
                      fmt: Any, size: tuple[int, int] = HALF, unit: str = "") -> str:
-    """Several series on one axis (2 or 3 at most). Each series' last point is
-    labelled; every point has a hover tooltip naming the series."""
+    """Several series on one axis (2 or 3 at most)."""
     w, h = size
     allv = [v for _, _, vals in series for v in vals if v is not None]
     if not allv:
@@ -435,7 +430,7 @@ def multi_line_chart(title: str, labels: list[str],
                        f'<title>{e(name)}: {e(fmt(v))}{e(unit)} ({e(tips[i])})</title></circle></g>')
         li, lv = pts[-1]
         y = _y(lv, ymax, h) - 9
-        while any(abs(y - o) < 13 for o in last_ys):     # keep end labels apart
+        while any(abs(y - o) < 13 for o in last_ys):
             y -= 13
         last_ys.append(y)
         anchor = "end" if xs[li] > w - 120 else "start"
@@ -447,9 +442,7 @@ def multi_line_chart(title: str, labels: list[str],
 
 
 def hbars(rows: list[tuple[str, float | int | None, str, str]], fmt: Any = None) -> str:
-    """Horizontal bars as HTML (label, value, colour class, optional note).
-    Text stays selectable and wraps at phone width; the value is always
-    printed, so the bar length never carries meaning alone."""
+    """Horizontal bars as HTML (label, value, colour class, optional note)."""
     fmt = fmt or (lambda v: f"{v:,}")
     vals = [v for _, v, _, _ in rows if v is not None]
     top = max(vals) if vals else 0
@@ -476,13 +469,7 @@ def mix_bar(parts: list[tuple[str, int, str]]) -> str:
     return f'<span class="mix" role="img" aria-label="{e(txt)}" title="{e(txt)}">{segs}</span>'
 
 
-# ==========================================================================
-# "Save as PDF": the browser's own print dialog (every desktop browser can
-# save to PDF), so the PDF matches the page exactly and no PDF library or
-# network access is needed. The button is hidden until the script runs, so a
-# page opened without JavaScript never shows a button that does nothing.
-# ==========================================================================
-
+# Browser print dialog: exact PDF, no library or network. Hidden until the script runs.
 PDF_SCRIPT = ('(function () { var b = document.getElementById("save-pdf"); if (!b) { return; } '
               'b.hidden = false; b.addEventListener("click", function () { window.print(); }); }());')
 
@@ -497,8 +484,8 @@ def script_hash(script: str) -> str:
 
 
 def csp_meta(script: str) -> str:
-    """Content-Security-Policy that allows exactly this inline script and
-    nothing else: no other script, no network, no frames, no forms."""
+    """Content-Security-Policy that allows exactly this inline script and nothing else: no other
+    script, no network, no frames, no forms."""
     csp = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
            f"script-src '{script_hash(script)}'; base-uri 'none'; form-action 'none'")
     return f'<meta http-equiv="Content-Security-Policy" content="{csp}"><meta name="referrer" content="no-referrer">'
