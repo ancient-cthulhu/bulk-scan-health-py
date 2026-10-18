@@ -390,9 +390,15 @@ class ResponseCache:
                 break
             p = p.parent
         for d in reversed(missing):
+            # Windows: plain mkdir. Python 3.13 (and CVE-2024-4030 backports) turn mode=0o700 into a
+            # protected owner-only ACL, which other tools and sync clients may not be able to read.
+            if os.name == "nt":
+                with contextlib.suppress(FileExistsError):
+                    d.mkdir()
+                continue
             with contextlib.suppress(FileExistsError):
                 d.mkdir(mode=0o700)
-            # mkdir's mode is filtered by the umask; set it explicitly (no-op on Windows).
+            # mkdir's mode is filtered by the umask; set it explicitly.
             with contextlib.suppress(OSError):
                 os.chmod(d, 0o700)
 
@@ -2044,6 +2050,11 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
             if hp is None:
                 report.note("Point-in-time history", "history.jsonl not written "
                             "(cache disabled or not writable).")
+            else:
+                log.info("[+] History: %s", hp)
+        if cache.mode != "off" and cache.root is not None:
+            log.info("[*] Cache: %d response(s) saved, %d reused (%s)", cache.writes, cache.hits,
+                     cache.root)
     except AccessDenied as e:
         print(f"[!] {e}")
         report = None
