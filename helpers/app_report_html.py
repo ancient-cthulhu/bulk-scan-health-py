@@ -1,4 +1,4 @@
-"""HTML renderer for the app report. Self-contained; all values escaped."""
+"""HTML renderer for the app report."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ def _header(r: AppReport) -> str:
         ("Policy", e(a.policy or (b.policy_name if b else None) or "Unavailable")),
         ("Business criticality", e(a.business_criticality or (b.business_criticality if b else None)
                                    or "Unavailable")),
-        ("Teams", e(", ".join(a.teams) or (b.teams if b else None) or "Unavailable")),
+        ("Teams", e(teams_label(a))),
         ("Region", e(a.region)),
         ("App ID", e(a.legacy_id)),
         ("Scanned build" if scan else "Latest build",
@@ -407,6 +407,13 @@ def render_html(report: AppReport, analysis: Analysis) -> str:
             f"<script>{PDF_SCRIPT}</script></body></html>")
 
 
+def teams_label(a: Any) -> str:
+    """Teams from the Applications REST API, minus hidden patterns."""
+    if a.teams:
+        return ", ".join(a.teams)
+    return "None assigned" if a.guid else "Unavailable"
+
+
 def _title(r: AppReport) -> str:
     """Page title, which browsers also offer as the PDF file name."""
     parts = [f"Scan health {r.app.name}"]
@@ -418,11 +425,6 @@ def _title(r: AppReport) -> str:
     parts.append(fmt_dt(r.generated))
     return " - ".join(parts)
 
-
-# ==========================================================================
-# Redesign (in progress): two-lens overview, compact actions, check matrix.
-# Not yet wired into render_html; rendered by the component gallery.
-# ==========================================================================
 
 
 _HEALTH_LEVEL = {"Good": "GREEN", "Fair": "YELLOW", "Poor": "RED"}
@@ -471,7 +473,7 @@ def overview(r: AppReport, an: Analysis) -> str:
     hist = (f", {len(r.builds) - 1} earlier build(s) for trend" if len(r.builds) > 1 else "")
     meta = [("Business unit", a.business_unit), ("Policy", a.policy or b.policy_name),
             ("Business criticality", a.business_criticality or b.business_criticality),
-            ("Teams", ", ".join(a.teams) or b.teams), ("Region", a.region), ("App ID", a.legacy_id)]
+            ("Teams", teams_label(a)), ("Region", a.region), ("App ID", a.legacy_id)]
     ctx_line = "&emsp;".join(f"{e(k)} <b>{e(v) if v else 'Unavailable'}</b>" for k, v in meta)
     links = [link(b.overview_url, "Static Overview"), link(b.review_url, "Review Modules"),
              link(b.triage_url, "Triage Flaws")]
@@ -486,7 +488,6 @@ def overview(r: AppReport, an: Analysis) -> str:
              f"{_policy_say(b.policy_compliance_status)}."
              + (f" Start with {top}." if top else ""))
 
-    # ---- scan health lens
     d, c = an.duration, an.cadence
     rows: list[kit.Result] = [kit.Result(
         "Checks failing", f"{len(failing)} of {len(b.checks)}" if b.checks_ran else "Not run",
@@ -518,7 +519,6 @@ def overview(r: AppReport, an: Analysis) -> str:
         "Whether the scan analysed the right code, efficiently and recently.", rows, spark_s,
         "Analysis time per build" if spark_s else "", _first(views, kit.LENS_SCAN))
 
-    # ---- security posture lens
     sev = b.open_by_severity or {}
     cov = kit.result_coverage([x.check_num for x in failing], b.checks_ran,
                               {x.check_num: x.label for x in b.checks})
