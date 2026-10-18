@@ -1,27 +1,21 @@
-# Veracode Tenant-Wide Scan Health
+# Veracode Scan Health
 
-Analyze SAST scan health across a Veracode tenant or for a specific application, sandbox, or scan.
+Checks the health of Veracode SAST scans: across a whole tenant, for one application, or for one scan. Python port of [veracode/scan_health](https://github.com/veracode/scan_health) (Go v2.47) with all 31 checks.
 
-The tool identifies packaging and configuration issues, prioritizes fixes, tracks trends, and exports self-contained HTML reports plus Excel, CSV, JSON, or Markdown data.
-
-> This is an unofficial Python port of [Veracode Scan Health](https://github.com/veracode/scan_health). It is not an official Veracode product.
+Not an official Veracode product.
 
 ## Install
 
-Requires Python 3.11 or later.
+Python 3.11+.
 
 ```bash
 pip install veracode-api-signing requests openpyxl
-pip install defusedxml  # optional, recommended
+pip install defusedxml        # optional, hardened XML parsing
 ```
 
 ## Authenticate
 
-Use a Veracode account with the **Reviewer**, **Security Lead**, or **Results API** role.
-
-### Credentials file
-
-Create `~/.veracode/credentials`:
+Standard Veracode HMAC credentials, in `~/.veracode/credentials`:
 
 ```ini
 [default]
@@ -29,278 +23,168 @@ veracode_api_key_id = YOUR_API_KEY_ID
 veracode_api_key_secret = YOUR_API_KEY_SECRET
 ```
 
-### Environment variables
-
-```bash
-export VERACODE_API_KEY_ID=YOUR_API_KEY_ID
-export VERACODE_API_KEY_SECRET=YOUR_API_KEY_SECRET
-```
+or as `VERACODE_API_KEY_ID` / `VERACODE_API_KEY_SECRET`. Role: Reviewer or Security Lead (Results API for API users).
 
 ## Run
 
-### Entire tenant
+**Tenant (bulk)**
 
 ```bash
-# Preview scope and estimated runtime
-python scan_health.py --dry-run
-
-# Analyze all policy profiles
-python scan_health.py
-
-# Include sandboxes in the EU region
+python scan_health.py --dry-run                          # list profiles, estimate runtime
+python scan_health.py                                    # all profiles
 python scan_health.py --include-sandboxes --region eu
-
-# Compare against a previous report
-python scan_health.py --previous-report last_week.xlsx
+python scan_health.py --app-name-filter "^Pay" --max-apps 10
 ```
 
-Bulk runs resume automatically when the same command is rerun within 72 hours. Use `--restart` to start over.
+Writes `scan_health.xlsx`, `tenant_report.html`, module/file CSVs and a checkpoint to a run folder. An interrupted run resumes when you rerun the same command (within 72 hours; `--restart` starts fresh). Run weekly for trends.
 
-### One application
+**One application**
 
 ```bash
-python scan_health.py --app "Payments API" --dry-run
-python scan_health.py --app "Payments API"
-python scan_health.py --app-id 4242 --history 25
+python scan_health.py --app "Payments API"               # latest 10 policy scans
+python scan_health.py --app "<platform link to the app or a sandbox>"
+python scan_health.py --app-id <app_id> --history 25
 python scan_health.py --app "Payments API" --sandbox "feature-x"
-python scan_health.py --app "Payments API" --history-since 2026-01-01
 ```
 
-`--app` also accepts a quoted Veracode application, sandbox, or scan URL.
-
-### One scan
+**One scan**
 
 ```bash
-# Analyze a published build
-python scan_health.py --scan 12345678
-
-# Analyze only that build, without trend history
-python scan_health.py --scan 12345678 --history 0
-
-# Use a quoted Veracode scan URL
-python scan_health.py --scan "<veracode-scan-url>"
-
-# --sast is an alias for --scan
-python scan_health.py --sast "<veracode-scan-url>" --dry-run
+python scan_health.py --scan "<platform link to the scan>"   # --sast is an alias
+python scan_health.py --scan <build_id>                       # build ID
+python scan_health.py --scan <build_id> --history 0           # no trend
 ```
 
-A numeric build ID works after the scan has published results. The tool supports commercial and EU links. US/FedRAMP is not supported.
+**Links.** Copy the link from the Veracode Platform address bar. Either form works:
 
-## Output
-
-Everything is written under `./scan_health_output` by default:
-
-```text
-scan_health_output/
-  tenant/<region>/<timestamp>/          tenant reports and exports
-  apps/<app>_<app_id>/<timestamp>/      application reports
-  apps/<app>_<app_id>/scan_<build>_<timestamp>/
-  history/                              trend snapshots
-  cache/                                reusable API responses
+```
+https://analysiscenter.veracode.com/auth/index.jsp#<Page>:<account_id>:<app_id>:...
+https://analysiscenter.veracode.com/?loc=<Page>:<account_id>:<app_id>:...
 ```
 
-Use `--out-dir` to change the root folder.
+- `--app`: the application page (`HomeAppProfile`), a sandbox (`SandboxView`), or any scan page.
+- `--scan`: a scan page (Triage Flaws, Review Modules, Static Overview, source files, result summary, detailed report, SCA) or a sandbox (its latest scan).
+- `.com` is the commercial region and `.eu` is EU. FedRAMP is not supported.
+- Quote links in the shell. The trend uses earlier scans in the same policy or sandbox.
 
-### Tenant run
+App and scan runs write `report.html` and `report.json`. The HTML report is one self-contained file (offline, light and dark) with verdicts, a ranked action plan, changes since the previous scan, all checks, duration and findings trends. It has a **Save as PDF** button (A4, via the browser's print dialog).
 
-The primary output is `tenant_report.html`. Additional outputs include:
+Bad links are rejected before any API call, with the reason. While the app or scan is being resolved, a 401/403 or an unreachable API stops in seconds instead of retrying. These exit with code `2` and write nothing.
 
-- `scan_health.xlsx`
-- Module and file detail CSVs
-- Tenant trend snapshot
-- Resume checkpoint
+## Output folders
 
-### Application or scan run
-
-The primary outputs are `report.html` and `report.json`.
-
-`report.html` is self-contained, works offline, prints cleanly, and includes:
-
-- Scan-health and security verdicts
-- Ranked actions with owner, effort, evidence, fix, and verification
-- Changes since the previous scan
-- All 31 health checks
-- Duration, throughput, size, cadence, and findings trends
-- Module composition and data-quality notes
-
-Default formats are `html,xlsx,json,md`. Select formats with `--formats`.
-
-## Common options
-
-```bash
-# Process only matching applications
-python scan_health.py --app-name-filter "^Payments.*"
-
-# Limit a test run
-python scan_health.py --max-apps 10
-
-# Reduce API usage
-python scan_health.py --rate-budget 20
-
-# Increase workers without increasing the configured request rate
-python scan_health.py --parallel 8
-
-# Skip selected health checks
-python scan_health.py --skip-checks 1,17,30
-
-# Disable response caching
-python scan_health.py --no-cache
-
-# Start a new run instead of resuming
-python scan_health.py --restart
+```
+scan_health_output/                (--out-dir)
+  tenant/<region>/<date_time>/     bulk runs
+  apps/<app>_<id>/<date_time>/     --app  (scan_<build>_<date_time>/ for --scan)
+  history/                         keep: snapshots and per-app history (trends)
+  cache/                           safe to delete: raw API responses
 ```
 
-| Option | Default | Purpose |
-|---|---:|---|
+`history/` and `cache/` contain file names and flaw data; on Linux and macOS they are restricted to your user. `--no-cache` disables the cache. Explicit `--output`, `--report-dir`, `--cache-dir` and `--snapshot-dir` are used as given.
+
+**Exit codes:** `0` ok, `1` auth or fatal API error, `2` usage error or unresolved app/scan, `3` report write failed, `130` interrupted. A partial report is written on `1` and `130`.
+
+## Rate limiting
+
+Veracode limits per IP: 80/min for `detailedreport.do` and other results XML APIs, 250/min for other XML APIs, 500/min for REST. Each class is paced separately at `--rate-budget` percent (default 70). A policy profile costs about 4 calls, so the default runs about 56 profiles/min. `--parallel` only hides slow responses; it does not raise the rate. Every retry (timeout, 5xx, 401) is sent with a fresh HMAC signature.
+
+## Options (bulk)
+
+| Option | Default | Description |
+|---|---|---|
+| `--out-dir` | `./scan_health_output` | Root output folder |
+| `--output` | run folder | Main output file, used as given |
+| `--output-format` | `xlsx` | `xlsx`, `csv` or `json` |
 | `--region` | `commercial` | `commercial` or `eu` |
-| `--rate-budget` | `70` | Percentage of each API limit to consume |
-| `--parallel` | `8` | Concurrent workers |
-| `--max-apps` | `0` | Maximum applications; `0` means all |
-| `--include-sandboxes` | Off | Include sandbox scans |
-| `--skip-no-scan` | Off | Skip profiles without policy scans |
-| `--skip-checks` | None | Check numbers to exclude |
-| `--detail` | `csv` | Module/file detail: `csv`, `xlsx`, or `none` |
-| `--previous-report` | None | Previous XLSX report for tenant trends |
-| `--trend-window` | `12` | Comparable tenant snapshots |
-| `--no-dashboard` | Off | Skip Excel dashboard sheets |
-| `--no-html` | Off | Skip the tenant HTML report |
-| `--no-cache` | Off | Disable response caching |
-| `--restart` | Off | Ignore the resumable run |
-| `--dry-run` | Off | Show scope and estimate without scanning |
-| `--log-level` | `INFO` | `DEBUG`, `INFO`, or `WARNING` |
+| `--rate-budget` | `70` | Percent of each rate limit to use |
+| `--parallel` | `8` | Worker threads |
+| `--max-retries` | `8` | Retries for 5xx |
+| `--retry-backoff` | `2.0` | Backoff factor for 5xx |
+| `--timeout` | `120` | HTTP timeout, seconds |
+| `--report-timeout` | `600` | Read timeout for `detailedreport` and other report APIs, seconds |
+| `--auth-retry-window` | `3600` | Seconds to retry a request through 401/403 |
+| `--max-apps` | `0` (all) | Limit app count |
+| `--app-name-filter` | | Regex on app names |
+| `--include-sandboxes` | off | Also check sandbox scans |
+| `--skip-no-scan` | off | Skip apps without a policy scan |
+| `--skip-checks` | | Check numbers to skip, e.g. `1,17,30` |
+| `--detail` | `csv` | Module/file rows: `csv`, `xlsx` or `none` |
+| `--no-dashboard` | off | Skip the dashboard sheets |
+| `--dashboard-output` | | Dashboard workbook for csv/json output |
+| `--previous-report` | | Prior xlsx for per-app trends |
+| `--snapshot-dir` | `<out-dir>/history/tenant` | Snapshot folder |
+| `--no-snapshot` | off | Do not save a snapshot |
+| `--keep-snapshots` | `0` (all) | Keep the newest N snapshots |
+| `--trend-window` | `12` | Snapshots used for tenant trends |
+| `--no-html` | off | Skip `tenant_report.html` |
+| `--checkpoint` | `<output>.ckpt.jsonl` | Checkpoint path |
+| `--restart` | off | Start a new run |
+| `--dry-run` | off | List and estimate, then exit |
+| `--log-level` | `INFO` | `DEBUG`, `INFO` or `WARNING` |
 
-Run the following for the complete option list:
+App and scan options: `--app`, `--app-id`, `--app-guid`, `--sandbox`, `--scan`, `--history`, `--history-since`, `--history-mode`, `--formats`, `--report-dir`. See `--help`.
 
-```bash
-python scan_health.py --help
-```
+## Outputs (bulk)
 
-## Rate limits
+- **Workbook:** Executive Dashboard, App Heatmap, Issue Heatmap, Scan Health Summary, Recommendations, Tenant Aggregation, Tenant Overview, and Trends with `--previous-report`. CSV writes one file per sheet; JSON writes one document.
+- **tenant_report.html:** scan health and findings side by side, a filterable fix list with CSV export, a team heatmap, priorities, changes and trends. One page, no external resources; values are escaped and the only script is allowed by hash.
+- **Snapshots:** a small gzip record per run, used for tenant trends. Only runs with the same scope are compared.
 
-Limits are applied separately and are **per IP address**:
-
-| API class | Published limit |
-|---|---:|
-| Flaw Report and Results XML APIs | 80 calls/minute |
-| Other XML APIs | 250 calls/minute |
-| REST APIs | 500 calls/minute |
-
-`--rate-budget` controls how much of each limit the tool uses. Requests are evenly paced rather than sent in bursts.
-
-A policy profile normally requires four requests: one report request and three standard XML requests.
-
-| Rate budget | Approx. profiles/minute |
-|---:|---:|
-| `20` | 16 |
-| `30` | 24 |
-| `50` | 40 |
-| `70` | 56 |
-| `85` | 68 |
-
-Use `--dry-run` for an estimate based on the tenant and selected options.
-
-`--parallel` does not raise the request rate. Workers prevent slow responses from leaving the configured budget unused.
+Scan health and findings are separate: a healthy scan does not mean no vulnerabilities. Apps without a published scan are Unknown, not healthy. Only `accepted` mitigations close a flaw. A failed API retrieval marks the profile `Error`, never clean.
 
 ## Health checks
 
-The tool evaluates 31 scan-health conditions covering:
+| # | Check | Severity | Flags |
+|---|---|---|---|
+| 1 | ignoreJunkFiles | Medium | Unnecessary files uploaded |
+| 2 | thirdParty | Medium | Third-party libraries as entry points |
+| 3 | flawCount | Medium | Zero or over 2,500 flaws |
+| 4 | fatalErrors | High | Missing PDB, no Java binaries, nested JARs |
+| 5 | unscannableJava | High | Java modules with fatal errors |
+| 6 | detectUnwantedFiles | Medium | 7z, scripts, installers, pyc, ClickOnce and similar |
+| 7 | nestedArchives | High | Archives inside archives |
+| 8 | missingPrecompiled | High | ASP.NET views not precompiled |
+| 9 | missingSCA | Medium | No SCA results |
+| 10 | unselectedJS | Medium | JavaScript modules not selected |
+| 11 | unexpectedSource | High | Source code instead of binaries |
+| 12 | missingSupporting | Medium | Missing supporting files |
+| 13 | missingDebug | Medium | .NET modules without PDB |
+| 14 | unsupportedPlatform | High | Unsupported compiler or platform |
+| 15 | gradleWrapper | High | gradle-wrapper.jar selected |
+| 16 | sensitiveFiles | High | Keys, certificates, secrets, Office docs, notebooks |
+| 17 | repositories | Medium | Git repository uploaded |
+| 18 | nodeModules | Medium | node_modules uploaded |
+| 19 | testingArtefacts | High/Medium | Test frameworks or mocks |
+| 20 | tooManyFiles | Medium | Over 10,000 files |
+| 21 | excessMicrosoft | Medium | .NET Roslyn components |
+| 22 | looseClassFiles | Medium | Loose Java .class files |
+| 23 | goWorkspace | Medium | Go workspace files |
+| 24 | unselectedFirstParty | Medium | First-party modules not selected |
+| 25 | overScanning | Medium | Overlapping selected modules |
+| 26 | dependenciesSelected | Medium | Dependencies as entry points |
+| 27 | duplicateFiles | High/Medium | Duplicate file names |
+| 28 | minifiedJS | Medium | Minified JavaScript |
+| 29 | moduleCount | Medium | Over 500 modules or 100 selected |
+| 30 | regularScans | Medium | No scan in 30 days |
+| 31 | analysisSize | Medium | Over 500 MB analysed or 1 GB of modules |
 
-- Junk, sensitive, duplicate, and unwanted files
-- Nested archives and repository contents
-- Missing debug or supporting files
-- Unscannable or unsupported modules
-- Incorrect entry-point selection
-- First-party, third-party, and dependency selection
-- JavaScript, Java, .NET, Go, and ASP.NET packaging
-- Excessive files, modules, or analysis size
-- Missing SCA results
-- Flaw-count anomalies
-- Scan recency
+## API calls
 
-Skip checks by number when needed:
+REST `/appsec/v1/applications`; XML `getbuildinfo`, `detailedreport`, `getfilelist`, `getprescanresults`, plus `getbuildlist` (fallback) and `getsandboxlist` (sandboxes). About 4 calls per profile.
 
-```bash
-python scan_health.py --skip-checks 1,17,30
+## Differences from the Go tool
+
+Adds bulk mode, Excel/CSV/JSON, dashboard, trends, checkpoint and resume, per-endpoint pacing, and skippable checks. It picks the latest published build. Not ported: scan compare, self-update and region auto-detection (use `--region`).
+
+## Repository
+
 ```
-
-Only flaws with an **accepted** mitigation are excluded from open-flaw counts. Proposed, rejected, and unmitigated flaws remain open.
-
-Failed API retrieval is reported as **Error**, never as a healthy scan.
-
-## Dashboard and reports
-
-The tenant HTML report and Excel dashboard keep scan health separate from security risk:
-
-- **Scan health** shows whether the scan is accurate, efficient, and current.
-- **Security risk** shows findings severity, Veracode score or rating, and policy status.
-
-A healthy scan does not mean the application has no vulnerabilities. Likewise, a low flaw count from an unhealthy scan is not evidence of safety.
-
-The Excel workbook includes:
-
-- **Executive Dashboard**
-- **App Heatmap**
-- **Issue Heatmap**
-- **Scan Health Summary**
-- **Recommendations**
-- **Tenant Aggregation**
-- **Tenant Overview**
-- **Trends**, when a previous report is provided
-
-Applications without a published scan are reported as **Unknown**, not healthy.
-
-## Trends
-
-Tenant runs save compact snapshots under:
-
-```text
-scan_health_output/history/tenant/<region>/<account_id>/
-```
-
-Run the tool regularly with the same scope to track:
-
-- Degraded or improved applications
-- New or stale scans
-- Policy changes
-- New Very High findings
-- Renamed or removed profiles
-- Recurring tenant-wide packaging issues
-
-Snapshots are compared only when the region, filters, sandbox scope, application limit, and skipped checks match.
-
-## Reliability
-
-Tenant-scale runs may be long-running. The tool protects progress through:
-
-- A checkpoint after every processed profile
-- Automatic resume for matching runs
-- Per-endpoint rate limiting
-- Retries with exponential backoff
-- Partial reports on fatal errors or interruption
-- Cached API responses for application and scan runs
-
-There is no separate resume command. Rerun the same command or use `--restart` to discard the current checkpoint.
-
-## Exit codes
-
-| Code | Meaning |
-|---:|---|
-| `0` | Success |
-| `1` | Authentication or fatal API error |
-| `2` | Invalid usage or non-unique application match |
-| `3` | Report write failed |
-| `130` | Interrupted |
-
-Once collection begins, the tool attempts to write a partial report on exit codes `1` and `130`.
-
-## Repository layout
-
-```text
-scan_health.py       main entry point
-helpers/             collection, analytics, output, and report modules
-tests/               pytest suite with offline fixtures
+scan_health.py   entry point
+helpers/         report, analytics, rendering and layout modules
+tests/           pytest, offline fixtures
 ```
 
 ## License
 
-This tool is not an official Veracode product. It comes with no support or warranty. The original scan_health tool is licensed under the MIT License. This port follows the same terms.
+MIT, as the original. No support or warranty.

@@ -1,9 +1,4 @@
-"""
-Components for the redesigned reports (app, scan and tenant).
-
-Everything is static HTML and SVG (no script). Every value
-goes through report_ui.e(); links go through report_ui.link().
-"""
+"""Shared report components: lens panels, matrix, heatmap, CSS."""
 
 from __future__ import annotations
 

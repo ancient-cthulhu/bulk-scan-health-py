@@ -1,14 +1,4 @@
-"""
-Single-application deep health report for scan_health.py.
-
-Enabled from scan_health.main() by --app, --app-id or --app-guid. Produces one
-AppReport for one application profile (policy context, or one sandbox) across
-its recent build history.
-
-Every request goes through VeracodeClient._get, so rate limiting, 429 handling
-and auth retries apply. The health checks are scan_health's own CHECK_REGISTRY
-run through scan_health.run_checks; nothing here re-implements a check.
-"""
+"""Single app, sandbox or scan report: resolve, collect, cache, run()."""
 
 from __future__ import annotations
 
@@ -29,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, parse_qs, unquote, urlsplit
 
 import requests
 
@@ -79,6 +69,32 @@ class ResolutionError(Exception):
     def __init__(self, message: str, candidates: list[str] | None = None) -> None:
         super().__init__(message)
         self.candidates = candidates or []
+
+
+class AccessDenied(ResolutionError):
+    """The API refused the credentials (401/403) while the link or name was
+    being checked. Raised at once instead of retrying for the auth window, so
+    a wrong link, account or region is reported in seconds, not after an hour."""
+
+
+def access_denied_message(status: int, what: str, region: str) -> str:
+    return (f"The Veracode API refused access (HTTP {status}) while checking {what}. Nothing was "
+            "collected. Usual causes: the link is for a different region than the API credentials "
+            f"(this run uses {region}); the application belongs to another Veracode account; or the "
+            "API user lacks the Results API / Reviewer role. Fix the link or credentials and run again.")
+
+
+class ApiUnreachable(ResolutionError):
+    """The Veracode API could not be reached while the link or name was being
+    checked. Raised after one retry, so a network, proxy or region problem is
+    reported in seconds instead of after minutes of connection retries."""
+
+
+def unreachable_message(url: str, exc: Exception, region: str) -> str:
+    host = urlsplit(url).hostname or url
+    return (f"Could not reach the Veracode API at {host} ({type(exc).__name__}). Nothing was "
+            "collected. Check network, proxy or firewall access to that host, and that the region "
+            f"is right (this run uses {region}; set --region eu for analysiscenter.veracode.eu).")
 
 
 class FatalAPIError(Exception):
@@ -561,6 +577,10 @@ class Fetcher:
         self.region = region
         self.calls: dict[str, int] = {"report": 0, "xml": 0, "rest": 0}
         self.errors: list[str] = []
+        # While the link or name is being resolved, a 401/403 is reported at
+        # once (AccessDenied); afterwards the normal auth retry window applies
+        # so a credential rotation mid-run does not lose the run.
+        self.fail_fast = False
 
     def xml(self, endpoint: str, params: dict[str, Any], *, app_id: str,
             build_id: str | None = None, cache_policy: str = "none") -> FetchResult:
@@ -597,11 +617,17 @@ class Fetcher:
         url = f"{self.client._cfg['xml']}/{endpoint}"
         self.calls[bucket] += 1
         try:
-            r = self.client._get(url, params, bucket)
+            r = self.client._get(url, params, bucket, auth_retry=not self.fail_fast,
+                                 quick=self.fail_fast)
         except sh.TransientAuthError as e:
             return self._fail(endpoint, f"authentication failure persisted: {e}")
         except requests.RequestException as e:
+            if self.fail_fast:
+                raise ApiUnreachable(unreachable_message(url, e, self.region)) from e
             return self._fail(endpoint, f"{type(e).__name__}: {e}")
+        if self.fail_fast and r.status_code in (401, 403):
+            raise AccessDenied(access_denied_message(r.status_code, f"app {app_id} ({endpoint})",
+                                                     self.region))
         if not r.ok:
             return self._fail(endpoint, f"HTTP {r.status_code}")
         try:
@@ -627,13 +653,22 @@ class Fetcher:
         self.cache.write(p, result.raw)
 
     def rest(self, path: str, params: dict[str, Any] | None = None,
-             auth_retry: bool = True) -> dict[str, Any]:
+             auth_retry: bool | None = None) -> dict[str, Any]:
         """REST GET through the client. Raises on failure. auth_retry=False
         returns a 401/403 at once (raised here as HTTPError) instead of
-        retrying for the whole auth window; use it for optional lookups."""
+        retrying for the whole auth window; use it for optional lookups.
+        Left at None, a 401/403 while resolving raises AccessDenied."""
         self.calls["rest"] += 1
-        r = self.client._get(f"{self.client._cfg['rest']}{path}", params, "rest",
-                             auth_retry=auth_retry)
+        retry = (not self.fail_fast) if auth_retry is None else auth_retry
+        url = f"{self.client._cfg['rest']}{path}"
+        try:
+            r = self.client._get(url, params, "rest", auth_retry=retry, quick=self.fail_fast)
+        except requests.RequestException as e:
+            if self.fail_fast:
+                raise ApiUnreachable(unreachable_message(url, e, self.region)) from e
+            raise
+        if auth_retry is None and self.fail_fast and r.status_code in (401, 403):
+            raise AccessDenied(access_denied_message(r.status_code, "the application", self.region))
         if r.status_code == 404:
             return {}
         r.raise_for_status()
@@ -1201,17 +1236,89 @@ def _sandbox_fields(fields: list[str]) -> tuple[str, str] | None:
     return app_id, str(int(sbx))
 
 
+def clean_link(value: str) -> str:
+    """Undo common copy-and-paste damage: surrounding quotes or angle
+    brackets, and a '#' that an email client or chat tool encoded as %23."""
+    v = value.strip().strip("'\"<>").strip()
+    if "#" not in v and "%23" in v.lower():
+        v = unquote(v)
+    return v
+
+
+def _location(parts: SplitResult) -> str | None:
+    """The page part of a platform link: the '#' fragment of /auth/index.jsp,
+    or the loc= parameter of a deep link (https://analysiscenter.veracode.com/
+    ?loc=HomeAppProfile:<account>:<app>), which the platform turns into the
+    same fragment after sign-in. None when the link has neither."""
+    loc = parse_qs(parts.query).get("loc")
+    if loc:
+        return loc[0].strip().lstrip("#").rstrip("#")
+    if parts.path.lower() == "/auth/index.jsp":
+        return parts.fragment
+    return None
+
+
+def link_problem(value: str, kind: str) -> str:
+    """Why a link cannot be used, in plain words, for kind "scan" (--scan) or
+    "app" (--app). Checked before any API call, so a wrong link is reported
+    at once instead of after a run."""
+    v = _with_scheme(clean_link(value))
+    try:
+        parts = urlsplit(v)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return "This is not a valid link."
+    if not host or "." not in host:
+        return ("This is neither a Veracode Platform link nor a build ID." if kind == "scan"
+                else "This is not a Veracode Platform link.")
+    if host == "analysiscenter.veracode.us":
+        return ("Links to the US (FedRAMP) region are not supported; this tool supports the "
+                "commercial and eu regions.")
+    if host not in SCAN_HOSTS:
+        return (f"{host} is not the Veracode Platform. Copy the link from analysiscenter.veracode.com "
+                "(or .eu).")
+    if parts.scheme.lower() != "https":
+        return "Use the https:// link."
+    location = _location(parts)
+    if location is None:
+        return ("This points at another part of the Veracode site. Expected a link like "
+                "https://analysiscenter.veracode.com/auth/index.jsp#Page:...")
+    fields = location.split(":") if location else []
+    if not fields:
+        return ("The link has no page part after '#'. Copy the whole address from the browser's "
+                "address bar (some tools cut links at '#').")
+    page = fields[0]
+    app_hint = (f" To analyse the whole application, use --app-id {fields[2]}."
+                if len(fields) > 2 and fields[2].isdigit() else "")
+    if re.search(r"dynamic|dast|manual|discovery", page, re.IGNORECASE):
+        return f"{page} is a dynamic or manual analysis page; only static (SAST) scans are supported."
+    if kind == "app":
+        return ("This link does not carry an application ID. Copy the link of the application, a "
+                "sandbox or any of its scans, or use the profile name or --app-id.")
+    if page == "HomeAppProfile":
+        return ("This links to the application, not to a scan. Use --app with this link for the "
+                "application report, or open one of its scans (for example Triage Flaws) and copy "
+                "that link.")
+    if page == SANDBOX_PAGE:
+        return "This sandbox link is cut short or damaged; it needs the sandbox ID at the end."
+    if page in SCAN_PAGES:
+        if len(fields) < 4 or not fields[3]:
+            return "The link is cut short: it has no build ID. Copy the whole address."
+        return "The IDs in this link are not valid numbers; the link looks damaged. Copy it again."
+    return (f"{page} is not a scan page this tool can read. Open the scan's Triage Flaws, Review "
+            f"Modules or Static Overview page and copy that link.{app_hint}")
+
+
 def _invalid_link(value: str) -> ValueError:
-    return ValueError(f"{term_safe(value)!r} is not a valid or supported Veracode Platform URL "
-                      "or build ID. Expected a link to one of these pages: "
-                      + ", ".join((*SCAN_PAGES, SANDBOX_PAGE)))
+    return ValueError(f"{link_problem(value, 'scan')}\n    Link: {term_safe(value)!r}\n"
+                      "    Supported pages: " + ", ".join((*SCAN_PAGES, SANDBOX_PAGE)))
 
 
 def parse_scan_target(value: str) -> ScanTarget:
     """Parse a platform scan link or a bare build id, as Veracode's scan_health
     tool does: https, a known Veracode host, path /auth/index.jsp, a supported
     page, app id and build id in fragment fields 2 and 3."""
-    v = value.strip()
+    v = clean_link(value)
     if v.isdigit():
         if int(v) <= 0 or len(v) > 12:
             raise ValueError("Build ID must be a positive number")
@@ -1240,8 +1347,8 @@ def _with_scheme(v: str) -> str:
 
 
 def _split_platform_link(v: str, invalid: Callable[[str], ValueError]) -> tuple[str, str]:
-    """(region, fragment) of a Veracode Platform link: https, a known Veracode
-    host, path /auth/index.jsp. The host must match exactly, so look-alike
+    """(region, page part) of a Veracode Platform link: https, a known Veracode
+    host, and /auth/index.jsp#... or ?loc=... The host must match exactly, so look-alike
     domains and links merely containing a Veracode URL are rejected."""
     v = _with_scheme(v)
     try:
@@ -1255,21 +1362,21 @@ def _split_platform_link(v: str, invalid: Callable[[str], ValueError]) -> tuple[
         raise ValueError("Links to the US (FedRAMP) region are not supported; this tool "
                          "supports the commercial and eu regions.")
     region = SCAN_HOSTS.get(host)
-    if region is None or parts.path.lower() != "/auth/index.jsp":
+    location = _location(parts)
+    if region is None or location is None:
         raise invalid(v)
-    return region, parts.fragment
+    return region, location
 
 
 def is_link(value: str) -> bool:
     """True when an --app value is a URL rather than a profile name."""
-    return value.strip().lower().startswith(("https://", "http://", "analysiscenter.veracode."))
+    return clean_link(value).lower().startswith(("https://", "http://", "analysiscenter.veracode."))
 
 
 def _invalid_app_link(value: str) -> ValueError:
-    return ValueError(f"{term_safe(value)!r} is not a Veracode Platform link to an application. "
-                      "Expected https://analysiscenter.veracode.com/auth/index.jsp#<Page>:"
-                      "<account_id>:<app_id>... (any application or scan page), or use the "
-                      "profile name or --app-id.")
+    return ValueError(f"{link_problem(value, 'app')}\n    Link: {term_safe(value)!r}\n"
+                      "    Expected https://analysiscenter.veracode.com/auth/index.jsp#<Page>:"
+                      "<account_id>:<app_id>... (the application, a sandbox or any scan page)")
 
 
 def parse_app_link(value: str) -> ScanTarget:
@@ -1283,7 +1390,7 @@ def parse_app_link(value: str) -> ScanTarget:
     against the Applications API before anything runs. build_id is kept when
     the link points at a scan, so the caller can mention --scan.
     """
-    v = value.strip()
+    v = clean_link(value)
     region, fragment = _split_platform_link(v, _invalid_app_link)
     fields = fragment.split(":")
     if len(fields) < 3 or not re.fullmatch(r"[A-Za-z]+", fields[0]):
@@ -1994,8 +2101,10 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
     client = sh.VeracodeClient(region, timeout=args.timeout, pool_size=16,
                                rate_budget=args.rate_budget, max_retries=args.max_retries,
                                backoff_factor=args.retry_backoff,
-                               auth_retry_window=args.auth_retry_window)
+                               auth_retry_window=args.auth_retry_window,
+                               report_timeout=getattr(args, "report_timeout", 600))
     fetcher = Fetcher(client, cache, region)
+    fetcher.fail_fast = True                  # until the link or name has resolved
     report: AppReport | None = None
     exit_code = EXIT_OK
     started = time.monotonic()
@@ -2105,6 +2214,7 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
         if args.dry_run:
             report = None      # dry run writes nothing
             return EXIT_OK
+        fetcher.fail_fast = False             # resolved: normal auth retry from here on
 
         if scan is not None:
             pass                      # resolve_scan already noted an unpublished build
@@ -2117,6 +2227,8 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
                         f"{len(en.published)} exist in this context.")
 
         for i, ref in enumerate(en.published):
+            log.info("[*] Build %s (%d/%d): fetching results (large reports can take minutes)",
+                     ref.build_id, i + 1, len(en.published))
             snap = collect_snapshot(
                 fetcher, app, ref, is_latest=(i == 0), mode=args.history_mode, skip=skip,
                 sandbox_name=context.get("sandbox_name") or "",
@@ -2151,6 +2263,10 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
             if hp is None:
                 report.note("Point-in-time history", "history.jsonl not written "
                             "(cache disabled or not writable).")
+    except AccessDenied as e:
+        print(f"[!] {e}")
+        report = None                         # nothing was collected; no report to write
+        exit_code = EXIT_RESOLVE
     except sh.AuthError as e:
         log.error("FATAL: %s", e)
         exit_code = EXIT_FATAL

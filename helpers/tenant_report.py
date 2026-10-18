@@ -1,11 +1,4 @@
-"""
-Tenant-wide snapshots for scan_health.py bulk mode.
-
-Every bulk run can save a compact, private, gzip-compressed snapshot of its
-results: one record per profile (and sandbox) plus the tenant metrics. Later
-runs read the series of comparable snapshots to show trends over time and
-per-application movement.
-"""
+"""Tenant snapshots: write, read, select comparable series."""
 
 from __future__ import annotations
 

@@ -1,19 +1,4 @@
-"""
-Where scan_health.py writes things. One root folder (default
-./scan_health_output, --out-dir to change it):
-
-    scan_health_output/
-      tenant/<region>/<YYYY-MM-DD_HHMMSS>/     one folder per bulk run
-      apps/<app>_<app_id>/<YYYY-MM-DD_HHMMSS>/  --app reports
-      apps/<app>_<app_id>/scan_<build>_<ts>/    --scan reports
-      history/tenant/<region>/<account>/        tenant snapshots (keep: trends)
-      history/apps/<app guid>.jsonl             per-app history (keep: trends)
-      cache/<region>/<app_id>/<build>/          raw API responses (safe to delete)
-
-Explicit --output, --report-dir, --cache-dir and --snapshot-dir always win.
-Works the same on Windows, Linux and macOS: folder names use only letters,
-digits, "_" and "-", and stay short.
-"""
+"""Output folder layout under scan_health_output/."""
 
 from __future__ import annotations
 

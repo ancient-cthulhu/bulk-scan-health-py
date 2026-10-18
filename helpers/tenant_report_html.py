@@ -1,10 +1,4 @@
-"""
-Self-contained HTML rendering of the tenant-wide report.
-
-Same visual language as the single-application report (shared report_ui):
-inline CSS, inline SVG charts, no external resources, light and dark, print
-layout, readable at phone width. Rendering only: no API calls.
-"""
+"""HTML renderer for the tenant report. One CSP-hashed script; all values escaped."""
 
 from __future__ import annotations
 

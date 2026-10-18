@@ -1,12 +1,4 @@
-"""
-Tenant-wide analytics over bulk-run snapshots. Pure functions, stdlib only,
-no API calls and no I/O.
-
-Input is the snapshot of the current run plus the comparable earlier
-snapshots (newest first, as tenant_report.select_series returns them). Output
-is one TenantReport: the single source of truth that the HTML, JSON and xlsx
-renderers read.
-"""
+"""Tenant analytics over bulk-run snapshots. Pure functions, no I/O."""
 
 from __future__ import annotations
 

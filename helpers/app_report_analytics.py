@@ -1,10 +1,4 @@
-"""
-Analytics for the single-application report.
-
-Pure functions over the collected BuildSnapshot list: no I/O, no API calls, no
-rendering. Every renderer consumes the Analysis object built here, so the HTML,
-JSON and any later format show the same numbers. Standard library only.
-"""
+"""Analytics for the app report. Pure functions, no I/O."""
 
 from __future__ import annotations
 

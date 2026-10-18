@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-Veracode Tenant-Wide Scan Health
-Python port of https://github.com/veracode/scan_health (Go v2.47)
-Extended for tenant-wide iteration, Excel/CSV/JSON export, trend analysis.
-
-Requirements:
-    pip install veracode-api-signing requests openpyxl
-"""
+"""Veracode scan health, tenant-wide. Python port of veracode/scan_health (Go v2.47)."""
 
 from __future__ import annotations
 
@@ -926,27 +919,30 @@ class VeracodeClient:
     AUTH_RETRY_BASE = 30.0       # first backoff after a 401/403
     AUTH_RETRY_CAP = 300.0       # ceiling on a single auth backoff
     NET_RETRIES = 5              # connection-level retries per request
+    QUICK_NET_RETRIES = 1        # while checking a link or name (quick=True)
+    QUICK_CONNECT_TIMEOUT = 15   # seconds, quick=True only
+    QUICK_STATUS_RETRIES = 2     # 5xx retries while checking a link or name
+    STATUS_RETRY = (500, 502, 503, 504)
 
     def __init__(self, region: str = "commercial", timeout: int = 120,
                  pool_size: int = 16, rate_budget: float = 70.0,
                  max_retries: int = 8, backoff_factor: float = 2.0,
-                 auth_retry_window: float = 3600.0) -> None:
+                 auth_retry_window: float = 3600.0, report_timeout: int = 600) -> None:
         self._cfg = REGIONS[region]
         self._timeout = timeout
+        self._report_timeout = max(timeout, report_timeout)
+        self._max_retries = max(0, max_retries)
+        self._backoff = max(0.0, backoff_factor)
         self._s = requests.Session()
         self._s.auth = RequestsAuthPluginVeracodeHMAC()
         self._s.headers["User-Agent"] = "veracode-scan-health-py/4.0"
 
-        retry = Retry(total=max_retries, backoff_factor=backoff_factor,
-                      status_forcelist=(500, 502, 503, 504),
-                      allowed_methods=("GET",),
-                      respect_retry_after_header=True,
-                      raise_on_status=False)
-        # 429 is deliberately absent from status_forcelist: the RateLimiter
-        # handles it, because a blind urllib3 retry would keep the offending
-        # bucket at the same rate and simply collide again.
+        # No retries inside urllib3: they resend the same signed request, and
+        # a Veracode HMAC header (timestamp + nonce) is refused when replayed
+        # (seen as a 401 after a read timeout). _send retries with a fresh
+        # signature instead. 429 is left to the RateLimiter.
         pool = max(16, pool_size)
-        self._s.mount("https://", HTTPAdapter(max_retries=retry,
+        self._s.mount("https://", HTTPAdapter(max_retries=Retry(0, read=False, redirect=0),
                                               pool_connections=pool, pool_maxsize=pool))
 
         self.limiter = RateLimiter(rate_budget)
@@ -972,7 +968,7 @@ class VeracodeClient:
         return min(self.AUTH_RETRY_CAP, self.AUTH_RETRY_BASE * (2 ** max(0, attempt - 1)))
 
     def _get(self, url: str, params: dict | None, bucket: str,
-             auth_retry: bool = True) -> requests.Response:
+             auth_retry: bool = True, quick: bool = False) -> requests.Response:
         """GET with per-bucket pacing, throttle handling, and retry on auth and
         connection failures.
 
@@ -984,8 +980,12 @@ class VeracodeClient:
         auth_retry=False returns a 401/403 response immediately instead. It is
         for optional enrichment probes (Findings, Reporting API) where a 403
         means "this account lacks the role", which no amount of waiting fixes.
+
+        quick=True is for the first lookups of a run (checking a link or a
+        name): one connection retry and a short connect timeout, so an
+        unreachable host is reported in seconds instead of minutes.
         """
-        return self._send("GET", url, params, bucket, auth_retry=auth_retry)
+        return self._send("GET", url, params, bucket, auth_retry=auth_retry, quick=quick)
 
     def _post(self, url: str, body: dict, bucket: str,
               auth_retry: bool = True) -> requests.Response:
@@ -996,25 +996,33 @@ class VeracodeClient:
 
     def _send(self, method: str, url: str, params: dict | None, bucket: str,
               json_body: dict | None = None,
-              auth_retry: bool = True) -> requests.Response:
+              auth_retry: bool = True, quick: bool = False) -> requests.Response:
         """Shared transport for _get and _post. See _get for the semantics."""
+        retries = self.QUICK_NET_RETRIES if quick else self.NET_RETRIES
+        status_retries = self.QUICK_STATUS_RETRIES if quick else self._max_retries
+        read = self._report_timeout if bucket == "report" else self._timeout
+        timeout: float | tuple[float, float] = (
+            (min(self.QUICK_CONNECT_TIMEOUT, read), read) if quick else read)
         auth_attempt = 0
         auth_waited = 0.0
         net_attempt = 0
+        status_attempt = 0
         while True:
             self.limiter.acquire(bucket)
             try:
-                r = self._s.request(method, url, params=params, json=json_body,
-                                    timeout=self._timeout)
+                r = self._s.request(method, url, params=params, json=json_body, timeout=timeout)
             except requests.RequestException as e:
                 net_attempt += 1
-                if net_attempt > self.NET_RETRIES:
+                # A report that ran past the read timeout will most likely do so
+                # again: retry it once, not five times.
+                limit = 1 if (bucket == "report" and isinstance(e, requests.ReadTimeout)) else retries
+                if net_attempt > limit:
                     raise
                 with self._rate_lock:
                     self.net_retry_events += 1
                 wait = min(60.0, 2.0 ** net_attempt)
                 log.warning("[!] Network error on %s (%s: %s). Retry %d/%d in %.0fs.",
-                            url, type(e).__name__, e, net_attempt, self.NET_RETRIES, wait)
+                            url, type(e).__name__, e, net_attempt, limit, wait)
                 time.sleep(wait)
                 continue
 
@@ -1024,6 +1032,18 @@ class VeracodeClient:
             if r.status_code == 429:
                 self.limiter.throttled(bucket, _parse_retry_after(r.headers.get("Retry-After")))
                 continue        # re-paced at the reduced rate
+
+            if (r.status_code in self.STATUS_RETRY and method == "GET"
+                    and status_attempt < status_retries):
+                status_attempt += 1
+                wait = min(120.0, self._backoff * (2 ** (status_attempt - 1)))
+                ra = _parse_retry_after(r.headers.get("Retry-After"))
+                if ra:
+                    wait = min(300.0, max(wait, ra))
+                log.warning("[!] HTTP %d on %s. Retry %d/%d in %.0fs.",
+                            r.status_code, url, status_attempt, status_retries, wait)
+                time.sleep(wait)
+                continue
 
             if r.status_code in (401, 403) and not auth_retry:
                 return r
@@ -4169,7 +4189,11 @@ def main() -> None:
                         "the rate limiter, not by blind retry.")
     p.add_argument("--retry-backoff", type=float, default=2.0,
                    help="Exponential backoff factor for 5xx retries (default 2.0)")
-    p.add_argument("--timeout", type=int, default=120)
+    p.add_argument("--timeout", type=int, default=120,
+                   help="HTTP read timeout in seconds (default 120)")
+    p.add_argument("--report-timeout", type=int, default=600, metavar="SECONDS",
+                   help="Read timeout for detailedreport and the other report APIs, which can "
+                        "take minutes on large builds (default 600)")
     p.add_argument("--auth-retry-window", type=float, default=3600.0, metavar="SECONDS",
                    help="How long to keep retrying a single request through 401/403 before "
                         "abandoning THAT REQUEST (default 3600). The run never aborts on a "
@@ -4306,6 +4330,8 @@ def main() -> None:
         p.error("--retry-backoff must be >= 0")
     if args.timeout < 1:
         p.error("--timeout must be >= 1")
+    if args.report_timeout < 1:
+        p.error("--report-timeout must be >= 1")
     if args.max_apps < 0:
         p.error("--max-apps must be >= 0")
     if args.auth_retry_window < 0:
@@ -4475,7 +4501,8 @@ def main() -> None:
                                 rate_budget=args.rate_budget,
                                 max_retries=args.max_retries,
                                 backoff_factor=args.retry_backoff,
-                                auth_retry_window=args.auth_retry_window)
+                                auth_retry_window=args.auth_retry_window,
+                                report_timeout=args.report_timeout)
         log.info("[*] Region: %s | rate budget %.0f%% of limits "
                  "(report %.0f/min, xml %.0f/min, rest %.0f/min)",
                  args.region, args.rate_budget,

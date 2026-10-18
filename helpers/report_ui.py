@@ -1,14 +1,9 @@
-"""
-Shared building blocks for the HTML reports (single-application and tenant).
-
-Escaping, safe links, status chips, the page CSS and the inline SVG chart
-helpers live here so both reports look and behave the same. No JavaScript, no
-external resources. Every value that reaches a page goes through e(); links
-are only emitted for https URLs on Veracode hosts.
-"""
+"""Shared HTML helpers: escaping, safe links, chips, SVG charts."""
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
 import math
 from datetime import datetime
@@ -479,3 +474,44 @@ def mix_bar(parts: list[tuple[str, int, str]]) -> str:
     segs = "".join(f'<i class="{e(cls)}" style="width:{100.0 * n / total:.2f}%"></i>'
                    for cls, n, _ in parts if n)
     return f'<span class="mix" role="img" aria-label="{e(txt)}" title="{e(txt)}">{segs}</span>'
+
+
+# ==========================================================================
+# "Save as PDF": the browser's own print dialog (every desktop browser can
+# save to PDF), so the PDF matches the page exactly and no PDF library or
+# network access is needed. The button is hidden until the script runs, so a
+# page opened without JavaScript never shows a button that does nothing.
+# ==========================================================================
+
+PDF_SCRIPT = ('(function () { var b = document.getElementById("save-pdf"); if (!b) { return; } '
+              'b.hidden = false; b.addEventListener("click", function () { window.print(); }); }());')
+
+
+def pdf_button() -> str:
+    return ('<div class="toolbar"><button type="button" id="save-pdf" class="pdfbtn" hidden '
+            'title="Opens the print dialog; choose Save as PDF">Save as PDF</button></div>')
+
+
+def script_hash(script: str) -> str:
+    return "sha256-" + base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
+
+
+def csp_meta(script: str) -> str:
+    """Content-Security-Policy that allows exactly this inline script and
+    nothing else: no other script, no network, no frames, no forms."""
+    csp = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
+           f"script-src '{script_hash(script)}'; base-uri 'none'; form-action 'none'")
+    return f'<meta http-equiv="Content-Security-Policy" content="{csp}"><meta name="referrer" content="no-referrer">'
+
+
+PRINT_CSS = """
+.toolbar{float:right;margin:0 0 8px 16px}
+.pdfbtn{font:inherit;font-size:14px;font-weight:600;color:var(--link);background:var(--card);border:1px solid var(--s1);border-radius:8px;padding:6px 14px;cursor:pointer}
+.pdfbtn:hover{background:var(--wash)}
+.pdfbtn:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
+@page{size:A4;margin:14mm}
+@media print{.toolbar{display:none} *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+main{max-width:none;padding:0} section,.part,main>section{break-inside:auto!important;margin:14px 0}
+h1,h2,h3,summary{break-after:avoid} tr,svg,.v,.act,.stat,.kpi,.panel,.q,figure{break-inside:avoid}
+body{font-size:12.5px} .grid2,.cols2{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+"""
