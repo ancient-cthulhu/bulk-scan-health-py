@@ -11,16 +11,10 @@ import scan_health as sh
 from . import app_report_analytics as ana
 from .report_ui import chip, e, link, rec_html
 
-# ==========================================================================
-# Lenses and result coverage
-# ==========================================================================
-
 LENS_SCAN = "scan"
 LENS_POSTURE = "posture"
 LENS_NAME = {LENS_SCAN: "Scan health", LENS_POSTURE: "Security posture"}
 
-# Inline glyphs, drawn in currentColor: a gauge for scan health, a shield for
-# security posture. Decorative (the lens name is always written next to them).
 _GLYPH = {
     LENS_SCAN: ('<svg class="glyph" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 14a7 7 0 1 1 14 0" '
                 'fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>'
@@ -31,8 +25,7 @@ _GLYPH = {
                    'stroke-width="1.8" stroke-linejoin="round"/></svg>'),
 }
 
-# Checks whose failure means part of the application may not have been
-# analysed (category "Results accuracy" in the action rubric).
+# Failing these means part of the app may not have been analysed.
 _ACCURACY = {n for n, (_, _, cat) in ana._CHECK_META.items() if cat == "Results accuracy"}
 _ACCURACY_MAJOR = _ACCURACY & ana._P1_ACCURACY
 _CHECK_LABELS = {n: label for n, (label, _) in sh.CHECK_CATALOG.items()}
@@ -40,11 +33,10 @@ _CHECK_LABELS = {n: label for n, (label, _) in sh.CHECK_CATALOG.items()}
 
 @dataclass
 class Coverage:
-    """How completely the uploaded and selected code represents the
-    application, from the accuracy checks only. A tool heuristic: it says
-    nothing about the quality of Veracode's analysis of what was scanned."""
-    level: str        # GREEN | YELLOW | ORANGE | GRAY
-    label: str        # Complete | Partial | At risk | Unknown
+    """How completely the uploaded and selected code represents the application, from the accuracy
+    checks only."""
+    level: str
+    label: str
     reason: str
 
 
@@ -71,8 +63,8 @@ def result_coverage(failed: list[int] | set[int], checks_ran: bool,
 
 
 def action_lens(check_num: int | None, category: str) -> str:
-    """Scan health for anything raised by a check or about scan performance
-    and cadence; security posture for findings and policy actions."""
+    """Scan health for anything raised by a check or about scan performance and cadence; security
+    posture for findings and policy actions."""
     if check_num is not None or category != "Security exposure":
         return LENS_SCAN
     return LENS_POSTURE
@@ -82,19 +74,14 @@ def lens_label(lens: str) -> str:
     return f'<span class="lens">{_GLYPH[lens]}{e(LENS_NAME[lens])}</span>'
 
 
-# ==========================================================================
-# Lens panel with lab-style results
-# ==========================================================================
-
 @dataclass
 class Result:
-    """One measurement: value against its reference, with a flag when out of
-    range. value_html/reference_html are already safe HTML."""
+    """One measurement: value against its reference, with a flag when out of range."""
     label: str
     value_html: str
     reference_html: str = ""
-    flag: str = ""          # e.g. "High", "New", "Not met"; "" when in range
-    level: str = "GRAY"     # level of the flag chip
+    flag: str = ""
+    level: str = "GRAY"
 
 
 def results_table(rows: list[Result]) -> str:
@@ -117,14 +104,9 @@ def lens_panel(lens: str, grade_level: str, grade: str, sentence: str, results: 
             f'<p class="say">{e(sentence)}</p>{results_table(results)}{trend}{first}</section>')
 
 
-# ==========================================================================
-# Sparkline and bullet chart
-# ==========================================================================
-
 def sparkline(values: Sequence[float | None], tips: list[str], label: str, fmt: Any,
               w: int = 168, h: int = 34) -> str:
-    """Small trend line: de-emphasised line, latest point in the accent and
-    labelled. Every point has a tooltip; the full chart lives further down."""
+    """Small trend line: de-emphasised line, latest point in the accent and labelled."""
     pts = [(i, v) for i, v in enumerate(values) if v is not None]
     if len(pts) < 2:
         return ""
@@ -153,8 +135,7 @@ def sparkline(values: Sequence[float | None], tips: list[str], label: str, fmt: 
 
 def bullet(label: str, value: float, band: tuple[float, float] | None, limit: float | None,
            fmt: Any, w: int = 520, h: int = 58) -> str:
-    """One-row position chart: the value as a bar, the normal range as a band,
-    the limit as a tick. For "latest against baseline and threshold"."""
+    """One-row position chart: the value as a bar, the normal range as a band, the limit as a tick."""
     top = max([value] + ([band[1]] if band else []) + ([limit] if limit else [])) * 1.1 or 1.0
     x0, x1 = 4, w - 4
 
@@ -184,13 +165,9 @@ def bullet(label: str, value: float, band: tuple[float, float] | None, limit: fl
     return "".join(out)
 
 
-# ==========================================================================
-# Actions
-# ==========================================================================
-
 @dataclass
 class ActionView:
-    """An action, ready to render. fix_html entries are safe HTML."""
+    """An action, ready to render."""
     priority: str
     title: str
     lens: str
@@ -202,14 +179,13 @@ class ActionView:
     verify: str = ""
     effect: str = ""
     links: list[tuple[str, str]] = field(default_factory=list)
-    note: str = ""          # e.g. "failing 6 scans", "138 profiles"
+    note: str = ""
     anchor: str = ""
-    more_html: str = ""     # safe HTML, e.g. a link that filters the fix list
+    more_html: str = ""
 
 
 def action_list(items: list[ActionView], open_first: int = 3) -> str:
-    """Compact action rows: one line each, expanding to the detail. The first
-    `open_first` are expanded; print expands all."""
+    """Compact action rows: one line each, expanding to the detail."""
     if not items:
         return '<p class="empty">Nothing to do: every measured dimension is in range.</p>'
     rows = []
@@ -240,10 +216,6 @@ def fix_html(texts: list[str]) -> list[str]:
     return [rec_html(t) for t in texts]
 
 
-# ==========================================================================
-# Checks-by-builds matrix
-# ==========================================================================
-
 _CELL = {"Pass": ("ok", "\u2713", "Pass"), "Fail": ("crit", "\u2715", "Fail")}
 
 
@@ -252,15 +224,14 @@ class MatrixRow:
     check: int
     label: str
     category: str
-    cells: list[str]          # status per build, oldest first ("" when not analysed)
+    cells: list[str]
     lifecycle: str = ""
     severity: str = ""
-    detail_html: str = ""     # safe HTML shown when the row is expanded
+    detail_html: str = ""
 
 
 def check_matrix(builds: list[str], rows: list[MatrixRow], caption: str) -> str:
-    """Rows are checks, columns are builds (oldest to newest). Each cell has
-    an icon and a text alternative, so color never carries meaning alone."""
+    """Rows are checks, columns are builds (oldest to newest)."""
     head = "".join(f'<th scope="col" class="b">{e(b)}</th>' for b in builds)
     body = []
     for r in rows:
@@ -278,28 +249,19 @@ def check_matrix(builds: list[str], rows: list[MatrixRow], caption: str) -> str:
             f'<th scope="col">Lifecycle</th></tr></thead><tbody>{"".join(body)}</tbody></table></div>')
 
 
-# ==========================================================================
-# Heatmap and priority matrix
-# ==========================================================================
-
 def filter_link(text_html: str, target: str, flt: str, title: str = "") -> str:
-    """In-page link that the tenant report's script turns into a filter on
-    the target table; without script it just jumps to the table."""
+    """In-page link that the tenant report's script turns into a filter on the target table; without
+    script it just jumps to the table."""
     t = f' title="{e(title)}"' if title else ""
     return f'<a href="#{e(target)}" data-filter="{e(flt)}"{t}>{text_html}</a>'
 
 
-# Heatmap colours: one blue hue, blended through three stops in OKLab so
-# the middle of the scale stays saturated instead of turning grey. Light
-# mode grows darker with the share, dark mode grows lighter. Each tile gets
-# its exact colour for both modes and the text colour (ink or inverse) with
-# the better contrast against it.
+# OKLab blend keeps mid-scale saturated; text colour picked per tile for contrast.
 _HM: dict[str, dict[str, Any]] = {"light": {"stops": ("#e6effc", "#3987e5", "#0b2a55"), "ink": "#141413", "inv": "#ffffff"},
        "dark": {"stops": ("#1a2b40", "#2f7ad8", "#c4dcfb"), "ink": "#efeee9", "inv": "#141413"}}
 
 
-# Scale position of the smallest share shown: the first step clears 2:1
-# against the page in both themes (palette validator, ordinal check).
+# First step clears 2:1 against the page in both themes.
 HEAT_START = 0.3
 
 
@@ -351,8 +313,8 @@ def _contrast(a: str, b: str) -> float:
 
 
 def _tile_style(t: float) -> tuple[str, str]:
-    """(inline style, classes) for a tile: background per theme and whether
-    the text should use the inverse colour in each theme."""
+    """(inline style, classes) for a tile: background per theme and whether the text should use the
+    inverse colour in each theme."""
     lc, dc = heat_colour(t, "light"), heat_colour(t, "dark")
     lm, dm = _HM["light"], _HM["dark"]
     cls = []
@@ -373,11 +335,8 @@ def _ramp_style() -> str:
 def heatmap(caption: str, cols: list[str], rows: list[tuple[str, list[tuple[float | None, int, int]]]],
             row_head: str, filters: list[list[str | None]] | None = None, target: str = "fix",
             totals: list[tuple[int, str | None]] | None = None, total_head: str = "Profiles") -> str:
-    """Tile heatmap of shares on one sequential hue, scaled from 0 to the
-    largest share shown so differences stay visible on any tenant (the
-    legend states the range). Every tile prints its value; tiles with a
-    filter link open the matching list. Optional row totals add a bar
-    column on the right."""
+    """Tile heatmap of shares on one sequential hue, scaled from 0 to the largest share shown so
+    differences stay visible on any tenant (the legend states the range)."""
     shares = [sh_ for _, cells in rows for sh_, _, _ in cells if sh_]
     vmax = max(shares) if shares else 0.0
     other = {i for i, c in enumerate(cols) if c.split(" (")[0] == "Other"}
@@ -433,8 +392,7 @@ QUADRANTS = [
 
 def priority_matrix(counts: dict[str, int], total: int, href: dict[str, str] | None = None,
                     filters: dict[str, str] | None = None) -> str:
-    """2x2 of findings risk (rows) by scan health risk (columns), using the
-    workbook's quadrant values. Cells can link to a filtered list."""
+    """2x2 of findings risk (rows) by scan health risk (columns), using the workbook's quadrant values."""
     href = href or {}
     q = {name: (lvl, txt) for name, lvl, txt in QUADRANTS}
 
@@ -461,14 +419,6 @@ def priority_matrix(counts: dict[str, int], total: int, href: dict[str, str] | N
             '<div></div><div class="ax x">Scan health: in range</div><div class="ax x">Scan health: needs work</div>'
             f'</div>{foot}')
 
-
-# ==========================================================================
-# Small inline marks
-# ==========================================================================
-
-# ==========================================================================
-# Stylesheet for the redesigned reports
-# ==========================================================================
 
 DESIGN_CSS = """
 :root{color-scheme:light;
@@ -505,7 +455,6 @@ h3{font-size:15.5px;margin:22px 0 8px;font-weight:650}
 .glyph{width:20px;height:20px;flex:none;color:var(--ink2);vertical-align:-4px}
 .lens{display:inline-flex;align-items:center;gap:5px}
 .lens .glyph{width:15px;height:15px}
-/* two peer panels */
 .lenses{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:24px 0 0}
 .panel{background:var(--card);border:1px solid var(--ring);border-radius:14px;padding:18px 20px 16px;min-width:0;display:flex;flex-direction:column}
 .panel>header{display:flex;justify-content:space-between;align-items:center;gap:10px}
@@ -521,12 +470,10 @@ h3{font-size:15.5px;margin:22px 0 8px;font-weight:650}
 .trend figcaption{font-size:12.5px;color:var(--muted)}
 .first{margin:auto 0 0;padding-top:10px;border-top:1px solid var(--grid);font-size:14px}
 .first .k{font-weight:600;margin-right:6px}
-/* chips */
 .chip{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;white-space:nowrap}
 .chip .ic{display:inline-grid;place-items:center;width:18px;height:18px;border-radius:50%;color:#fff;font-size:11px;font-weight:700}
 .ok .ic{background:var(--good)} .warn .ic{background:var(--warn);color:#141413}
 .serious .ic{background:var(--serious);color:#141413} .crit .ic{background:var(--crit)} .unknown .ic{background:var(--unk)}
-/* actions */
 .actions{display:grid;gap:8px}
 .act{border:1px solid var(--ring);border-radius:10px;background:var(--card)}
 .act>summary{list-style:none;cursor:pointer;color:inherit;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:4px 12px;align-items:center;padding:10px 14px}
@@ -540,7 +487,6 @@ h3{font-size:15.5px;margin:22px 0 8px;font-weight:650}
 .act dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:6px 16px;margin:0;padding:4px 14px 14px 58px;font-size:14px}
 .act dt{color:var(--muted)} .act dd{margin:0;overflow-wrap:anywhere;min-width:0}
 .act ul{margin:0;padding-left:18px}
-/* tables */
 .tw{overflow-x:auto;margin:6px 0}
 table{border-collapse:collapse;width:100%;font-size:13.5px}
 caption{text-align:left;font-size:13px;color:var(--muted);padding:0 0 6px}
@@ -549,14 +495,12 @@ thead th{font-size:12.5px;color:var(--ink2);font-weight:600;white-space:nowrap}
 td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .name{overflow-wrap:anywhere;font-weight:400}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
-/* matrix */
 .matrix th.b{text-align:center;font-weight:500;font-size:12px;color:var(--muted)}
 .matrix td.c{text-align:center;font-weight:700;width:36px;padding:7px 2px}
 .matrix td.c.ok{color:var(--good)} .matrix td.c.crit{color:var(--crit)} .matrix td.c.na{color:var(--unk)}
 .matrix td.c.crit span[aria-hidden]{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:5px;background:var(--crit);color:#fff;font-size:11px}
 .matrix .life{white-space:nowrap;color:var(--ink2)}
 .matrix details{margin-top:4px;font-size:13px}
-/* heatmap */
 .heatwrap{padding:0 40px 4px 0}
 .heat{border-collapse:separate;border-spacing:3px;width:auto}
 .heat th,.heat td{border:0;padding:0}
@@ -584,7 +528,6 @@ font-size:12.5px;font-variant-numeric:tabular-nums;color:var(--hm-ink);backgroun
 .heatlegend i.hm0{display:inline-block;width:16px;height:16px;border-radius:4px;background:var(--hm-zero)}
 .heatlegend .ramp i{display:inline-block;width:140px;height:12px;border-radius:4px;background:var(--g)}
 @media (prefers-color-scheme:dark){.heat td.hm{background:var(--cd);color:var(--hm-ink);font-weight:400} .heat td.hm.id{color:#141413;font-weight:600} .heatlegend .ramp i{background:var(--gd)}}
-/* priority matrix */
 .quad{display:grid;grid-template-columns:max-content repeat(2,minmax(0,1fr));gap:8px;align-items:stretch}
 .quad .q{display:block;border:1px solid var(--ring);border-radius:12px;padding:14px 16px;background:var(--card);color:inherit;text-decoration:none}
 .quad a.q:hover{border-color:var(--s1)}
@@ -596,7 +539,6 @@ font-size:12.5px;font-variant-numeric:tabular-nums;color:var(--hm-ink);backgroun
 .quad .ax.y{writing-mode:vertical-rl;transform:rotate(180deg);text-align:center}
 .quad .ax.x{text-align:center}
 i.v1{background:var(--v1)} i.v2{background:var(--v2)} i.v3{background:var(--v3)} i.v4{background:var(--v4)}
-/* svg */
 svg{display:block;overflow:visible}
 .spark{width:168px;height:34px;flex:none}
 .spark .sl{fill:none;stroke:var(--axis);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
@@ -621,9 +563,23 @@ a{color:inherit;text-decoration:none}}
 .quad .ax.y{display:none} .quad>div:nth-last-child(3){display:none}}
 """
 
-# Styles for the chart helpers and blocks of report_ui that the redesigned
-# pages keep using (trend charts, distributions, KPI tiles, tables, filters).
 COMPAT_CSS = """
+.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--ink2);margin:2px 0 6px}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.grp-in{position:absolute;opacity:0;width:1px;height:1px;pointer-events:none}
+.by-team{display:none}
+#grp-team:checked~* .by-team,#grp-team:checked~.by-team{display:revert}
+#grp-team:checked~* .by-bu,#grp-team:checked~.by-bu{display:none}
+.grpsw{display:inline-flex;align-items:center;border:1px solid var(--ring);border-radius:8px;overflow:hidden;font-size:14px;margin-top:14px}
+.grpsw span{padding:5px 10px;color:var(--ink2)}
+.grpsw label{padding:5px 12px;cursor:pointer;border-left:1px solid var(--ring)}
+#grp-bu:checked~* label[for=grp-bu],#grp-team:checked~* label[for=grp-team]{background:var(--wash);color:var(--link);font-weight:600}
+#grp-bu:focus-visible~* label[for=grp-bu],#grp-team:focus-visible~* label[for=grp-team]{outline:2px solid var(--s1);outline-offset:-2px}
+.rulegrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:14px}
+.rules h3{margin:0 0 8px;display:flex;align-items:center;gap:8px}
+.rules dl{margin:0}
+.rules dt{font-weight:600;margin-top:10px}
+.rules dd{margin:2px 0 0;color:var(--ink2);font-size:14px;line-height:1.5}
 .nav{display:flex;flex-wrap:wrap;gap:4px 18px;margin:16px 0 0;font-size:14px}
 .nav a{text-decoration:none} .nav a:hover{text-decoration:underline}
 .kpis,.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:8px 0 16px}

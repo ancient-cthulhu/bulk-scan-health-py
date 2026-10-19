@@ -1,4 +1,4 @@
-"""Tenant analytics over bulk-run snapshots. Pure functions, no I/O."""
+"""Tenant analytics over bulk-run snapshots."""
 
 from __future__ import annotations
 
@@ -12,22 +12,22 @@ import scan_health as sh
 from . import app_report_analytics as ana
 
 TENANT_CONFIG: dict[str, Any] = {
-    # Same threshold as the bulk dashboard ("fresh" vs "stale").
     "stale_days": sh.DASHBOARD_CONFIG["scan_age"]["healthy_days"],
-    # Scan age buckets in days (upper bounds, inclusive); None is open-ended.
     "age_buckets": [(30, "0-30 days"), (60, "31-60 days"), (90, "61-90 days"),
                     (180, "91-180 days"), (365, "181-365 days"), (None, "Over 1 year")],
-    # Analysis time buckets in seconds (upper bounds, exclusive).
     "duration_buckets": [(600, "Under 10 min"), (1800, "10-30 min"), (3600, "30-60 min"),
                          (7200, "1-2 h"), (14400, "2-4 h"), (None, "Over 4 h")],
     "score_buckets": [(59, "0-59"), (79, "60-79"), (100, "80-100")],
+    "size_bands": [(50, "Under 50 MiB"), (200, "50-200 MiB"), (500, "200-500 MiB"), (None, "Over 500 MiB")],
+    # A profile is "slower than its own history" when its latest analysis time is at least this
+    # ratio and this many seconds above the median of its earlier distinct scans.
+    "perf_min_history": 2, "perf_history_max": 5, "perf_slower_ratio": 1.5, "perf_min_extra": 600,
     "top_movement": 25,
     "top_list": 20,
     "top_checks": 5,
     "check_app_list": 50,
     "check_severity_weight": {"HIGH": 3, "MEDIUM": 1, "LOW": 0},
-    # Tenant verdict thresholds. These are this tool's defaults, not Veracode
-    # guidance; change them here.
+    # This tool's defaults, not Veracode guidance.
     "verdict": {
         "poor_share_green": 10.0, "poor_share_yellow": 25.0,
         "vh_share_yellow": 5.0, "vh_share_orange": 15.0,
@@ -40,19 +40,20 @@ HEALTH_ORDER = ("Good", "Fair", "Poor", "Unknown")
 _HEALTH_RANK = {"Good": 0, "Fair": 1, "Poor": 2}
 _BAND_ORDER = [b[2] for b in sh.DASHBOARD_CONFIG["attention_bands"]]
 NO_BU = "No business unit"
+NO_TEAM = "No team"
 
 
 @dataclass
 class TenantVerdict:
     name: str
-    level: str          # GREEN | YELLOW | ORANGE | RED | GRAY
+    level: str
     label: str
     reason: str
 
 
 @dataclass
 class TenantReport:
-    """Everything the tenant renderers need. Plain data, JSON-serialisable."""
+    """Everything the tenant renderers need."""
     generated: str
     tenant_key: str
     region: str
@@ -69,14 +70,14 @@ class TenantReport:
     coverage: dict[str, Any]
     series: list[dict[str, Any]]
     movement: dict[str, Any] | None
-    baseline: str | None            # generated time of the snapshot compared against
-    apps: list[dict[str, Any]]      # current records, highest attention first
+    baseline: str | None
+    apps: list[dict[str, Any]]
     notes: list[dict[str, str]] = field(default_factory=list)
-    # Every failing check on every profile (the fix list). Details (what was
-    # found, the recommendation, platform links) come from the current run
-    # when available; snapshots alone give the check and its generic advice.
     fixes: list[dict[str, Any]] = field(default_factory=list)
-    links: dict[str, str] = field(default_factory=dict)     # app key -> Review Modules URL
+    teams: list[dict[str, Any]] = field(default_factory=list)
+    has_teams: bool = False
+    group_default: str = "bu"
+    links: dict[str, str] = field(default_factory=dict)
 
     def note(self, topic: str, message: str, level: str = "info") -> None:
         self.notes.append({"topic": topic, "message": message, "level": level})
@@ -84,10 +85,6 @@ class TenantReport:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-
-# ==========================================================================
-# Small helpers
-# ==========================================================================
 
 def _dt(s: Any) -> datetime | None:
     if not s:
@@ -122,6 +119,20 @@ def _bu(rec: dict[str, Any]) -> str:
     return str(rec.get("bu") or "") or NO_BU
 
 
+def _teams(rec: dict[str, Any]) -> list[str]:
+    return [str(t) for t in rec.get("teams") or [] if t] or [NO_TEAM]
+
+
+def group_keys(rec: dict[str, Any], dim: str) -> list[str]:
+    """The groups a profile belongs to: one business unit, or every team it is in."""
+    return [_bu(rec)] if dim == "bu" else _teams(rec)
+
+
+def has_teams(snap: dict[str, Any] | None) -> bool:
+    """Whether a snapshot recorded teams at all (snapshots before schema 1.2 did not)."""
+    return snap is not None and any("teams" in a for a in snap.get("apps") or [])
+
+
 def _display(rec: dict[str, Any]) -> str:
     name = str(rec.get("name") or "")
     return f"{name} [{rec['sandbox']}]" if rec.get("sandbox") else name
@@ -129,7 +140,7 @@ def _display(rec: dict[str, Any]) -> str:
 
 def _app_ref(rec: dict[str, Any], **extra: Any) -> dict[str, Any]:
     """Compact reference to one app for lists."""
-    out = {"key": rec.get("key"), "name": _display(rec), "bu": _bu(rec),
+    out = {"key": rec.get("key"), "name": _display(rec), "bu": _bu(rec), "teams": _teams(rec),
            "app_id": rec.get("app_id"), "health": rec.get("health") or "Unknown",
            "attention": rec.get("attention")}
     out.update(extra)
@@ -164,12 +175,8 @@ def _checks_affected(snap: dict[str, Any]) -> dict[int, int]:
     return out
 
 
-# ==========================================================================
-# Current run
-# ==========================================================================
-
 def kpis(snap: dict[str, Any]) -> dict[str, Any]:
-    """Headline numbers. Counts from TenantMetrics match the workbook."""
+    """Headline numbers."""
     m = snap.get("metrics") or {}
     apps = snap.get("apps") or []
     sev = [a for a in apps if a.get("sev_available")]
@@ -216,14 +223,19 @@ def distributions(snap: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def business_units(snap: dict[str, Any], prev: dict[str, Any] | None,
-                   cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    """Per-BU health mix, policy, open Very High/High and stale count, with the
-    change since the baseline snapshot. Worst Poor share first."""
+                   cfg: dict[str, Any], dim: str = "bu",
+                   series: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Per group (business unit, or team: a profile counts in each of its teams): health mix, policy,
+    open Very High/High and stale count, the change since the baseline, and Poor share per run."""
+    if dim == "team" and not has_teams(prev):
+        prev = None
+
     def per_bu(s: dict[str, Any]) -> dict[str, dict[str, Any]]:
         at = str(s.get("generated") or "")
         groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for a in s.get("apps") or []:
-            groups[_bu(a)].append(a)
+            for g in group_keys(a, dim):
+                groups[g].append(a)
         out = {}
         for bu, recs in groups.items():
             h = Counter(str(r.get("health") or "Unknown") for r in recs)
@@ -232,7 +244,7 @@ def business_units(snap: dict[str, Any], prev: dict[str, Any] | None,
             stale = sum(1 for r in recs
                         if (d := scan_age_days(r, at)) is not None and d > cfg["stale_days"])
             known = pl["GREEN"] + pl["YELLOW"] + pl["RED"]
-            out[bu] = {"bu": bu, "apps": len(recs),
+            out[bu] = {"bu": bu, "group": bu, "apps": len(recs),
                        **{k.lower(): h.get(k, 0) for k in HEALTH_ORDER},
                        "poor_share": _share(h.get("Poor", 0), len(recs)),
                        "policy_pass": pl["GREEN"], "policy_conditional": pl["YELLOW"],
@@ -254,14 +266,26 @@ def business_units(snap: dict[str, Any], prev: dict[str, Any] | None,
                               if p and r["open_vh"] is not None and p["open_vh"] is not None else None)
         r["new"] = prev is not None and p is None
         rows.append(r)
+    trend: dict[str, list[float | None]] = defaultdict(list)
+    for snp in series or []:
+        known = dim == "bu" or has_teams(snp)
+        cnt: dict[str, Counter[str]] = defaultdict(Counter)
+        for a in snp.get("apps") or []:
+            for g in group_keys(a, dim):
+                cnt[g][str(a.get("health") or "Unknown")] += 1
+        for r in rows:
+            c = cnt.get(r["group"])
+            trend[r["group"]].append(_share(c["Poor"], sum(c.values())) if known and c else None)
+    for r in rows:
+        r["poor_trend"] = trend.get(r["group"], [])
     rows.sort(key=lambda r: (-(r["poor_share"] or 0), -r["apps"], r["bu"].lower()))
     return rows
 
 
 def check_table(snap: dict[str, Any], prev: dict[str, Any] | None,
                 cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    """All 31 checks: apps affected, share, severity, change, top BUs and the
-    affected apps (highest attention first, capped)."""
+    """All 31 checks: apps affected, share, severity, change, top BUs and the affected apps (highest
+    attention first, capped)."""
     apps = snap.get("apps") or []
     total = len(apps)
     info = snap.get("checks") or {}
@@ -280,6 +304,7 @@ def check_table(snap: dict[str, Any], prev: dict[str, Any] | None,
         ci = info.get(str(num)) or {}
         owner, effort, category = ana._CHECK_META.get(num, ("AppSec", "M", "Results accuracy"))
         bus = Counter(_bu(r) for r in hit)
+        tms = Counter(t for r in hit for t in _teams(r))
         p = old.get(num) if prev is not None else None
         rows.append({
             "check": num, "label": label,
@@ -288,6 +313,7 @@ def check_table(snap: dict[str, Any], prev: dict[str, Any] | None,
             "apps": n, "share": _share(n, total),
             "previous": p, "delta": (n - p) if p is not None else None,
             "top_bus": [{"bu": b, "apps": k} for b, k in bus.most_common(3)],
+            "top_teams": [{"bu": b, "apps": k} for b, k in tms.most_common(3)],
             "owner": owner, "effort": effort, "impact": category,
             "recommendation": str(ci.get("rec") or ""),
             "affected": [_app_ref(r) for r in hit[:cfg["check_app_list"]]],
@@ -296,7 +322,64 @@ def check_table(snap: dict[str, Any], prev: dict[str, Any] | None,
     return rows
 
 
-def performance(snap: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+def _size(a: dict[str, Any]) -> float | None:
+    v = a.get("analysis_size_mib")
+    return float(v) if isinstance(v, (int, float)) and v > 0 else None
+
+
+def size_bands(apps: list[dict[str, Any]], cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Analysis time by analysis size, so profiles are compared with profiles of similar size."""
+    groups: dict[str, list[float]] = defaultdict(list)
+    for a in apps:
+        d = a.get("duration_seconds")
+        if not isinstance(d, int):
+            continue
+        sz = _size(a)
+        groups[_bucket(sz, cfg["size_bands"], False) if sz is not None else "Size unknown"].append(float(d))
+    out = []
+    for label in [b[1] for b in cfg["size_bands"]] + ["Size unknown"]:
+        v = sorted(groups.get(label, []))
+        if v or label != "Size unknown":
+            out.append({"band": label, "apps": len(v),
+                        "p50_seconds": round(ana.percentile(v, 50)) if v else None,
+                        "p90_seconds": round(ana.percentile(v, 90)) if v else None})
+    return out
+
+
+def vs_own_history(snap: dict[str, Any], history: list[dict[str, Any]],
+                   cfg: dict[str, Any]) -> dict[str, Any]:
+    """Each profile's latest analysis time against its own earlier scans (same profile, same
+    sandbox), never against other applications."""
+    prior: dict[str, dict[str, tuple[int, float | None]]] = defaultdict(dict)
+    for s in history:
+        for a in s.get("apps") or []:
+            k, b, d = a.get("key"), a.get("build_id"), a.get("duration_seconds")
+            if k and b and isinstance(d, int) and len(prior[k]) < cfg["perf_history_max"]:
+                prior[k].setdefault(str(b), (d, _size(a)))
+    slower, compared = [], 0
+    for a in snap.get("apps") or []:
+        d, b = a.get("duration_seconds"), str(a.get("build_id") or "")
+        if not isinstance(d, int) or not b:
+            continue
+        earlier = [v for bid, v in prior.get(str(a.get("key")), {}).items() if bid != b]
+        if len(earlier) < cfg["perf_min_history"]:
+            continue
+        compared += 1
+        base = ana.median([float(x[0]) for x in earlier])
+        sizes = [x[1] for x in earlier if x[1] is not None]
+        if base > 0 and d >= base * cfg["perf_slower_ratio"] and d - base >= cfg["perf_min_extra"]:
+            slower.append(_app_ref(a, duration_seconds=d, baseline_seconds=round(base),
+                                   ratio=round(d / base, 1), analysis_size_mib=_size(a),
+                                   baseline_size_mib=round(ana.median(sizes), 1) if sizes else None,
+                                   earlier_scans=len(earlier)))
+    slower.sort(key=lambda r: -r["ratio"])
+    return {"compared": compared, "slower": len(slower), "apps": slower[:cfg["top_list"]],
+            "min_history": cfg["perf_min_history"], "ratio": cfg["perf_slower_ratio"],
+            "min_extra_seconds": cfg["perf_min_extra"]}
+
+
+def performance(snap: dict[str, Any], cfg: dict[str, Any],
+                history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     apps = snap.get("apps") or []
     durs = [a for a in apps if isinstance(a.get("duration_seconds"), int)]
     secs = sorted(float(a["duration_seconds"]) for a in durs)
@@ -306,9 +389,9 @@ def performance(snap: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     n = cfg["top_list"]
     return {
         "measured": len(secs),
-        "p50_seconds": round(ana.percentile(secs, 50)) if secs else None,
-        "p90_seconds": round(ana.percentile(secs, 90)) if secs else None,
         "max_seconds": round(secs[-1]) if secs else None,
+        "by_size": size_bands(apps, cfg),
+        "vs_own": vs_own_history(snap, history or [], cfg),
         "histogram": [{"bucket": b[1], "apps": hist.get(b[1], 0)} for b in cfg["duration_buckets"]],
         "slowest": [_app_ref(a, duration_seconds=a["duration_seconds"],
                              analysis_size_mib=a.get("analysis_size_mib"), build_id=a.get("build_id"))
@@ -351,8 +434,7 @@ def coverage(snap: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
         return {"count": len(hit), "apps": [_app_ref(a, status=a.get("status")) for a in hit[:n]]}
 
     return {
-        # Same definition as the workbook's "never scanned" count, which also
-        # covers profiles whose retrieval failed (listed again under errors).
+        # Same definition as the workbook, which also counts failed retrievals.
         "never_scanned": lst(lambda a: not a.get("ever_scanned", bool(a.get("published")))),
         "errors": lst(lambda a: a.get("status") == "Error"),
         "severity_unavailable": lst(lambda a: a.get("published") and not a.get("sev_available")),
@@ -360,14 +442,8 @@ def coverage(snap: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# ==========================================================================
-# Trend and movement
-# ==========================================================================
-
 def series_point(snap: dict[str, Any]) -> dict[str, Any]:
     """One point of the tenant time series."""
-    apps = snap.get("apps") or []
-    secs = [float(a["duration_seconds"]) for a in apps if isinstance(a.get("duration_seconds"), int)]
     return {
         "generated": snap.get("generated"), "complete": bool(snap.get("complete")),
         "profiles": _metric(snap, "total_apps"),
@@ -376,7 +452,6 @@ def series_point(snap: dict[str, Any]) -> dict[str, Any]:
         "stale": _metric(snap, "stale"),
         "policy_pass_pct": _policy_pass_pct(snap),
         "open_vh": _metric(snap, "critical_flaws"), "open_h": _metric(snap, "high_flaws"),
-        "median_analysis_seconds": round(ana.median(secs)) if secs else None,
         "checks": {str(k): v for k, v in sorted(_checks_affected(snap).items())},
     }
 
@@ -406,8 +481,7 @@ def _degrade_reasons(old: dict[str, Any], new: dict[str, Any]) -> tuple[list[str
 
 
 def movement(cur: dict[str, Any], prev: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
-    """Per-app, per-check and per-BU change between the baseline snapshot and
-    this run. An app absent now is "no longer listed", never "fixed"."""
+    """Per-app, per-check and per-BU change between the baseline snapshot and this run."""
     n = cfg["top_movement"]
     old = {a["key"]: a for a in prev.get("apps") or [] if a.get("key")}
     new = {a["key"]: a for a in cur.get("apps") or [] if a.get("key")}
@@ -416,7 +490,6 @@ def movement(cur: dict[str, Any], prev: dict[str, Any], cfg: dict[str, Any]) -> 
         "degraded", "improved", "newly_stale", "newly_scanned", "new_apps", "no_longer_listed",
         "renamed")}
     rescanned = 0
-    # Every app's movement (not capped), for the application table.
     status: dict[str, dict[str, Any]] = {}
     for k, a in new.items():
         p = old.get(k)
@@ -480,10 +553,6 @@ def movement(cur: dict[str, Any], prev: dict[str, Any], cfg: dict[str, Any]) -> 
         out["kpi_deltas"]["policy_pass_pct"] = round(out["kpi_deltas"]["policy_pass_pct"], 1)
     return out
 
-
-# ==========================================================================
-# Verdicts and actions
-# ==========================================================================
 
 def verdicts(k: dict[str, Any], mv: dict[str, Any] | None, cfg: dict[str, Any]) -> list[TenantVerdict]:
     v = cfg["verdict"]
@@ -554,8 +623,8 @@ def _fmt_delta(v: Any) -> str:
 
 
 def issue_priority(check: int, share: float | None, cfg: dict[str, Any]) -> str:
-    """The app report's P1/P2/P3 rubric for the check, raised one level when
-    the check affects at least the "widespread" share of profiles."""
+    """The app report's P1/P2/P3 rubric for the check, raised one level when the check affects at least
+    the "widespread" share of profiles."""
     if check in ana._P1_ACCURACY:
         base = "P1"
     elif check in ana._P2_ACCURACY or check in ana._P2_PERF:
@@ -569,8 +638,7 @@ def issue_priority(check: int, share: float | None, cfg: dict[str, Any]) -> str:
 
 
 def actions(checks: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
-    """Organisational issues ranked by priority, then by profiles affected
-    weighted by severity."""
+    """Organisational issues ranked by priority, then by profiles affected weighted by severity."""
     w = cfg["check_severity_weight"]
     issues = []
     for c in checks:
@@ -581,7 +649,7 @@ def actions(checks: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]
                  f"; {c['delta']:+d} since the last run" if c["delta"] else "; unchanged since the last run")
         issues.append({
             **{k: c[k] for k in ("check", "label", "severity", "apps", "share", "delta", "owner",
-                                 "effort", "impact", "recommendation", "top_bus")},
+                                 "effort", "impact", "recommendation", "top_bus", "top_teams")},
             "priority": pr,
             "quick_win": c["effort"] == "S",
             "why": ana._WHY.get(c["impact"], "Affects scan quality."),
@@ -599,23 +667,20 @@ def actions(checks: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]
     }
 
 
-# ==========================================================================
-# Entry point
-# ==========================================================================
-
 def analyse(current: dict[str, Any], history: list[dict[str, Any]],
             history_notes: list[str] | None = None,
             cfg: dict[str, Any] | None = None,
             extras: dict[str, Any] | None = None) -> TenantReport:
-    """Build the TenantReport for `current` (this run's snapshot) and its
-    comparable earlier snapshots `history` (newest first)."""
+    """Build the TenantReport for `current` (this run's snapshot) and its comparable earlier snapshots
+    `history` (newest first)."""
     cfg = cfg or TENANT_CONFIG
     prev = next((s for s in history if s.get("complete")), None)
     apps = sorted(current.get("apps") or [],
                   key=lambda a: (-(a.get("attention") or -1), _display(a).lower()))
     k = kpis(current)
     checks = check_table(current, prev, cfg)
-    bus = business_units(current, prev, cfg)
+    snaps = [*reversed(history), current]
+    bus = business_units(current, prev, cfg, "bu", snaps)
     mv = movement(current, prev, cfg) if prev is not None else None
     series = [series_point(s) for s in reversed(history)] + [series_point(current)]
     rep = TenantReport(
@@ -625,9 +690,18 @@ def analyse(current: dict[str, Any], history: list[dict[str, Any]],
         scope=dict(current.get("scope") or {}), complete=bool(current.get("complete")),
         kpis=k, verdicts=verdicts(k, mv, cfg), actions=actions(checks, cfg),
         distributions=distributions(current, cfg), checks=checks, business_units=bus,
-        performance=performance(current, cfg), findings=findings(current, cfg),
+        performance=performance(current, cfg, history), findings=findings(current, cfg),
         coverage=coverage(current, cfg), series=series, movement=mv,
         baseline=str(prev.get("generated")) if prev is not None else None, apps=apps)
+    cur_apps = current.get("apps") or []
+    with_team = sum(1 for a in cur_apps if a.get("teams"))
+    rep.has_teams = with_team > 0
+    if rep.has_teams:
+        rep.teams = business_units(current, prev, cfg, "team", snaps)
+        rep.group_default = "team" if with_team > sum(1 for a in cur_apps if a.get("bu")) else "bu"
+        if prev is not None and not has_teams(prev):
+            rep.note("Teams", "The baseline run did not record teams, so per-team changes start "
+                     "from the next run.")
     ex = extras or {}
     rep.fixes = fix_list(current, prev, checks, ex.get("details"), cfg)
     rep.links = dict(ex.get("links") or {})
@@ -686,12 +760,7 @@ _PRI_RANK = {"P1": 0, "P2": 1, "P3": 2}
 def fix_list(current: dict[str, Any], prev: dict[str, Any] | None, checks: list[dict[str, Any]],
              details: dict[tuple[str, int], tuple[str, str, str]] | None = None,
              cfg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """One row per failing check per profile, highest priority first.
-
-    details maps (app key, check) to (severity, what was found,
-    recommendation) from the current run. Change is "New" when the check
-    was not failing on that profile in the baseline (or the profile is new),
-    "Recurring" when it was, and "" without a baseline."""
+    """One row per failing check per profile, highest priority first."""
     cfg = cfg or TENANT_CONFIG
     det = details or {}
     share = {c["check"]: c["share"] for c in checks}
@@ -710,6 +779,7 @@ def fix_list(current: dict[str, Any], prev: dict[str, Any] | None, checks: list[
             change = "" if base is None else ("Recurring" if c in base.get(key, set()) else "New")
             out.append({
                 "key": key, "app_id": a.get("app_id"), "name": _display(a), "bu": _bu(a),
+                "teams": list(a.get("teams") or []),
                 "attention": a.get("attention"), "check": c, "label": sh.CHECK_CATALOG[c][0],
                 "severity": (sev or "").upper() or sev_seen.get(c) or sh.CHECK_CATALOG[c][1].upper(),
                 "priority": issue_priority(c, share.get(c), cfg), "owner": owner, "effort": effort,
@@ -722,11 +792,10 @@ def fix_list(current: dict[str, Any], prev: dict[str, Any] | None, checks: list[
 
 
 def check_bu_matrix(apps: list[dict[str, Any]], top_bus: int = 8,
-                    top_checks: int = 12) -> dict[str, Any]:
-    """Share of each business unit's profiles failing each check, for the
-    most common failing checks and the largest business units (the rest
-    folded into "Other")."""
-    sizes = Counter(_bu(a) for a in apps)
+                    top_checks: int = 12, dim: str = "bu") -> dict[str, Any]:
+    """Share of each group's profiles failing each check, for the most common failing checks and the
+    largest groups (the rest folded into "Other"). With teams, a profile counts in each of its teams."""
+    sizes = Counter(g for a in apps for g in group_keys(a, dim))
     bus = [b for b, _ in sizes.most_common(top_bus)]
     other = len(sizes) > top_bus
     cols = bus + (["Other"] if other else [])
@@ -734,12 +803,15 @@ def check_bu_matrix(apps: list[dict[str, Any]], top_bus: int = 8,
     if other:
         totals["Other"] = sum(n for b, n in sizes.items() if b not in bus)
     hits: dict[int, Counter[str]] = defaultdict(Counter)
+    failing: Counter[int] = Counter()
     for a in apps:
-        col = _bu(a) if _bu(a) in totals else "Other"
-        for c in a.get("failed_checks") or []:
+        cols_a = {g if g in totals else "Other" for g in group_keys(a, dim)}
+        for c in set(a.get("failed_checks") or []):
             if isinstance(c, int):
-                hits[c][col] += 1
-    ranked = sorted(hits, key=lambda c: (-sum(hits[c].values()), c))[:top_checks]
+                failing[c] += 1
+                for col in cols_a:
+                    hits[c][col] += 1
+    ranked = sorted(hits, key=lambda c: (-failing[c], c))[:top_checks]
     rows = []
     for c in ranked:
         cells = []
@@ -747,5 +819,5 @@ def check_bu_matrix(apps: list[dict[str, Any]], top_bus: int = 8,
             n, t = hits[c][col], totals[col]
             cells.append((round(100.0 * n / t, 1) if t else None, n, t))
         rows.append({"check": c, "label": sh.CHECK_CATALOG.get(c, (str(c), ""))[0],
-                     "apps": sum(hits[c].values()), "cells": cells})
+                     "apps": failing[c], "cells": cells})
     return {"cols": cols, "totals": [totals[c] for c in cols], "rows": rows}

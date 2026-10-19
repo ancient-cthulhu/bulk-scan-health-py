@@ -1,4 +1,4 @@
-"""HTML renderer for the tenant report. One CSP-hashed script; all values escaped."""
+"""HTML renderer for the tenant report."""
 
 from __future__ import annotations
 
@@ -37,20 +37,14 @@ HEALTH_LEVEL = {"Good": "GREEN", "Fair": "YELLOW", "Poor": "RED"}
 SEV_LEVEL = {"HIGH": "ORANGE", "MEDIUM": "YELLOW", "LOW": "GRAY"}
 _HOST = {"commercial": "https://analysiscenter.veracode.com",
          "eu": "https://analysiscenter.veracode.eu"}
-# KPI tiles: (key, label, direction): +1 more is better, -1 more is worse, 0 neutral.
 _KPI_TILES = [("profiles", "Profiles", 0), ("good", "Good", 1), ("poor", "Poor", -1),
               ("stale", "Stale", -1), ("policy_pass_pct", "Policy pass %", 1),
               ("apps_with_open_vh", "Apps with open Very High", -1), ("open_vh", "Open Very High", -1),
               ("never_scanned", "Never scanned", -1), ("errors", "Errors", -1)]
 
 
-# ==========================================================================
-# Helpers
-# ==========================================================================
-
 def platform_base(region: str, tenant_key: str) -> str:
-    """Prefix of an application's platform link, or "" when unknown. The
-    HomeAppProfile:<account>:<app> form is the one the platform uses."""
+    """Prefix of an application's platform link, or "" when unknown."""
     host = _HOST.get(region)
     if not host or not tenant_key.isdigit():
         return ""
@@ -107,32 +101,43 @@ def _cmd(ref: dict[str, Any]) -> str:
             f'scan_health.py --app-id {aid}</span>')
 
 
+def _dual(bu_html: str, team_html: str, inline: bool = True) -> str:
+    """Both groupings; the Group by switch shows one (business unit unless Team is chosen)."""
+    t = "span" if inline else "div"
+    return f'<{t} class="by-bu">{bu_html}</{t}><{t} class="by-team">{team_html}</{t}>'
+
+
+def _group_cell(r: dict[str, Any]) -> str:
+    teams = r.get("teams") or [ta.NO_TEAM]
+    return _dual(e(r.get("bu")), e(", ".join(teams)))
+
+
+GROUP_HEAD = _dual("Business unit", "Team")
+
+
 def _ref_table(refs: list[dict[str, Any]], base: str, extra: list[tuple[str, Any]],
                more: int = 0) -> str:
     """Compact table of app references with extra columns (header, render)."""
     if not refs:
         return '<p class="na">None.</p>'
-    head = "<tr><th>Application</th><th>Business unit</th>" + "".join(
+    head = f"<tr><th>Application</th><th>{GROUP_HEAD}</th>" + "".join(
         f'<th{" class=n" if h.endswith(" ") else ""}>{e(h.strip())}</th>' for h, _ in extra) + "</tr>"
     body = "".join(
-        f"<tr><td class=name>{_app_cell(r, base)}</td><td class=name>{e(r.get('bu'))}</td>"
+        f"<tr><td class=name>{_app_cell(r, base)}</td><td class=name>{_group_cell(r)}</td>"
         + "".join(f'<td{" class=n" if h.endswith(" ") else ""}>{fn(r)}</td>' for h, fn in extra)
         + "</tr>" for r in refs)
     tail = f'<p class="small">and {more:,} more.</p>' if more > 0 else ""
     return f'<div class="tw"><table><thead>{head}</thead><tbody>{body}</tbody></table></div>{tail}'
 
 
-def _section(id_: str, title: str, lead: str, body: str, lens: str | None = None) -> str:
-    """One report section; lead is safe HTML."""
+def _section(id_: str, title: str, lead: str, body: str, lens: str | None = None,
+             title_html: str | None = None) -> str:
+    """One report section; lead (and title_html, when given) is safe HTML."""
     glyph = kit._GLYPH[lens] if lens else ""
     lp = f'<p class="lead">{lead}</p>' if lead else ""
-    return (f'<section class="part" id="{e(id_)}"><header><h2>{glyph}{e(title)}</h2></header>'
+    return (f'<section class="part" id="{e(id_)}"><header><h2>{glyph}{title_html or e(title)}</h2></header>'
             f'{lp}{body}</section>')
 
-
-# ==========================================================================
-# Sections
-# ==========================================================================
 
 def _changes(rep: ta.TenantReport, base: str) -> str:
     mv = rep.movement
@@ -220,9 +225,6 @@ def _trends(rep: ta.TenantReport) -> str:
                    lambda v: f"{v:,.0f}", HALF, unit="%"),
         line_chart(f"Stale profiles (scan over {ta.TENANT_CONFIG['stale_days']} days)", labels,
                    ser("stale"), tips, lambda v: f"{v:,.0f}", HALF),
-        line_chart("Median analysis time (minutes)", labels,
-                   [None if v is None else v / 60 for v in ser("median_analysis_seconds")], tips,
-                   lambda v: f"{v:,.0f}", HALF, unit=" min"),
         line_chart("Profiles in scope", labels, ser("profiles"), tips, lambda v: f"{v:,.0f}", HALF),
     ]
     movers = ""
@@ -252,6 +254,7 @@ def _checks(rep: ta.TenantReport, base: str) -> str:
                         for r in c["affected"])
         more = f'<li class="na">and {c["affected_more"]:,} more</li>' if c["affected_more"] else ""
         bus = ", ".join(f"{b['bu']} ({b['apps']})" for b in c["top_bus"])
+        tms = ", ".join(f"{b['bu']} ({b['apps']})" for b in c.get("top_teams") or [])
         rec = (f"<p>{rec_html(c['recommendation'])}</p>" if c["recommendation"] else "")
         share = 100.0 * (c["share"] or 0) / top_share
         rows.append(
@@ -261,10 +264,10 @@ def _checks(rep: ta.TenantReport, base: str) -> str:
             f"<td class=n>{kit.filter_link(fmt_num(c['apps']), 'fix', 'check=' + str(c['check']), 'Show in the fix list')}</td>"
             f'<td><span class="share"><span class="bar"><i style="width:{min(share, 100):.1f}%"></i></span>'
             f"{_pct(c['share'])}</span></td><td class=nw>{_delta(c['delta'], -1)}</td>"
-            f"<td class=name>{e(bus)}</td>"
+            f"<td class=name>{_dual(e(bus), e(tms))}</td>"
             f"<td class=nw><details><summary>{c['apps']:,} apps</summary>{rec}<ul>{names}{more}</ul></details></td></tr>")
     table = ('<div class="tw"><table><thead><tr><th class=n>#</th><th>Check</th><th>Severity</th>'
-             '<th class=n>Apps</th><th>Share</th><th>Change</th><th>Top business units</th>'
+             '<th class=n>Apps</th><th>Share</th><th>Change</th><th>{_dual("Top business units", "Top teams")}</th>'
              f'<th>Affected</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>')
     if not hit:
         table = '<p class="na">No health check fails on any profile.</p>'
@@ -354,12 +357,13 @@ _TABLE_SCRIPT = r"""(function () {
     a.rel = "noopener noreferrer";
     return a;
   }
+  function teamsOf(app) { return Array.isArray(app[AC.tm]) ? app[AC.tm] : []; }
+  function teamText(app) { var t = teamsOf(app); return t.length ? t.join(", ") : "No team"; }
   function command(r) {
     var id = r[AC.id];
     return (typeof id === "number" && id > 0) ? "scan_health.py --app-id " + id : "";
   }
 
-  // ------------------------------------------------------------ table engine
   function Table(o) {
     var t = { page: 0, size: 25, col: o.col, dir: o.dir, view: o.rows.slice() };
     var timer = null;
@@ -412,7 +416,6 @@ _TABLE_SCRIPT = r"""(function () {
     return t;
   }
 
-  // ------------------------------------------------------------ fix list
   var fixes = null, setApp = null;
   if (F && Array.isArray(F.rows) && $("fix")) {
     var FC = {};
@@ -423,19 +426,26 @@ _TABLE_SCRIPT = r"""(function () {
     FROWS.forEach(function (r, i) {
       r.__i = i;
       var app = APPS[r[FC.app]], ck = CK[r[FC.check]];
-      r.__q = [app[AC.name], app[AC.bu], app[AC.sbx], "#" + r[FC.check], ck[0], FOUND[r[FC.found]] || ""]
+      r.__q = [app[AC.name], app[AC.bu], app[AC.sbx], teamsOf(app).join(" "), "#" + r[FC.check], ck[0],
+               FOUND[r[FC.found]] || ""]
         .join("\u0001").toLowerCase();
     });
-    var fq = $("x-q"), fcheck = $("x-check"), fbu = $("x-bu"), fpri = $("x-pri"), fown = $("x-owner"),
+    var fq = $("x-q"), fcheck = $("x-check"), fbu = $("x-bu"), fpri = $("x-pri"), fown = $("x-team"),
         fsev = $("x-sev"), fchg = $("x-change"), fquick = $("x-quick"), fapp = $("x-app"), fappTxt = $("x-app-name");
     var counts = {};
     FROWS.forEach(function (r) { counts[r[FC.check]] = (counts[r[FC.check]] || 0) + 1; });
     options(fcheck, Object.keys(counts).map(Number).sort(function (a, b) { return counts[b] - counts[a]; })
       .map(function (c) { return [String(c), "#" + c + " " + CK[c][0] + " (" + num(counts[c]) + ")"]; }));
-    var bus = {}, owners = {};
-    FROWS.forEach(function (r) { bus[APPS[r[FC.app]][AC.bu]] = 1; owners[CK[r[FC.check]][1]] = 1; });
+    var bus = {}, teams = {}, noTeam = false;
+    FROWS.forEach(function (r) {
+      var app = APPS[r[FC.app]], t = teamsOf(app);
+      bus[app[AC.bu]] = 1;
+      if (!t.length) { noTeam = true; }
+      t.forEach(function (x) { teams[x] = 1; });
+    });
     options(fbu, Object.keys(bus).sort(function (a, b) { return a.localeCompare(b); }));
-    options(fown, Object.keys(owners).sort());
+    options(fown, Object.keys(teams).sort(function (a, b) { return a.localeCompare(b); }));
+    if (noTeam) { options(fown, [["__no_team__", "No team"]]); }
     var appIx = -1;
     setApp = function (v) {
       var i = parseInt(v, 10);
@@ -476,7 +486,8 @@ _TABLE_SCRIPT = r"""(function () {
         if (fcheck.value && String(r[FC.check]) !== fcheck.value) { return false; }
         if (fbu.value && app[AC.bu] !== fbu.value) { return false; }
         if (fpri.value && r[FC.pri] !== fpri.value) { return false; }
-        if (fown.value && ck[1] !== fown.value) { return false; }
+        if (fown.value === "__no_team__" && teamsOf(app).length) { return false; }
+        if (fown.value && fown.value !== "__no_team__" && teamsOf(app).indexOf(fown.value) < 0) { return false; }
         if (fsev.value && r[FC.sev] !== fsev.value) { return false; }
         if (fchg.value && (r[FC.chg] || "") !== fchg.value) { return false; }
         if (fquick.checked && ck[2] !== "S") { return false; }
@@ -499,8 +510,8 @@ _TABLE_SCRIPT = r"""(function () {
         var f = el("td", "found", found || "See the check details in the platform.");
         if (found) { f.title = found; }
         tr.appendChild(f);
-        var o = el("td", "nw");
-        o.appendChild(el("div", null, ck[1]));
+        var o = el("td", "name");
+        o.appendChild(el("div", teamsOf(app).length ? null : "na", teamText(app)));
         o.appendChild(el("div", "small", "Effort " + ck[2] + (ck[2] === "S" ? ", quick win" : "")));
         tr.appendChild(o);
         cell(tr, r[FC.chg] === "New" ? chip("YELLOW", "New") : (r[FC.chg] || ""), "small");
@@ -524,11 +535,12 @@ _TABLE_SCRIPT = r"""(function () {
         return '"' + s.replace(/"/g, '""') + '"';
       }
       var lines = [["Priority", "Application", "Business unit", "Sandbox", "Check", "Severity", "Found",
-                    "Owner", "Effort", "Change", "How to fix", "Platform link", "Deep dive"].map(safe).join(",")];
+                    "Team", "Effort", "Change", "How to fix", "Platform link", "Deep dive"].map(safe).join(",")];
       fixes.view.forEach(function (r) {
         var app = APPS[r[FC.app]], ck = CK[r[FC.check]];
         lines.push([r[FC.pri], app[AC.name], app[AC.bu], app[AC.sbx], "#" + r[FC.check] + " " + ck[0],
-                    r[FC.sev], FOUND[r[FC.found]] || "", ck[1], ck[2], r[FC.chg], RECS[r[FC.rec]] || "",
+                    r[FC.sev], FOUND[r[FC.found]] || "", teamsOf(app).join("; "), ck[2], r[FC.chg],
+                    RECS[r[FC.rec]] || "",
                     platformUrl(app), command(app)].map(safe).join(","));
       });
       var blob = new Blob(["\ufeff" + lines.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" });
@@ -541,20 +553,23 @@ _TABLE_SCRIPT = r"""(function () {
     });
   }
 
-  // ------------------------------------------------------------ applications
-  var aq = $("f-q"), abu = $("f-bu"), ah = $("f-health"), ap = $("f-policy"), ab = $("f-band"),
+  var aq = $("f-q"), abu = $("f-bu"), ateam = $("f-team"), ah = $("f-health"), ap = $("f-policy"), ab = $("f-band"),
       ac = $("f-change"), as = $("f-stale"), aquad = $("f-quad"), acov = $("f-cov");
   var seen = {};
   APPS.forEach(function (r) { seen[r[AC.bu]] = true; });
   options(abu, Object.keys(seen).sort(function (a, b) { return a.localeCompare(b); }));
+  var aseenT = {}, anoT = false;
+  APPS.forEach(function (r) { var t = teamsOf(r); if (!t.length) { anoT = true; } t.forEach(function (x) { aseenT[x] = 1; }); });
+  options(ateam, Object.keys(aseenT).sort(function (a, b) { return a.localeCompare(b); }));
+  if (anoT) { options(ateam, [["__no_team__", "No team"]]); }
   APPS.forEach(function (r) {
-    r.__q = [r[AC.name], r[AC.bu], r[AC.sbx], r[AC.top] || ""].join("\u0001").toLowerCase();
+    r.__q = [r[AC.name], r[AC.bu], r[AC.sbx], r[AC.top] || "", teamsOf(r).join(" ")].join("\u0001").toLowerCase();
   });
   var apps = Table({
     root: $("apps"), rows: APPS, body: $("apps-body"), info: $("apps-info"), prev: $("apps-prev"),
     next: $("apps-next"), sizeSel: $("apps-size"), q: aq, col: "att", dir: -1,
     asc: ["name", "bu", "pol", "top", "health", "cov", "quad"],
-    filters: [abu, ah, ap, ab, ac, as, aquad, acov],
+    filters: [abu, ateam, ah, ap, ab, ac, as, aquad, acov],
     val: function (r, col) {
       if (col === "health") { return RANK.health[r[AC.health]]; }
       if (col === "cov") { return RANK.cov[r[AC.cov]]; }
@@ -563,6 +578,8 @@ _TABLE_SCRIPT = r"""(function () {
     keep: function (r, q) {
       if (q && r.__q.indexOf(q) < 0) { return false; }
       if (abu.value && r[AC.bu] !== abu.value) { return false; }
+      if (ateam.value === "__no_team__" && teamsOf(r).length) { return false; }
+      if (ateam.value && ateam.value !== "__no_team__" && teamsOf(r).indexOf(ateam.value) < 0) { return false; }
       if (ah.value && r[AC.health] !== ah.value) { return false; }
       if (ap.value && r[AC.pl] !== ap.value) { return false; }
       if (ab.value && r[AC.band] !== ab.value) { return false; }
@@ -577,7 +594,10 @@ _TABLE_SCRIPT = r"""(function () {
       nameTd.appendChild(appLink(r));
       if (r[AC.sbx]) { nameTd.appendChild(el("div", "small", "Sandbox: " + r[AC.sbx])); }
       tr.appendChild(nameTd);
-      cell(tr, r[AC.bu], "name");
+      var g = el("td", "name");
+      g.appendChild(el("span", "by-bu", r[AC.bu]));
+      g.appendChild(el("span", "by-team", teamText(r)));
+      tr.appendChild(g);
       cell(tr, chip(HL[r[AC.health]] || "GRAY", r[AC.health]));
       var fx = el("td", "n");
       if (r[AC.fails] > 0 && fixes) {
@@ -608,7 +628,6 @@ _TABLE_SCRIPT = r"""(function () {
     }
   });
 
-  // ------------------------------------------------------------ routing
   function route(target, query) {
     var p = {};
     String(query || "").split("&").forEach(function (kv) {
@@ -619,7 +638,7 @@ _TABLE_SCRIPT = r"""(function () {
     });
     if (target === "fix" && fixes) {
       fq.value = "";
-      [[fcheck, "check"], [fbu, "bu"], [fpri, "pri"], [fown, "owner"], [fsev, "sev"], [fchg, "change"]]
+      [[fcheck, "check"], [fbu, "bu"], [fpri, "pri"], [fown, "team"], [fsev, "sev"], [fchg, "change"]]
         .forEach(function (x) { x[0].value = (p[x[1]] !== undefined && has(x[0], p[x[1]])) ? p[x[1]] : ""; });
       fquick.checked = p.quick === "1";
       setApp(p.app || "");
@@ -627,7 +646,7 @@ _TABLE_SCRIPT = r"""(function () {
       $("fix").scrollIntoView();
     } else if (target === "apps") {
       aq.value = "";
-      [[abu, "bu"], [ah, "health"], [ap, "policy"], [ab, "band"], [ac, "change"], [aquad, "quad"], [acov, "cov"]]
+      [[abu, "bu"], [ateam, "team"], [ah, "health"], [ap, "policy"], [ab, "band"], [ac, "change"], [aquad, "quad"], [acov, "cov"]]
         .forEach(function (x) { x[0].value = (p[x[1]] !== undefined && has(x[0], p[x[1]])) ? p[x[1]] : ""; });
       as.checked = p.stale === "1";
       apps.apply();
@@ -648,16 +667,16 @@ _TABLE_SCRIPT = r"""(function () {
 
 
 _APP_COLS = ["name", "bu", "sbx", "health", "att", "band", "lvl", "age", "vh", "h", "m", "l",
-             "pol", "pl", "top", "chg", "why", "id", "fails", "cov", "quad", "url"]
+             "pol", "pl", "top", "chg", "why", "id", "fails", "cov", "quad", "url", "tm"]
 _FIX_COLS = ["app", "check", "sev", "pri", "found", "rec", "chg"]
 _FRAG_RE = re.compile(r"^[A-Za-z]{1,40}:[0-9:]{1,80}$")
 FIX_STATIC_ROWS = 300
-FOUND_BUDGET = 2_500_000      # characters of finding text embedded in the page
+FOUND_BUDGET = 2_500_000
 
 
 def json_for_script(obj: Any) -> str:
-    """JSON that can sit inside a <script> block: no value can produce "</",
-    "<!--", an HTML entity or a JavaScript line terminator."""
+    """JSON that can sit inside a <script> block: no value can produce "</", "<!--", an HTML entity or
+    a JavaScript line terminator."""
     s = json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
     return s.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
@@ -682,9 +701,7 @@ def _coverage_label(a: dict[str, Any]) -> str:
 
 
 def _fragment(url: str) -> str:
-    """The part after '#' of a Veracode Platform link (the page and its ids),
-    or "" for anything else. The page host comes from the region, never from
-    data, so only the fragment is embedded."""
+    """The part after '#' of a Veracode Platform link (the page and its ids), or "" for anything else."""
     head, sep, frag = url.partition("#")
     if sep and head in {f"{h}/auth/index.jsp" for h in _HOST.values()} and _FRAG_RE.match(frag):
         return frag
@@ -712,6 +729,7 @@ def _app_rows(rep: ta.TenantReport) -> list[list[Any]]:
             a.get("app_id") if isinstance(a.get("app_id"), int) else None,
             len(a.get("failed_checks") or []), _coverage_label(a),
             str(a.get("quadrant") or ""), _fragment(rep.links.get(str(a.get("key") or ""), "")),
+            [str(t) for t in a.get("teams") or []],
         ])
     return out
 
@@ -737,8 +755,7 @@ def _fix_data(rep: ta.TenantReport, index: dict[str, int]) -> dict[str, Any]:
         rows.append([ai, f["check"], f["severity"], f["priority"], found_ix[fd], rec_ix[r], f["change"]])
     checks = {str(n): [lab, *ana._CHECK_META.get(n, ("AppSec", "M", "Results accuracy"))]
               for n, (lab, _) in sh.CHECK_CATALOG.items()}
-    # Keep the page usable on very large tenants: the embedded "what was
-    # found" text shares a fixed budget; the workbook keeps the full text.
+    # Shared budget keeps very large tenants usable; the workbook has the full text.
     total = sum(len(x) for x in found)
     if total > FOUND_BUDGET:
         cap = max(60, FOUND_BUDGET // max(len(found), 1))
@@ -755,19 +772,19 @@ def _pager(prefix: str) -> str:
 
 
 def _fix_section(rep: ta.TenantReport, base: str, app_index: dict[str, int]) -> tuple[str, str]:
-    """The fix list: every failing check on every profile, filterable, with
-    a CSV download of the filtered list. Returns (section, data block)."""
+    """The fix list: every failing check on every profile, filterable, with a CSV download of the
+    filtered list."""
     data = _fix_data(rep, app_index)
     n = len(data["rows"])
     tools = (
         '<div class="tools">'
-        '<label>Search<input id="x-q" type="search" placeholder="Application, check, file name" '
+        '<label>Search<input id="x-q" type="search" placeholder="Application, team, check, file name" '
         'autocomplete="off"></label>'
         '<label>Check<select id="x-check"><option value="">All checks</option></select></label>'
         '<label>Business unit<select id="x-bu"><option value="">All</option></select></label>'
         '<label>Priority<select id="x-pri"><option value="">All</option><option>P1</option>'
         '<option>P2</option><option>P3</option></select></label>'
-        '<label>Owner<select id="x-owner"><option value="">All</option></select></label>'
+        '<label>Team<select id="x-team"><option value="">All</option></select></label>'
         '<label>Severity<select id="x-sev"><option value="">All</option><option value="HIGH">High</option>'
         '<option value="MEDIUM">Medium</option></select></label>'
         '<label>Since last run<select id="x-change"><option value="">All</option><option>New</option>'
@@ -776,7 +793,7 @@ def _fix_section(rep: ta.TenantReport, base: str, app_index: dict[str, int]) -> 
         '</div><p class="appflt" id="x-app" hidden>Showing one profile: <b id="x-app-name"></b> '
         '<button type="button" class="linkbtn" id="x-app-clear">Show all profiles</button></p>')
     heads = [("pri", "Priority"), ("app", "Application"), ("check", "Check"), ("", "What was found"),
-             ("", "Owner"), ("", "Since last run"), ("", "Fix")]
+             ("", "Team"), ("", "Since last run"), ("", "Fix")]
     th = "".join(f'<th data-col="{k}"><button type="button">{lab}</button></th>' if k else f"<th>{lab}</th>"
                  for k, lab in heads)
     js = (f'<div class="js-only">{tools}<div class="tw"><table class="fix"><thead><tr>{th}</tr></thead>'
@@ -791,13 +808,13 @@ def _fix_section(rep: ta.TenantReport, base: str, app_index: dict[str, int]) -> 
             f'<td class="name">{_app_cell(ref, base)}<div class="small">{e(f["bu"])}</div></td>'
             f'<td class="name">#{e(f["check"])} {e(f["label"])}</td>'
             f'<td class="found">{e(f["found"] or "See the check details in the platform.")}</td>'
-            f'<td class="nw">{e(f["owner"])}</td><td>{e(f["change"])}</td>'
+            f'<td class="name">{e(", ".join(f.get("teams") or []) or "No team")}</td><td>{e(f["change"])}</td>'
             f'<td class="name">{rec_html(f["recommendation"]) if f["recommendation"] else ""}</td></tr>')
     shown = min(n, FIX_STATIC_ROWS)
     nojs = (f'<div class="no-js"><p class="small">Showing the {shown:,} highest-priority fixes of {n:,}. '
             'Open this file in a browser with JavaScript to filter and download the full list; the '
             'workbook has every issue.</p><div class="tw"><table class="fix"><thead><tr>'
-            '<th>Priority</th><th>Application</th><th>Check</th><th>What was found</th><th>Owner</th>'
+            '<th>Priority</th><th>Application</th><th>Check</th><th>What was found</th><th>Team</th>'
             f'<th>Since last run</th><th>Fix</th></tr></thead><tbody>{"".join(static_rows)}</tbody></table></div></div>')
     lead = (f"Every failing scan health check on every profile ({n:,}), highest priority first. "
             "Filter to what you own, open the profile in the Veracode Platform, and download the list "
@@ -829,7 +846,7 @@ def _apps(rep: ta.TenantReport, base: str) -> tuple[str, dict[str, int]]:
                 f"<td class=n>{fmt_num(r[c['vh']])}</td><td class=n>{fmt_num(r[c['h']])}</td>"
                 f"<td>{e(r[c['chg']])}</td></tr>")
 
-    heads = [("name", "Application", ""), ("bu", "Business unit", ""), ("health", "Scan health", ""),
+    heads = [("name", "Application", ""), ("bu", GROUP_HEAD, ""), ("health", "Scan health", ""),
              ("fails", "Failing checks", "n"), ("cov", "Coverage", ""), ("att", "Attention", ""),
              ("age", "Scan age", "n"), ("quad", "Priority box", ""), ("pol", "Policy", ""),
              ("vh", "Open VH", "n"), ("h", "Open H", "n"), ("chg", "Since last run", "")]
@@ -845,6 +862,7 @@ def _apps(rep: ta.TenantReport, base: str) -> tuple[str, dict[str, int]]:
         '<label>Search<input id="f-q" type="search" placeholder="Name, business unit, issue" '
         'autocomplete="off"></label>'
         '<label>Business unit<select id="f-bu"><option value="">All</option></select></label>'
+        '<label>Team<select id="f-team"><option value="">All</option></select></label>'
         '<label>Scan health<select id="f-health"><option value="">All</option><option>Good</option>'
         '<option>Fair</option><option>Poor</option><option>Unknown</option></select></label>'
         '<label>Coverage<select id="f-cov"><option value="">All</option><option>At risk</option>'
@@ -873,35 +891,159 @@ def _apps(rep: ta.TenantReport, base: str) -> tuple[str, dict[str, int]]:
     return section, index
 
 
-def _business_units(rep: ta.TenantReport) -> str:
-    bus = rep.business_units
+def _group_table(rep: ta.TenantReport, bus: list[dict[str, Any]], head: str, noun: str) -> str:
     cap = 150
+    labels = [short_date(p["generated"]) for p in rep.series]
     rows = "".join(
         f"<tr><td class=name>{e(b['bu'])}</td><td class=n>{fmt_num(b['apps'])}</td>"
         f"<td>{mix_bar([('hg', b['good'], 'Good'), ('hf', b['fair'], 'Fair'), ('hp', b['poor'], 'Poor'), ('hu', b['unknown'], 'Unknown')])}</td>"
         f"<td class=n>{_pct(b['poor_share'])}</td><td>{_delta(b['poor_share_delta'], -1, ' pp')}</td>"
         f"<td class=n>{_pct(b['policy_pass_pct'])}</td><td class=n>{fmt_num(b['open_vh'])}</td>"
-        f"<td>{_delta(b['open_vh_delta'], -1)}</td><td class=n>{fmt_num(b['stale'])}</td></tr>"
+        f"<td>{_delta(b['open_vh_delta'], -1)}</td><td class=n>{fmt_num(b['stale'])}</td>"
+        f"<td>{kit.sparkline(b.get('poor_trend') or [], labels, 'Poor share per run', lambda x: f'{x:,.0f}%', 110, 26) or '<span class=na>n/a</span>'}</td></tr>"
         for b in bus[:cap])
-    more = f'<p class="small">and {len(bus) - cap:,} more business units.</p>' if len(bus) > cap else ""
+    more = f'<p class="small">and {len(bus) - cap:,} more {noun}.</p>' if len(bus) > cap else ""
+    return (f'<div class="tw"><table><thead><tr><th>{head}</th><th class=n>Apps</th>'
+            '<th>Health mix</th><th class=n>Poor</th><th>Change</th><th class=n>Policy pass</th>'
+            '<th class=n>Open VH</th><th>Change</th><th class=n>Stale</th><th>Poor, per run</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table></div>{more}')
+
+
+def _business_units(rep: ta.TenantReport) -> str:
     legend = ('<div class="legend"><span><i class="sw hg"></i>Good</span><span><i class="sw hf"></i>'
               'Fair</span><span><i class="sw hp"></i>Poor</span><span><i class="sw hu"></i>Unknown</span></div>')
+    bu = _group_table(rep, rep.business_units, "Business unit", "business units")
+    if not rep.has_teams:
+        return _section("bus", "Business units", "Ordered by share of Poor profiles. Changes are "
+                        "against the last complete run.", legend + bu)
+    tm = _group_table(rep, rep.teams, "Team", "teams")
     return _section("bus", "Business units",
-                    "Ordered by share of Poor profiles. Changes are against the last complete run.",
-                    f'{legend}<div class="tw"><table><thead><tr><th>Business unit</th><th class=n>Apps</th>'
-                    '<th>Health mix</th><th class=n>Poor</th><th>Change</th><th class=n>Policy pass</th>'
-                    '<th class=n>Open VH</th><th>Change</th><th class=n>Stale</th></tr></thead>'
-                    f'<tbody>{rows}</tbody></table></div>{more}')
+                    _dual("Ordered by share of Poor profiles. Changes are against the last complete run.",
+                          "Ordered by share of Poor profiles. A profile in several teams counts in "
+                          "each. Changes are against the last complete run."),
+                    legend + _dual(bu, tm, inline=False),
+                    title_html=_dual("Business units", "Teams"))
+
+
+def _own_history(p: dict[str, Any], base: str) -> str:
+    v = p["vs_own"]
+    rule = (f"Latest scan at least {v['ratio']:g}x and {v['min_extra_seconds'] // 60} min slower than the "
+            f"median of the same profile's earlier scans (same sandbox), from previous runs. Needs "
+            f"{v['min_history']} earlier scans of that profile.")
+    if not v["compared"]:
+        return (f'<h3>Slower than their own history</h3><p class="small">{e(rule)} No profile has '
+                'enough earlier scans yet; this fills in as weekly runs accumulate.</p>')
+    if not v["slower"]:
+        return (f'<h3>Slower than their own history</h3><p class="small">{e(rule)} None of the '
+                f'{v["compared"]:,} profiles with enough history got slower.</p>')
+    tbl = _ref_table(v["apps"], base, [
+        ("Now ", lambda r: _dur(r.get("duration_seconds"))),
+        ("Usual ", lambda r: _dur(r.get("baseline_seconds"))),
+        ("Ratio ", lambda r: e(f"{r['ratio']:g}x")),
+        ("Size now ", lambda r: _mib(r.get("analysis_size_mib"))),
+        ("Size usual ", lambda r: _mib(r.get("baseline_size_mib")))])
+    return (f'<h3>Slower than their own history ({v["slower"]:,} of {v["compared"]:,})</h3>'
+            f'<p class="small">{e(rule)} A larger size now than usual usually explains it.</p>{tbl}')
+
+
+def _checks_list(nums: Any) -> str:
+    return ", ".join(f"#{n} {sh.CHECK_CATALOG[n][0]}" for n in sorted(nums) if n in sh.CHECK_CATALOG)
+
+
+def _r(term: str, rule: str) -> tuple[str, str]:
+    return term, rule
+
+
+def _rules(title: str, lens: str | None, items: list[tuple[str, str]]) -> str:
+    glyph = kit._GLYPH[lens] if lens else ""
+    dl = "".join(f"<dt>{e(t)}</dt><dd>{d}</dd>" for t, d in items)
+    return f'<div class="panel rules"><h3>{glyph}{e(title)}</h3><dl>{dl}</dl></div>'
+
+
+def _classification() -> str:
+    """How every label in the report is decided, one rule per label, from the live configuration."""
+    d = sh.DASHBOARD_CONFIG
+    f, a, v = d["flaws"], d["attention_score"], ta.TENANT_CONFIG["verdict"]
+    w = f["severity_weights"]
+    stale = ta.TENANT_CONFIG["stale_days"]
+    perf = ta.TENANT_CONFIG
+    bands = ", ".join(f"{lab} {lo}-{hi}" for lo, hi, lab, _ in d["attention_bands"])
+    wide = d["issue_prevalence"]["widespread_pct"]
+    scan = _rules("Scan health: can the results be trusted?", kit.LENS_SCAN, [
+        _r("Health (per profile)", "From the 31 scan health checks on the latest published scan. "
+         "<b>Poor</b>: at least one high-severity check fails. <b>Fair</b>: a medium-severity check "
+         "fails, none high. <b>Good</b>: nothing fails (or only low). <b>Unknown</b>: no published "
+         "static scan, or retrieval failed."),
+        _r("Stale", f"The latest published scan is older than {stale} days. With --include-sandboxes, "
+         "each sandbox is a row of its own and is judged on its own scans."),
+        _r("Never scanned / Errors", "No published static scan exists / the API calls for that profile "
+         "failed this run (rerun to retry). Neither is counted as Good."),
+        _r("Result coverage", "Findings only cover what was uploaded and selected. <b>At risk</b>: fails "
+         f"{e(_checks_list(kit._ACCURACY_MAJOR))}. <b>Partial</b>: fails one of the other "
+         f"{len(kit._ACCURACY - kit._ACCURACY_MAJOR)} accuracy checks. <b>Complete</b>: none fail."),
+        _r("Analysis time", "Never averaged across the tenant. Each profile is compared with its own "
+         f"earlier scans (slower = {perf['perf_slower_ratio']:g}x and {perf['perf_min_extra'] // 60} "
+         "min above its usual), and profiles are grouped by analysis size."),
+    ])
+    posture = _rules("Policy and findings: what did the scans find?", kit.LENS_POSTURE, [
+        _r("Policy", "Veracode's own policy evaluation of the latest policy scan: Pass, Conditional "
+         "Pass (inside a grace period) or Did Not Pass. Not evaluated is Unknown and left out of "
+         "the pass rate."),
+        _r("Open findings", "Not fixed and not covered by an <b>accepted</b> mitigation; proposed or "
+         "rejected mitigations stay open. Very High is severity 5, High is severity 4."),
+        _r("Findings risk (per profile)", f"<b>Red</b>: {f['very_high_red']}+ open Very High or "
+         f"{f['high_red']}+ open High, or a Veracode score under {f['score_yellow']}. <b>Orange</b>: "
+         "any open Very High or High; size never lowers this. <b>Yellow</b>: score "
+         f"{f['score_yellow']}-{f['score_green'] - 1}. <b>Green</b>: otherwise. Without a score, "
+         f"weighted open flaws per MiB analysed (Very High {w['very_high']:g}, High {w['high']:g}, "
+         f"Medium {w['medium']:g}, Low {w['low']:g}): yellow from {f['density_yellow']:g}, red from "
+         f"{f['density_red']:g}. <b>Gray</b>: severity not available."),
+    ])
+    groups = _rules("How profiles are grouped", None, [
+        _r("Priority box", "Puts the two sides together without merging them. Scan health is bad when "
+         "the profile is Poor; findings are bad when findings risk is Orange or Red. <b>Immediate</b>: "
+         "both. <b>Review</b>: findings only. <b>Attention</b>: scan health only. <b>Monitor</b>: "
+         "neither. <b>Insufficient data</b>: neither side known."),
+        _r("Attention score (0-100)", f"Scan health {a['scan_health_weight']}, scan age "
+         f"{a['scan_age_weight']}, findings {a['flaw_weight']}, high-severity checks "
+         f"{a['high_severity_issue_weight']}, trend {a['trend_weight']}, data quality "
+         f"{a['data_quality_weight']}. Missing inputs are left out, never counted as healthy. "
+         f"Never-scanned profiles are capped at {a['never_scanned_cap']}. Bands: {e(bands)}."),
+        _r("Fix list priority", f"<b>P1</b>: checks that can hide code from analysis "
+         f"({e(_checks_list(ana._P1_ACCURACY))}). <b>P2</b>: other accuracy and efficiency checks. "
+         f"<b>P3</b>: the rest. Raised one level when a check fails on {wide:g}% or more of profiles."),
+        _r("Business unit and team", "As set on the application profile in Veracode. Access teams named "
+         "Service Delivery - * are not shown."),
+        _r("Headline chips", f"Scan health: green up to {v['poor_share_green']:g}% Poor, yellow up to "
+         f"{v['poor_share_yellow']:g}%. Policy: green from {v['policy_pass_green']:g}% pass, yellow from "
+         f"{v['policy_pass_yellow']:g}%. Freshness: green up to {v['stale_share_green']:g}% stale, "
+         f"yellow up to {v['stale_share_yellow']:g}%, orange up to {v['stale_share_orange']:g}%. "
+         "These are this tool's defaults, not Veracode guidance."),
+    ])
+    return _section("how", "How results are classified",
+                    "Scan health and policy/findings are classified separately; only the priority box "
+                    "and attention score look at both.",
+                    f'<div class="rulegrid">{scan}{posture}{groups}</div>')
 
 
 def _performance(rep: ta.TenantReport, base: str) -> str:
     p = rep.performance
+    v = p["vs_own"]
     stats = [("Measured", fmt_num(p["measured"]), "profiles with an analysis time"),
-             ("Median (p50)", _dur(p["p50_seconds"]), ""), ("p90", _dur(p["p90_seconds"]), ""),
-             ("Slowest", _dur(p["max_seconds"]), ""),
+             ("Slower than own history", fmt_num(v["slower"]) if v["compared"] else "n/a",
+              f"of {v['compared']:,} with enough history" if v["compared"] else "needs earlier runs"),
+             ("Slowest", _dur(p["max_seconds"]), "single profile"),
              ("Over size threshold", fmt_num(p["over_size_threshold"]), "check #31")]
     tiles = "".join(f'<div class="stat"><div class="k">{e(k)}</div><div class="n">{v}</div>'
                     f'<div class="s">{e(s)}</div></div>' for k, v, s in stats)
+    bands = "".join(f'<tr><td>{e(b["band"])}</td><td class=n>{fmt_num(b["apps"])}</td>'
+                    f'<td class=n>{_dur(b["p50_seconds"])}</td><td class=n>{_dur(b["p90_seconds"])}</td></tr>'
+                    for b in p["by_size"])
+    by_size = ('<h3>Analysis time by size</h3><p class="small">Profiles are only compared with '
+               'profiles of similar analysis size; a tenant-wide average mixes very different '
+               'applications.</p><div class="tw"><table><thead><tr><th>Analysis size</th>'
+               '<th class=n>Profiles</th><th class=n>Typical (median)</th><th class=n>Slow end (p90)</th>'
+               f'</tr></thead><tbody>{bands}</tbody></table></div>')
     hist = hbars([(h["bucket"], h["apps"], "s1", "") for h in p["histogram"]])
     slow = _ref_table(p["slowest"], base, [("Analysis time ", lambda r: _dur(r.get("duration_seconds"))),
                                            ("Size ", lambda r: _mib(r.get("analysis_size_mib")))])
@@ -910,7 +1052,8 @@ def _performance(rep: ta.TenantReport, base: str) -> str:
     return _section("performance", "Scan performance",
                     "Analysis time of each profile's latest published scan (submit to publish; "
                     "excludes upload and prescan).",
-                    f'<div class="stats">{tiles}</div><h3>Analysis time distribution</h3>{hist}'
+                    f'<div class="stats">{tiles}</div>{_own_history(p, base)}{by_size}'
+                    f'<h3>Analysis time distribution</h3>{hist}'
                     f'<div class="cols2"><div><h3>Slowest scans</h3>{slow}</div>'
                     f'<div><h3>Largest analysis sizes</h3>{big}</div></div>')
 
@@ -986,10 +1129,6 @@ def _notes(rep: ta.TenantReport, collection: dict[str, Any] | None) -> str:
                     f"<details><summary>Snapshots used ({len(rep.series)})</summary><ul>{snaps}</ul></details>")
 
 
-# ==========================================================================
-# Page
-# ==========================================================================
-
 def _chg(v: float | int | None, direction: int, suffix: str = "") -> tuple[str, str]:
     """(flag text, level) for a change since the last run; ("", "") if none."""
     if not v:
@@ -997,6 +1136,20 @@ def _chg(v: float | int | None, direction: int, suffix: str = "") -> tuple[str, 
     worse = (v > 0) != (direction > 0)
     txt = (f"{v:+,g}{suffix}" if isinstance(v, float) else f"{v:+,}{suffix}")
     return txt, ("RED" if worse else "GREEN")
+
+
+def _group_inputs(rep: ta.TenantReport) -> str:
+    """Radio inputs for the Group by switch; they precede every section so plain CSS can switch views."""
+    team = rep.has_teams and rep.group_default == "team"
+    return (f'<input type="radio" name="grp" id="grp-bu" class="grp-in"{"" if team else " checked"}>'
+            f'<input type="radio" name="grp" id="grp-team" class="grp-in"{" checked" if team else ""}>')
+
+
+def _group_switch(rep: ta.TenantReport) -> str:
+    if not rep.has_teams:
+        return ""
+    return ('<div class="grpsw" role="group" aria-label="Group by"><span>Group by</span>'
+            '<label for="grp-bu">Business unit</label><label for="grp-team">Team</label></div>')
 
 
 def overview(rep: ta.TenantReport) -> str:
@@ -1029,9 +1182,10 @@ def overview(rep: ta.TenantReport) -> str:
         res("Never scanned", f"{k['never_scanned']:,}", "no published static scan", "never_scanned"),
         res("Errors", f"{k['errors']:,}", "retrieval failed this run; rerun to retry", "errors"),
     ]
-    if perf["p50_seconds"] is not None:
-        srows.append(kit.Result("Median analysis time", e(sh._hms(perf["p50_seconds"])),
-                                f"p90 {e(sh._hms(perf['p90_seconds']))}"))
+    if perf["vs_own"]["compared"]:
+        srows.append(kit.Result("Slower than own history",
+                                f'<a href="#performance">{perf["vs_own"]["slower"]:,}</a>',
+                                f"of {perf['vs_own']['compared']:,} profiles with enough history"))
     if common and common["apps"]:
         srows.append(kit.Result("Most common issue",
                                 kit.filter_link(f"{common['apps']:,} profiles", "fix", f"check={common['check']}"),
@@ -1068,7 +1222,7 @@ def overview(rep: ta.TenantReport) -> str:
                             lambda x: f"{x:,.0f}")
     worst = rep.findings["top_open_vh"][0] if rep.findings["top_open_vh"] else None
     first_p = (f'<a href="#findings">Open Very High flaws in {e(worst["name"])}</a> '
-               f'<span class="small">{fmt_num(worst["open_vh"])} open, {e(worst["bu"])}</span>'
+               f'<span class="small">{fmt_num(worst["open_vh"])} open, {_group_cell(worst)}</span>'
                if worst else '<span class="na">No open Very High flaws.</span>')
     vp = v.get("Policy compliance")
     posture_panel = kit.lens_panel(kit.LENS_POSTURE, vp.level if vp else "GRAY",
@@ -1086,11 +1240,13 @@ def overview(rep: ta.TenantReport) -> str:
     partial = ('<p class="small">This run did not finish: counts cover the profiles processed.</p>'
                if not rep.complete else "")
     nav = "".join(f'<a href="#{i}">{t}</a>' for i, t in (
-        ("fix", "Fix list"), ("org", "Fix once, repair many"), ("teams", "By team"),
+        ("fix", "Fix list"), ("org", "Fix once, repair many"), ("teams", "By group"),
         ("priority", "Priority by profile"), ("apps", "Applications"), ("changes", "What changed"), ("trends", "Trends"),
-        ("checks", "All checks"), ("findings", "Findings and policy"), ("notes", "Data notes")))
+        ("checks", "All checks"), ("findings", "Findings and policy"), ("how", "How it's classified"),
+        ("notes", "Data notes")))
     return (f'<header><h1>Scan health report</h1><p class="ctx">{ctx}</p>'
-            f'<p class="state">{e(state)}</p>{partial}<nav class="nav" aria-label="Sections">{nav}</nav></header>'
+            f'<p class="state">{e(state)}</p>{partial}<nav class="nav" aria-label="Sections">{nav}</nav>'
+            f'{_group_switch(rep)}</header>'
             f'<div class="lenses">{scan_panel}{posture_panel}</div>')
 
 
@@ -1105,11 +1261,13 @@ def org_actions(rep: ta.TenantReport) -> list[kit.ActionView]:
     out = []
     for i, it in enumerate(rep.actions["issues"]):
         bus = ", ".join(f"{b['bu']} ({b['apps']})" for b in it["top_bus"])
+        tms = ", ".join(f"{b['bu']} ({b['apps']})" for b in it.get("top_teams") or [])
         ex = ", ".join(r["name"] for r in it["examples"])
         out.append(kit.ActionView(
             priority=it["priority"], title=f"#{it['check']} {it['label']}", lens=kit.LENS_SCAN,
             owner=it["owner"], effort=f"{it['effort']} per profile", why=it["why"],
             evidence=[x for x in (it["evidence"], f"Most affected business units: {bus}" if bus else "",
+                                  f"Most affected teams: {tms}" if tms and rep.has_teams else "",
                                   f"For example: {ex}" if ex else "") if x],
             fix_html=kit.fix_html([it["recommendation"]]) if it["recommendation"] else [],
             verify=it["verify"], note=f"{it['apps']:,} profiles" + (", quick win" if it["quick_win"] else ""),
@@ -1119,18 +1277,25 @@ def org_actions(rep: ta.TenantReport) -> list[kit.ActionView]:
     return out
 
 
-def heat(rep: ta.TenantReport) -> str:
-    m = ta.check_bu_matrix(rep.apps)
+def _filter_value(dim: str, group: str) -> str:
+    """The filter value for a group: "No team" is a sentinel in the team selects."""
+    return "__no_team__" if dim == "team" and group == ta.NO_TEAM else group
+
+
+def heat(rep: ta.TenantReport, dim: str = "bu") -> str:
+    m = ta.check_bu_matrix(rep.apps, dim=dim)
     if not m["rows"]:
         return '<p class="empty">No check fails on any profile.</p>'
     rows = [(f"#{r['check']} {r['label']}", r["cells"]) for r in m["rows"]]
     cols = [f"{c} ({t:,})" for c, t in zip(m["cols"], m["totals"], strict=True)]
     filters: list[list[str | None]] = [
-        [f"check={r['check']}&bu={quote(c, safe='')}" if c != "Other" else f"check={r['check']}"
-         for c in m["cols"]] for r in m["rows"]]
+        [f"check={r['check']}&{dim}={quote(_filter_value(dim, c), safe='')}" if c != "Other"
+         else f"check={r['check']}" for c in m["cols"]] for r in m["rows"]]
     totals: list[tuple[int, str | None]] = [(int(r["apps"]), f"check={r['check']}") for r in m["rows"]]
-    return kit.heatmap("Share of each business unit's profiles failing the check: the most common "
-                       "failing checks, the largest business units, the rest folded into Other.",
+    what = ("business unit's profiles", "largest business units") if dim == "bu" else \
+        ("team's profiles (a profile counts in each of its teams)", "largest teams")
+    return kit.heatmap(f"Share of each {what[0]} failing the check: the most common failing checks, "
+                       f"the {what[1]}, the rest folded into Other.",
                        cols, rows, "Check", filters, totals=totals, total_head="Profiles failing")
 
 
@@ -1142,20 +1307,24 @@ def render_html(rep: ta.TenantReport, collection: dict[str, Any] | None = None) 
     org = kit.action_list(org_actions(rep), open_first=1)
     more = (f'<p class="small">{rep.actions["issues_more"]} more check(s) fail on at least one profile; '
             'see <a href="#checks">All checks</a>.</p>' if rep.actions["issues_more"] else "")
-    body = (overview(rep)
+    body = (_group_inputs(rep) + overview(rep)
             + fix_html
             + _section("org", "Fix once, repair many",
                        "Build and packaging patterns that fail across many profiles: fixing the pattern "
                        "once repairs every profile that shares it.", org + more, kit.LENS_SCAN)
-            + _section("teams", "Which team has which problem",
-                       "Send each business unit its own list.", heat(rep), kit.LENS_SCAN)
+            + _section("teams", "Which business unit has which problem",
+                       _dual("Send each business unit its own list.", "Send each team its own list."),
+                       _dual(heat(rep), heat(rep, "team"), inline=False) if rep.has_teams else heat(rep),
+                       kit.LENS_SCAN,
+                       title_html=_dual("Which business unit has which problem",
+                                        "Which team has which problem"))
             + _section("priority", "Priority by profile",
                        "Scan health risk against findings risk for every profile. Click a box to list "
                        "those profiles.", priority(rep))
             + apps_html
             + _changes(rep, base) + _trends(rep) + _checks(rep, base) + _business_units(rep)
             + _performance(rep, base) + _findings(rep, base) + _coverage(rep, base)
-            + _notes(rep, collection))
+            + _classification() + _notes(rep, collection))
     script = _TABLE_SCRIPT
     csp = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
            f"script-src '{script_hash(script)}'; base-uri 'none'; form-action 'none'")
