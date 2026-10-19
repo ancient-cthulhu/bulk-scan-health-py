@@ -931,7 +931,9 @@ class VeracodeClient:
                 apps.append({"app_id": a.get("guid",""), "legacy_id": a.get("id"),
                     "name": p.get("name",""),
                     "bu": (p.get("business_unit") or {}).get("name",""),
-                    "policy": pols[0].get("name","") if pols else ""})
+                    "policy": pols[0].get("name","") if pols else "",
+                    "teams": [str(t["team_name"]) for t in (p.get("teams") or [])
+                              if isinstance(t, dict) and t.get("team_name")]})
             page += 1
             total_pages = (d.get("page") or {}).get("total_pages")
             if total_pages is None:
@@ -3812,8 +3814,8 @@ def main() -> None:
                          "time; trend history lives in <out-dir>/history")
     sa.add_argument("--no-cache", action="store_true", help="Neither read nor write the cache")
     sa.add_argument("--hide-teams", default=None, metavar="PATTERNS",
-                    help="Comma-separated team name patterns not to show (* wildcard), added to "
-                         "the default 'Service Delivery - *'")
+                    help="Comma-separated team name patterns not to show in any report (* wildcard), "
+                         "added to the default 'Service Delivery - *'")
     sa.add_argument("--refresh-cache", action="store_true",
                     help="Ignore cached responses but write fresh ones")
     sa.add_argument("--fail-on", default=None, metavar="RULES",
@@ -3921,6 +3923,7 @@ def main() -> None:
     name_filter = re.compile(args.app_name_filter) if args.app_name_filter else None
     failures: list[str] = []
     guid_by_id: dict[str, str] = {}
+    teams_by_id: dict[str, list[str]] = {}
 
     def _finalize(client: "VeracodeClient | None", complete: bool = True) -> None:
         """Write the report from whatever is durable."""
@@ -3979,7 +3982,7 @@ def main() -> None:
                 from helpers import tenant_report
                 trep, sp = tenant_report.finish_run(
                     h_rows, bundle, guid_by_id, args, skip_checks,
-                    complete=complete, issue_records=agg_records)
+                    complete=complete, issue_records=agg_records, teams_by_id=teams_by_id)
                 if sp is not None:
                     log.info("[+] Snapshot: %s%s", sp, "" if complete else " (partial run)")
                 for line in tenant_analytics.summary_lines(trep):
@@ -4024,6 +4027,8 @@ def main() -> None:
         log.info("[*] Found %d apps", len(apps))
         guid_by_id.update({str(a.get("legacy_id")): str(a.get("app_id") or "")
                            for a in apps if a.get("legacy_id")})
+        teams_by_id.update({str(a.get("legacy_id")): list(a.get("teams") or [])
+                            for a in apps if a.get("legacy_id")})
 
         if name_filter:
             apps = [a for a in apps if name_filter.search(a["name"])]
