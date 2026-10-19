@@ -20,7 +20,7 @@ from . import app_report as ar
 
 log = logging.getLogger("scan_health.tenant_report")
 
-SNAPSHOT_SCHEMA = "1.1"      # 1.1 adds "checks"; readers accept any 1.x
+SNAPSHOT_SCHEMA = "1.2"      # 1.1 adds "checks", 1.2 per-app "teams"; readers accept any 1.x
 TOOL_VERSION = "4.1"
 UNKNOWN_TENANT = "account-unknown"
 _NAME_RE = re.compile(r"^\d{8}T\d{6}Z(-\d+)?\.json\.gz$")
@@ -31,13 +31,8 @@ class SnapshotError(Exception):
     """A snapshot file that cannot be used (unreadable, corrupt, newer schema)."""
 
 
-# ==========================================================================
-# Building a snapshot from a bulk run
-# ==========================================================================
-
 def run_scope(args: Any, skip_checks: set[int]) -> dict[str, Any]:
-    """What a run covered. Only runs with an identical scope are compared,
-    so a filtered or sandbox-inclusive run never distorts the tenant trend."""
+    """What a run covered."""
     return {
         "region": getattr(args, "region", "commercial"),
         "app_name_filter": getattr(args, "app_name_filter", None) or None,
@@ -57,8 +52,7 @@ def comparable(a: dict[str, Any], b: dict[str, Any]) -> bool:
 
 
 def tenant_key(rows: list[dict[str, Any]]) -> str:
-    """Account id read from the platform links in the rows (every Review
-    Modules link carries it). UNKNOWN_TENANT when no row has one."""
+    """Account id read from the platform links in the rows (every Review Modules link carries it)."""
     for r in rows:
         m = _ACCOUNT_RE.search(str(r.get("Review Modules URL") or ""))
         if m:
@@ -67,8 +61,7 @@ def tenant_key(rows: list[dict[str, Any]]) -> str:
 
 
 def _app_key(guid: str, app_id: str, name: str, sandbox: str) -> str:
-    """Stable identity across runs: GUID, then legacy id, then name. Renamed
-    profiles keep their history because the GUID does not change."""
+    """Stable identity across runs: GUID, then legacy id, then name."""
     if guid:
         return f"guid:{guid}|{sandbox}"
     if app_id and app_id != "0":
@@ -80,9 +73,9 @@ def _opt_int(v: Any) -> int | None:
     return sh._si_or_none(v)
 
 
-def app_record(row: dict[str, Any], ah: sh.ApplicationHealth | None, guid: str) -> dict[str, Any]:
-    """One compact record per profile (and sandbox) from the bulk row and its
-    dashboard scoring. Unavailable values are None, never 0."""
+def app_record(row: dict[str, Any], ah: sh.ApplicationHealth | None, guid: str,
+               teams: list[str] | None = None) -> dict[str, Any]:
+    """One compact record per profile (and sandbox) from the bulk row and its dashboard scoring."""
     app_id = str(row.get("App ID") or "")
     sandbox = str(row.get("Sandbox") or "")
     name = str(row.get("App Name") or "")
@@ -91,7 +84,8 @@ def app_record(row: dict[str, Any], ah: sh.ApplicationHealth | None, guid: str) 
     rec: dict[str, Any] = {
         "key": _app_key(guid, app_id, name, sandbox),
         "guid": guid or None, "app_id": _opt_int(app_id), "name": name,
-        "bu": str(row.get("Business Unit") or ""), "policy_name": str(row.get("Policy") or ""),
+        "bu": str(row.get("Business Unit") or ""), "teams": list(teams or []),
+        "policy_name": str(row.get("Policy") or ""),
         "sandbox": sandbox, "build_id": str(row.get("Build ID") or "") or None,
         "status": str(row.get("Scan Status") or ""),
         "published": pub.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if pub else None,
@@ -129,14 +123,16 @@ def app_record(row: dict[str, Any], ah: sh.ApplicationHealth | None, guid: str) 
 
 def build_snapshot(rows: list[dict[str, Any]], bundle: dict[str, Any],
                    guid_by_id: dict[str, str], scope: dict[str, Any], *,
-                   complete: bool, generated: str | None = None) -> dict[str, Any]:
+                   complete: bool, generated: str | None = None,
+                   teams_by_id: dict[str, list[str]] | None = None) -> dict[str, Any]:
     """The snapshot document for one bulk run."""
     by_key = {(a.app_id, a.sandbox): a for a in bundle["apps"]}
     apps = []
     for r in rows:
         aid = str(r.get("App ID") or "")
         sbx = str(r.get("Sandbox") or "")
-        apps.append(app_record(r, by_key.get((aid, sbx)), guid_by_id.get(aid, "")))
+        apps.append(app_record(r, by_key.get((aid, sbx)), guid_by_id.get(aid, ""),
+                               (teams_by_id or {}).get(aid)))
     m: sh.TenantMetrics = bundle["metrics"]
     metrics = asdict(m)
     metrics.update({"scan_compliance_pct": m.scan_compliance_pct,
@@ -144,8 +140,7 @@ def build_snapshot(rows: list[dict[str, Any]], bundle: dict[str, Any],
                     "errors": sum(1 for r in rows if r.get("Scan Status") == "Error")})
     issue_rows = bundle.get("issue_rows", [])
     issue_counts = {str(row["Check #"]): row["Apps Affected"] for row in issue_rows}
-    # Severity and the workbook's "Top Recommendation" per check, for the
-    # tenant action plan. Capped: the text can quote file names.
+    # Capped: the text can quote file names.
     checks = {str(row["Check #"]): {"severity": str(row.get("Severity") or ""),
                                     "rec": str(row.get("Top Recommendation") or "")[:600]}
               for row in issue_rows}
@@ -164,13 +159,8 @@ def build_snapshot(rows: list[dict[str, Any]], bundle: dict[str, Any],
     }
 
 
-# ==========================================================================
-# Snapshot I/O
-# ==========================================================================
-
 def snapshot_dir(root: Path, region: str, key: str) -> Path:
-    """<root>/<region>/<tenant-key>. Components are validated so nothing can
-    escape the snapshot root."""
+    """<root>/<region>/<tenant-key>."""
     if region not in sh.REGIONS:
         raise ValueError(f"bad region {region!r}")
     if key != UNKNOWN_TENANT and not key.isdigit():
@@ -184,12 +174,11 @@ def _stamp(generated: str) -> str:
 
 
 def write_snapshot(root: Path, snap: dict[str, Any]) -> Path:
-    """Atomic, private write. Returns the file written."""
+    """Atomic, private write."""
     d = snapshot_dir(root, snap["scope"]["region"], snap["tenant_key"])
     created = not root.exists()
     ar.ResponseCache._ensure_dir(d)
     if created:
-        # Keep snapshots out of version control if the tool runs inside a repo.
         with contextlib.suppress(OSError):
             (root / ".gitignore").write_text("# Created by scan_health.py\n*\n", encoding="utf-8")
     base = _stamp(snap["generated"])
@@ -199,7 +188,7 @@ def write_snapshot(root: Path, snap: dict[str, Any]) -> Path:
         path = d / f"{base}-{n}.json.gz"
         n += 1
     body = json.dumps(snap, separators=(",", ":"), sort_keys=True, default=str).encode("utf-8")
-    fd, tmp = tempfile.mkstemp(dir=str(d), prefix=".tmp_", suffix=".json.gz")   # 0600 on POSIX
+    fd, tmp = tempfile.mkstemp(dir=str(d), prefix=".tmp_", suffix=".json.gz")
     try:
         with os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
             gz.write(body)
@@ -223,7 +212,7 @@ def list_snapshots(root: Path, region: str, key: str) -> list[Path]:
 
 
 def load_snapshot(path: Path) -> dict[str, Any]:
-    """Read one snapshot. Raises SnapshotError for anything unusable."""
+    """Read one snapshot."""
     try:
         with gzip.open(path, "rb") as fh:
             doc = json.loads(fh.read().decode("utf-8"))
@@ -240,9 +229,7 @@ def load_snapshot(path: Path) -> dict[str, Any]:
 
 def select_series(root: Path, region: str, key: str, scope: dict[str, Any], window: int,
                   exclude: Path | None = None) -> tuple[list[dict[str, Any]], list[str]]:
-    """Up to `window` comparable snapshots, newest first, plus a note for each
-    one skipped and why. Reads newest first and stops once the window is full,
-    so a long history costs nothing extra."""
+    """Up to `window` comparable snapshots, newest first, plus a note for each one skipped and why."""
     series: list[dict[str, Any]] = []
     notes: list[str] = []
     for p in list_snapshots(root, region, key):
@@ -264,8 +251,7 @@ def select_series(root: Path, region: str, key: str, scope: dict[str, Any], wind
 
 
 def prune(root: Path, region: str, key: str, keep: int) -> list[Path]:
-    """Delete all but the newest `keep` snapshots for this tenant. keep <= 0
-    keeps everything. Only files named like snapshots are ever removed."""
+    """Delete all but the newest `keep` snapshots for this tenant."""
     if keep <= 0:
         return []
     removed = []
@@ -280,36 +266,54 @@ def prune(root: Path, region: str, key: str, keep: int) -> list[Path]:
 
 def finish_run(rows: list[dict[str, Any]], bundle: dict[str, Any] | None,
                guid_by_id: dict[str, str], args: Any, skip_checks: set[int], *,
-               complete: bool, issue_records: list[dict[str, Any]] | None = None
-               ) -> tuple[Any, Path | None]:
-    """End of a bulk run: save the snapshot (unless --no-snapshot), then read
-    the comparable earlier snapshots and build the TenantReport. A snapshot
-    write failure is logged and the analysis still runs. Returns
-    (TenantReport, snapshot path or None). No API calls."""
+               complete: bool, issue_records: list[dict[str, Any]] | None = None,
+               teams_by_id: dict[str, list[str]] | None = None) -> tuple[Any, Path | None]:
+    """End of a bulk run: save the snapshot (unless --no-snapshot), then read the comparable earlier
+    snapshots and build the TenantReport."""
     from . import tenant_analytics as ta
     if bundle is None:
         bundle = sh.generate_dashboard(health_rows=rows, issue_records=issue_records or [],
                                        check_categories=sh.CHECK_CATEGORIES)
     scope = run_scope(args, skip_checks)
-    snap = build_snapshot(rows, bundle, guid_by_id, scope, complete=complete)
+    hide = getattr(args, "hide_teams", None)
+    teams = {k: ar.visible_teams(v, hide) for k, v in (teams_by_id or {}).items()}
+    team_note = _team_note(teams_by_id or {}, teams)
+    snap = build_snapshot(rows, bundle, guid_by_id, scope, complete=complete, teams_by_id=teams)
     root = Path(args.snapshot_dir).expanduser()
     path: Path | None = None
     if not getattr(args, "no_snapshot", False):
         try:
             path = _write_and_prune(root, snap, args)
-        except Exception as e:      # never fatal: the reports are already written
+        except Exception as e:
             log.warning("Snapshot not written (reports are unaffected): %s", e)
     window = max(1, int(getattr(args, "trend_window", 12) or 12))
     series, notes = select_series(root, scope["region"], snap["tenant_key"], scope,
                                   window - 1, exclude=path)
-    return ta.analyse(snap, series, notes, extras=run_extras(rows, bundle, guid_by_id)), path
+    rep = ta.analyse(snap, series, notes, extras=run_extras(rows, bundle, guid_by_id))
+    log.info("[*] Teams: %s", team_note)
+    rep.note("Teams", team_note, "info" if rep.has_teams else "warning")
+    return rep, path
+
+
+def _team_note(raw: dict[str, list[str]], shown: dict[str, list[str]]) -> str:
+    """What the run found about teams, so an empty Team view is never a mystery."""
+    n = len(raw)
+    with_raw = sum(1 for v in raw.values() if v)
+    with_shown = sum(1 for v in shown.values() if v)
+    if not n:
+        return "No team data was collected for this run."
+    if not with_raw:
+        return f"None of the {n:,} profiles has a team assigned in Veracode."
+    if not with_shown:
+        return (f"{with_raw:,} of {n:,} profiles have teams, but all are hidden access teams "
+                "(Service Delivery - * or --hide-teams), so grouping is by business unit only.")
+    return f"{with_shown:,} of {n:,} profiles have a team."
 
 
 def run_extras(rows: list[dict[str, Any]], bundle: dict[str, Any],
                guid_by_id: dict[str, str]) -> dict[str, Any]:
-    """Per-profile detail that only the current run has (not stored in
-    snapshots): what each failing check found, its recommendation, and the
-    Review Modules link of the analysed build."""
+    """Per-profile detail that only the current run has (not stored in snapshots): what each failing
+    check found, its recommendation, and the Review Modules link of the analysed build."""
     def key(app_id: str, name: str, sandbox: str) -> str:
         return _app_key(guid_by_id.get(app_id, ""), app_id, name, sandbox)
 
@@ -329,7 +333,7 @@ def run_extras(rows: list[dict[str, Any]], bundle: dict[str, Any],
         found = str(getattr(i, "description", "") or "")[:200]
         sev = str(getattr(i, "severity", "") or "")
         old = details.get((k, c))
-        if old is not None:          # several issues for one check: keep the worst, join text
+        if old is not None:
             sev = old[0] if old[0] == "high" else sev
             sep = " " if old[1].endswith(".") else "; "
             found = (old[1] + sep + found)[:200] if found and found not in old[1] else old[1]
@@ -350,8 +354,8 @@ def _write_and_prune(root: Path, snap: dict[str, Any], args: Any) -> Path:
 
 
 def html_path(args: Any) -> Path:
-    """tenant_report.html in the run folder; with an explicit --output,
-    <output without extension>_tenant_report.html next to it."""
+    """tenant_report.html in the run folder; with an explicit --output, <output without
+    extension>_tenant_report.html next to it."""
     out = Path(str(getattr(args, "output", "") or "scan_health.xlsx")).expanduser()
     if getattr(args, "layout_run", False):
         return out.with_name("tenant_report.html")
@@ -359,7 +363,7 @@ def html_path(args: Any) -> Path:
 
 
 def write_html(rep: Any, args: Any, client: Any = None) -> Path:
-    """Render and atomically write the tenant HTML report. No API calls."""
+    """Render and atomically write the tenant HTML report."""
     from . import tenant_report_html
     collection: dict[str, Any] = {}
     if client is not None:

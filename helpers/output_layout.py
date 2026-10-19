@@ -18,8 +18,7 @@ DEFAULT_OUT_DIR = "scan_health_output"
 LEGACY_CACHE_DIR = "scan_health_cache"
 RUN_FILE = "run.json"
 STAMP = "%Y-%m-%d_%H%M%S"
-# An unfinished bulk run older than this is not resumed, so a weekly schedule
-# never folds last week's partial data into this week's report.
+# Older partial runs are not resumed, so last week's data never mixes into this week's.
 RESUME_MAX_AGE = timedelta(hours=72)
 _RUN_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}(-\d+)?$")
 _EXT = {"xlsx": "xlsx", "csv": "csv", "json": "json"}
@@ -30,8 +29,7 @@ def _now() -> datetime:
 
 
 def resolve(args: Any) -> None:
-    """Fill in the derived folders on the parsed arguments. Explicit values are
-    kept; anything left at None defaults under --out-dir."""
+    """Fill in the derived folders on the parsed arguments."""
     out = Path(getattr(args, "out_dir", None) or DEFAULT_OUT_DIR).expanduser()
     args.out_dir = str(out)
     args.cache_dir_explicit = getattr(args, "cache_dir", None) is not None
@@ -44,17 +42,12 @@ def resolve(args: Any) -> None:
         args.snapshot_dir = str(out / "history" / "tenant")
 
 
-# ==========================================================================
-# One-time move from the old ./scan_health_cache layout
-# ==========================================================================
-
 def migrate_legacy(args: Any, legacy: Path | None = None) -> list[str]:
-    """Move an old ./scan_health_cache (responses, <guid>/history.jsonl and
-    snapshots/) into the new layout, once. Only when the new defaults are in
-    use and the target does not exist yet; never fatal. Returns what moved."""
+    """Move an old ./scan_health_cache (responses, <guid>/history.jsonl and snapshots/) into the new
+    layout, once."""
     legacy = legacy or Path(LEGACY_CACHE_DIR)
     moved: list[str] = []
-    old_snaps = legacy.parent / "scan_health_snapshots"      # phase 1 default
+    old_snaps = legacy.parent / "scan_health_snapshots"
     if (not args.snapshot_dir_explicit and old_snaps.is_dir()
             and not Path(args.snapshot_dir).exists()):
         try:
@@ -104,10 +97,6 @@ def migrate_legacy(args: Any, legacy: Path | None = None) -> list[str]:
     return moved
 
 
-# ==========================================================================
-# Bulk run folders
-# ==========================================================================
-
 def _read_run(d: Path) -> dict[str, Any] | None:
     try:
         doc = json.loads((d / RUN_FILE).read_text(encoding="utf-8"))
@@ -124,8 +113,7 @@ def _write_run(d: Path, doc: dict[str, Any]) -> None:
 
 def find_resumable(base: Path, scope: dict[str, Any], output_format: str,
                    now: datetime | None = None) -> tuple[Path | None, str]:
-    """Newest unfinished run folder with the same scope and format, if recent
-    enough. Returns (folder or None, a note explaining a skipped old run)."""
+    """Newest unfinished run folder with the same scope and format, if recent enough."""
     now = now or _now()
     if not base.is_dir():
         return None, ""
@@ -158,9 +146,7 @@ def new_run_dir(base: Path, now: datetime | None = None) -> Path:
 
 
 def bulk_output(args: Any, scope: dict[str, Any], *, create: bool) -> tuple[Path, bool, str]:
-    """Run folder and main output file for a bulk run with the default layout.
-    Returns (output file, resumed?, note). Creates the folder and its run.json
-    only when create is True (never on a dry run)."""
+    """Run folder and main output file for a bulk run with the default layout."""
     fmt = str(getattr(args, "output_format", "xlsx"))
     base = Path(args.out_dir) / "tenant" / str(scope.get("region") or "commercial")
     d, note = (None, "") if getattr(args, "restart", False) else find_resumable(base, scope, fmt)
@@ -186,10 +172,6 @@ def mark_run(output: Path, status: str) -> None:
     with contextlib.suppress(OSError):
         _write_run(d, doc)
 
-
-# ==========================================================================
-# Application report folders
-# ==========================================================================
 
 def app_report_dir(out_dir: str | Path, slug: str, app_id: Any, build_id: str | None = None,
                    now: datetime | None = None) -> Path:
