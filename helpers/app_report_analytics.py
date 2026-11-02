@@ -208,6 +208,7 @@ class ActionItem:
     links: list[tuple[str, str]] = field(default_factory=list)
     check_num: int | None = None
     consecutive_failing: int = 0
+    priority_why: str = ""
 
 
 @dataclass
@@ -697,6 +698,34 @@ _WHY: dict[str, str] = {
     "Security exposure": "Sensitive material was uploaded to the scanning service.",
     "Process/cadence": "Stale results hide issues introduced since the last scan.",
 }
+# One priority rule for both reports: the check's severity (as Veracode's scan_health assigns it)
+# and what the problem affects.
+PRIORITY_MEANING = {
+    "P1": "Fix first: findings at risk or data exposed",
+    "P2": "Fix soon: partial or stale results",
+    "P3": "Later: scan time only",
+}
+EFFORT_MEANING = {"S": "Small (packaging)", "M": "Medium (build change)", "L": "Large (code or toolchain)"}
+EFFORT_NAME = {"S": "Small", "M": "Medium", "L": "Large"}
+
+
+def check_priority(check: int, severity: str) -> tuple[str, str]:
+    """(priority, reason) for one failing check, from its severity and what it affects."""
+    category = _CHECK_META.get(check, ("", "M", "Results accuracy"))[2]
+    high = str(severity).lower() == "high"
+    if category == "Security exposure":
+        return "P1", "Sensitive files uploaded."
+    if category == "Results accuracy" and high:
+        return "P1", "Code may be skipped; findings can be missing."
+    if category == "Results accuracy":
+        return "P2", "Partial or noisy results."
+    if category == "Process/cadence":
+        return "P2", "Results out of date."
+    if high:
+        return "P2", "Very large or slow scan."
+    return "P3", "Scan time only; results unaffected."
+
+
 _P1_ACCURACY = {4, 5, 8, 11, 14, 16, 19}
 _P2_ACCURACY = {2, 10, 12, 13, 24, 25, 26}
 _P2_PERF = {1, 6, 7, 18, 20, 21, 28, 31}
@@ -729,12 +758,7 @@ def action_plan(report: AppReport, dur: DurationStats, cad: CadenceStats,
         if c.status != "Fail":
             continue
         owner, effort, category = _CHECK_META.get(c.check_num, ("AppSec", "M", "Results accuracy"))
-        if (c.check_num in _P1_ACCURACY and c.severity == "high") or c.check_num == 30:
-            prio = "P1"
-        elif c.check_num in _P2_ACCURACY | _P2_PERF or c.severity == "high":
-            prio = "P2"
-        else:
-            prio = "P3"
+        prio, prio_why = check_priority(c.check_num, c.severity)
         h = by_num.get(c.check_num)
         verify = f"Check #{c.check_num} passes on the next scan."
         effect = "Not quantifiable from available data"
@@ -745,24 +769,24 @@ def action_plan(report: AppReport, dur: DurationStats, cad: CadenceStats,
             verify += f" Uploaded module size drops by up to {size / 1e6:.1f} MB."
         items.append(ActionItem(
             priority=prio, title=c.label, owner_role=owner, effort=effort, category=category,
-            why=_WHY[category], evidence=list(c.issues) + ([f"{c.evidence_total} item(s) matched"]
-                                                          if c.evidence_total else []),
+            why=_WHY[category], evidence=list(c.issues),
             evidence_total=c.evidence_total, how_to_fix=list(c.recommendations),
             verify=verify, expected_effect=effect, links=links, check_num=c.check_num,
-            consecutive_failing=h.consecutive_failing if h else 0))
+            consecutive_failing=h.consecutive_failing if h else 0, priority_why=prio_why))
     if b.open_by_severity and b.open_by_severity.get("very_high"):
         n = b.open_by_severity["very_high"]
         items.append(ActionItem(
             priority="P1", title=f"Remediate {n} open Very High flaw(s)", owner_role="Developer",
             effort="M", category="Security exposure",
-            why="Very High flaws are the most exploitable findings and usually block policy.",
+            priority_why="Most exploitable flaws; usually fail policy.",
+            why="",
             evidence=[f"{n} open Very High, {b.open_by_severity.get('high', 0)} open High"],
             how_to_fix=["Fix or, where justified, propose a mitigation for each Very High flaw.",
                         "Use Triage Flaws to filter by severity 5."],
             verify="Open Very High count is 0 on the next policy scan.", links=links))
     if dur.status == "Regression" and dur.has_size_or_module_driver:
         items.append(ActionItem(
-            priority="P1",
+            priority="P3", priority_why="Slower scans from a larger upload; results unaffected.",
             title="Investigate the scan duration regression", owner_role="Build/Release Engineer",
             effort="M", category="Scan performance", why=dur.reason,
             evidence=dur.drivers or ["No size, LOC or module driver identified"],
@@ -772,7 +796,8 @@ def action_plan(report: AppReport, dur: DurationStats, cad: CadenceStats,
                    f"({sh._fmt_seconds(int(dur.threshold or 0))}).", links=links))
     if cad.failure_rate is not None and cad.failure_rate > cfg["failure_rate_p1"]:
         items.append(ActionItem(
-            priority="P1", title="Reduce failed scan attempts", owner_role="Build/Release Engineer",
+            priority="P2", priority_why="Failed scans leave no fresh results.",
+            title="Reduce failed scan attempts", owner_role="Build/Release Engineer",
             effort="M", category="Process/cadence", why=cad.failure_rate_note,
             evidence=[f"Failure rate {cad.failure_rate:.0%}"],
             how_to_fix=["Review the prescan errors of the failed builds.",
@@ -780,7 +805,8 @@ def action_plan(report: AppReport, dur: DurationStats, cad: CadenceStats,
             verify="The next attempts publish results."))
     if sh._policy_level(b.policy_compliance_status or "") == "RED":
         items.append(ActionItem(
-            priority="P2", title="Bring the application back into policy compliance",
+            priority="P2", priority_why="Policy is not met.",
+            title="Bring the application back into policy compliance",
             owner_role="App Owner", effort="M", category="Security exposure",
             why=f"Policy {b.policy_name or ''} status is {b.policy_compliance_status}.",
             evidence=[f"Rules status: {b.policy_rules_status or 'Unknown'}"],

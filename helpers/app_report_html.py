@@ -85,20 +85,20 @@ def _verdicts(an: Analysis) -> str:
 
 
 def _action_card(a: Any) -> str:
-    ev = "".join(f"<li>{e(x)}</li>" for x in a.evidence[:8])
+    found = ([] if not a.why or a.why in ana._WHY.values() else [a.why]) + list(a.evidence)
+    ev = "".join(f"<li>{e(x)}</li>" for x in found[:5])
     fix = "".join(f"<li>{rec_html(x)}</li>" for x in a.how_to_fix) or "<li>See the check documentation.</li>"
     lk = " &middot; ".join(link(u, lbl) for lbl, u in a.links)
-    rec = (f'<span class="tag">failing {a.consecutive_failing} consecutive scans</span>'
+    rec = (f'<span class="tag">failing {a.consecutive_failing} scans in a row</span>'
            if a.consecutive_failing > 1 else "")
     return (f'<article class="act"><header><span class="pill {e(a.priority)}">{e(a.priority)}</span>'
-            f'<h3>{e(a.title)}</h3><span class="tag">{e(a.owner_role)} &middot; effort {e(a.effort)} '
-            f'&middot; {e(a.category)}</span>{rec}</header>'
-            f'<dl><dt>Why</dt><dd>{e(a.why)}</dd>'
-            f'<dt>Evidence</dt><dd><ul>{ev}</ul></dd>'
-            f'<dt>How to fix</dt><dd><ul>{fix}</ul></dd>'
-            f'<dt>Verify</dt><dd>{e(a.verify)}</dd>'
-            f'<dt>Expected effect</dt><dd>{e(a.expected_effect)}</dd>'
-            + (f"<dt>Links</dt><dd>{lk}</dd>" if lk else "") + "</dl></article>")
+            f'<h3>{e(a.title)}</h3><span class="tag">{e(a.owner_role)} &middot; '
+            f'{e(ana.EFFORT_NAME.get(a.effort, a.effort))} effort</span>{rec}</header><dl>'
+            + (f"<dt>Why</dt><dd>{e(a.priority_why)}</dd>" if a.priority_why else "")
+            + (f"<dt>Found</dt><dd><ul>{ev}</ul></dd>" if ev else "")
+            + f"<dt>Fix</dt><dd><ul>{fix}</ul></dd>"
+            + (f"<dt>Done when</dt><dd>{e(a.verify)}</dd>" if a.verify else "")
+            + (f"<dt>Open</dt><dd>{lk}</dd>" if lk else "") + "</dl></article>")
 
 
 def _actions(an: Analysis) -> str:
@@ -110,9 +110,15 @@ def _actions(an: Analysis) -> str:
     if len(an.actions) > 5:
         rest = (f"<details><summary>{len(an.actions) - 5} more action(s)</summary>"
                 f'<div class="actions">{"".join(_action_card(a) for a in an.actions[5:])}</div></details>')
-    return (f'<section id="actions"><h2>Top actions</h2><p class="lead">Ranked by impact on results '
-            f'accuracy, exposure and scan time. Effort is an estimate.</p>'
+    return (f'<section id="actions"><h2>Top actions</h2>{_priority_key()}'
             f'<div class="actions">{top}</div>{rest}</section>')
+
+
+def _priority_key() -> str:
+    """Priorities and effort in one short legend (same rule as the tenant report)."""
+    p = "".join(f'<span><span class="pill {k}">{k}</span> {e(v)}</span>' for k, v in ana.PRIORITY_MEANING.items())
+    ef = " &middot; ".join(e(v) for v in ana.EFFORT_MEANING.values())
+    return f'<p class="pkey">{p}<span class="na">Effort: {ef}</span></p>'
 
 
 def _list_or_none(items: list[str], limit: int = 25) -> str:
@@ -529,7 +535,7 @@ def action_views(r: AppReport, an: Analysis) -> list[kit.ActionView]:
             lens=kit.action_lens(a.check_num, a.category), owner=a.owner_role, effort=a.effort,
             why=a.why, evidence=list(a.evidence), fix_html=kit.fix_html(a.how_to_fix),
             verify=a.verify, effect=("" if a.expected_effect.startswith("Not quantifiable")
-                                     else a.expected_effect),
+                                     else a.expected_effect), priority_why=a.priority_why,
             links=list(a.links), note=note, anchor=f"action-{i + 1}"))
     return out
 

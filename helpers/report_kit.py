@@ -182,6 +182,15 @@ class ActionView:
     note: str = ""
     anchor: str = ""
     more_html: str = ""
+    priority_why: str = ""
+
+
+def priority_key() -> str:
+    """One-line legend for priorities and effort, used above every action list."""
+    p = "".join(f'<span><span class="pri {k}">{k}</span> {e(v)}</span>'
+                for k, v in ana.PRIORITY_MEANING.items())
+    ef = " &middot; ".join(e(v) for v in ana.EFFORT_MEANING.values())
+    return f'<div class="pkey">{p}<span class="small">Effort: {ef}</span></div>'
 
 
 def action_list(items: list[ActionView], open_first: int = 3) -> str:
@@ -190,7 +199,7 @@ def action_list(items: list[ActionView], open_first: int = 3) -> str:
         return '<p class="empty">Nothing to do: every measured dimension is in range.</p>'
     rows = []
     for i, a in enumerate(items):
-        ev = "".join(f"<li>{e(x)}</li>" for x in a.evidence[:8])
+        ev = "".join(f"<li>{e(x)}</li>" for x in a.evidence[:5])
         fx = "".join(f"<li>{x}</li>" for x in a.fix_html) or "<li>See the check documentation.</li>"
         lk = ", ".join(link(u, lbl) for lbl, u in a.links)
         aid = f' id="{e(a.anchor)}"' if a.anchor else ""
@@ -199,13 +208,14 @@ def action_list(items: list[ActionView], open_first: int = 3) -> str:
             f'<span class="pri {e(a.priority)}">{e(a.priority)}</span>'
             f'<span class="t">{e(a.title)}</span>'
             f'<span class="m">{lens_label(a.lens)}<span>{e(a.owner)}</span>'
-            f'<span>Effort {e(a.effort)}</span>{"<span>" + e(a.note) + "</span>" if a.note else ""}</span>'
-            f'</summary><dl><dt>Why</dt><dd>{e(a.why)}</dd>'
-            + (f"<dt>Evidence</dt><dd><ul>{ev}</ul></dd>" if ev else "")
-            + f"<dt>How to fix</dt><dd><ul>{fx}</ul></dd>"
+            f'<span>{e(ana.EFFORT_NAME.get(a.effort, a.effort))} effort</span>'
+            f'{"<span>" + e(a.note) + "</span>" if a.note else ""}</span>'
+            f'</summary><dl>'
+            + (f"<dt>Why</dt><dd>{e(a.priority_why or a.why)}</dd>" if (a.priority_why or a.why) else "")
+            + (f"<dt>Found</dt><dd><ul>{ev}</ul></dd>" if ev else "")
+            + f"<dt>Fix</dt><dd><ul>{fx}</ul></dd>"
             + (f"<dt>Done when</dt><dd>{e(a.verify)}</dd>" if a.verify else "")
-            + (f"<dt>Expected effect</dt><dd>{e(a.effect)}</dd>" if a.effect else "")
-            + (f"<dt>Links</dt><dd>{lk}</dd>" if lk else "")
+            + (f"<dt>Open</dt><dd>{lk}</dd>" if lk else "")
             + (f"<dt>Find them</dt><dd>{a.more_html}</dd>" if a.more_html else "")
             + "</dl></details>")
     return f'<div class="actions">{"".join(rows)}</div>'
@@ -564,6 +574,9 @@ a{color:inherit;text-decoration:none}}
 """
 
 COMPAT_CSS = """
+.pkey{display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center;font-size:13.5px;color:var(--ink2);margin:4px 0 12px}
+.pkey>span{display:inline-flex;gap:6px;align-items:center}
+.pkey .small{display:block}
 .legend{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--ink2);margin:2px 0 6px}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 .grp-in{position:absolute;opacity:0;width:1px;height:1px;pointer-events:none}

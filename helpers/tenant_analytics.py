@@ -622,19 +622,9 @@ def _fmt_delta(v: Any) -> str:
     return f"+{v}" if v > 0 else str(v)
 
 
-def issue_priority(check: int, share: float | None, cfg: dict[str, Any]) -> str:
-    """The app report's P1/P2/P3 rubric for the check, raised one level when the check affects at least
-    the "widespread" share of profiles."""
-    if check in ana._P1_ACCURACY:
-        base = "P1"
-    elif check in ana._P2_ACCURACY or check in ana._P2_PERF:
-        base = "P2"
-    else:
-        base = "P3"
-    wide = sh.DASHBOARD_CONFIG["issue_prevalence"]["widespread_pct"]
-    if share is not None and share >= wide and base != "P1":
-        base = "P1" if base == "P2" else "P2"
-    return base
+def issue_priority(check: int, severity: str) -> str:
+    """The shared P1/P2/P3 rule (app_report_analytics.check_priority)."""
+    return ana.check_priority(check, severity)[0]
 
 
 def actions(checks: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
@@ -644,18 +634,18 @@ def actions(checks: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]
     for c in checks:
         if not c["apps"]:
             continue
-        pr = issue_priority(c["check"], c["share"], cfg)
+        pr, pr_why = ana.check_priority(c["check"], c["severity"])
         trend = ("" if c["delta"] is None else
                  f"; {c['delta']:+d} since the last run" if c["delta"] else "; unchanged since the last run")
         issues.append({
             **{k: c[k] for k in ("check", "label", "severity", "apps", "share", "delta", "owner",
                                  "effort", "impact", "recommendation", "top_bus", "top_teams")},
-            "priority": pr,
+            "priority": pr, "priority_why": pr_why,
             "quick_win": c["effort"] == "S",
             "why": ana._WHY.get(c["impact"], "Affects scan quality."),
             "evidence": f"{c['apps']} profiles ({c['share']}% of the tenant){trend}",
             "examples": c["affected"][:5],
-            "verify": f"Apps affected by check #{c['check']} falls on the next bulk run.",
+            "verify": f"Fewer profiles fail check #{c['check']} on the next bulk run.",
             "_weight": c["apps"] * w.get(c["severity"], 1),
         })
     issues.sort(key=lambda i: (i["priority"], -i["_weight"], i["check"]))
@@ -725,9 +715,8 @@ def analyse(current: dict[str, Any], history: list[dict[str, Any]],
         rep.note("Movement", f"{mv['counts']['no_longer_listed']} profile(s) from the baseline "
                  "are no longer listed (deleted, renamed out of the name filter, or access "
                  "removed). They are not counted as fixed.")
-    rep.note("Priorities", "Organisational issue priority uses the app report's P1/P2/P3 rubric "
-             "for the check, raised one level when it affects at least "
-             f"{sh.DASHBOARD_CONFIG['issue_prevalence']['widespread_pct']:g}% of profiles.")
+    rep.note("Priorities", "P1/P2/P3 follow one rule in the app and tenant reports; see How "
+             "results are classified.")
     rep.note("Thresholds", "Tenant verdict thresholds are this tool's defaults (TENANT_CONFIG), "
              "not Veracode guidance.")
     rep.note("Units", "Analysis Size is in MiB (2^20 bytes), as in the bulk workbook.")
@@ -763,7 +752,6 @@ def fix_list(current: dict[str, Any], prev: dict[str, Any] | None, checks: list[
     """One row per failing check per profile, highest priority first."""
     cfg = cfg or TENANT_CONFIG
     det = details or {}
-    share = {c["check"]: c["share"] for c in checks}
     rec = {c["check"]: c.get("recommendation") or "" for c in checks}
     sev_seen = {c["check"]: c["severity"] for c in checks}
     base = ({a["key"]: set(a.get("failed_checks") or []) for a in prev.get("apps") or [] if a.get("key")}
@@ -782,7 +770,9 @@ def fix_list(current: dict[str, Any], prev: dict[str, Any] | None, checks: list[
                 "teams": list(a.get("teams") or []),
                 "attention": a.get("attention"), "check": c, "label": sh.CHECK_CATALOG[c][0],
                 "severity": (sev or "").upper() or sev_seen.get(c) or sh.CHECK_CATALOG[c][1].upper(),
-                "priority": issue_priority(c, share.get(c), cfg), "owner": owner, "effort": effort,
+                "priority": issue_priority(c, (sev or "").upper() or sev_seen.get(c)
+                                           or sh.CHECK_CATALOG[c][1].upper()),
+                "owner": owner, "effort": effort,
                 "impact": impact, "found": found, "recommendation": advice or rec.get(c, ""),
                 "change": change, "quick_win": effort == "S",
             })
