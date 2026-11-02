@@ -973,9 +973,15 @@ class VeracodeClient:
 
     # strict=True raises on retrieval failure so it is never read as empty; "No report available."
     # stays None.
-    def get_detailed_report(self, bid: str, strict: bool = False) -> dict | None:
+    def get_detailed_report(self, bid: str, strict: bool = False,
+                            published: bool = False) -> dict | None:
         try: root = self._xml("detailedreport.do", {"build_id": bid})
         except XMLAPIError as e:
+            # For a build known to be published, "No report available." means Veracode could not
+            # generate the report (seen after about 5 minutes on very large applications).
+            if strict and published and str(e) == NO_REPORT_AVAILABLE:
+                raise XMLAPIError("No report available. The build is published, so Veracode could "
+                                  "not generate the detailed report (very large application?)") from e
             if strict and str(e) != NO_REPORT_AVAILABLE: raise
             log.debug("detailedreport.do failed for %s: %s", bid, e); return None
         except (requests.HTTPError, ET.ParseError) as e:
@@ -1481,7 +1487,7 @@ def _find_latest_published_build(client: VeracodeClient, aid: int,
     """Locate the newest build with published results."""
     latest = client.get_build_info(aid, sbx=sbx)
     if latest and latest.get("published") and latest.get("build_id"):
-        return {"id": latest["build_id"], "ver": latest.get("version", "")}
+        return {"id": latest["build_id"], "ver": latest.get("version", ""), "published": True}
 
     builds = client.get_builds(aid, sbx)
     if not builds:
@@ -1503,7 +1509,7 @@ def _find_latest_published_build(client: VeracodeClient, aid: int,
             break
         bi = client.get_build_info(aid, b["id"], sbx)
         if bi and bi.get("published"):
-            return b
+            return {**b, "published": True}
     # Nothing published: newest build, so prescan diagnostics still run.
     return builds[-1]
 
@@ -1545,7 +1551,7 @@ def _process_build(client: VeracodeClient, app: dict, build: dict,
     bid = build["id"]
     # A published build always has files and prescan results: a failure here is Error, not a clean
     # scan.
-    dr = client.get_detailed_report(bid, strict=True)
+    dr = client.get_detailed_report(bid, strict=True, published=bool(build.get("published")))
     files = client.get_files(legacy_id, bid, strict=dr is not None)
     prescan = client.get_prescan(legacy_id, bid, strict=dr is not None)
 
