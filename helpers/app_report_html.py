@@ -239,26 +239,42 @@ def _performance(an: Analysis) -> str:
                      lambda v: f"{v:,.0f}", size=HALF, unit="K")
     skpl = line_chart("Seconds per thousand lines", labels, [p.sec_per_kloc for p in d.points], tips,
                       lambda v: f"{v:,.0f}", size=HALF, unit=" s")
-    stats = [("Latest", sh._fmt_seconds(d.latest) if d.latest is not None else "n/a", ""),
-             ("Median (p50)", sh._fmt_seconds(int(d.p50)) if d.p50 is not None else "n/a", ""),
+    usual = d.baseline_median
+    change = (f"{(d.latest - usual) / usual:+.0%}" if d.latest is not None and usual else "n/a")
+    top = [("Latest", sh._fmt_seconds(d.latest) if d.latest is not None else "n/a", ""),
+           ("Usual", sh._fmt_seconds(int(usual)) if usual is not None else "n/a", "median of earlier scans"),
+           ("Change", change, "latest vs usual")]
+    stats = [("Median (p50)", sh._fmt_seconds(int(d.p50)) if d.p50 is not None else "n/a", ""),
              ("p90", sh._fmt_seconds(int(d.p90)) if d.p90 is not None else "n/a", ""),
              ("Fastest", sh._fmt_seconds(d.min or 0), f"build {d.fastest_build}"),
              ("Slowest", sh._fmt_seconds(d.max or 0), f"build {d.slowest_build}"),
              ("Trend (Theil-Sen)", f"{d.slope_min_per_scan:+.1f} min" if d.slope_min_per_scan
               is not None else "n/a", "per scan")]
-    st = "".join(f'<div class="stat"><div class="k">{e(k)}</div><div class="n">{e(v)}</div>'
-                 f'<div class="s">{e(sub)}</div></div>' for k, v, sub in stats)
-    drivers = ("<h3>Probable drivers</h3><p class=na>Correlated changes in the latest build, largest "
-               "first. Correlation, not proven cause.</p><ul>"
-               + "".join(f"<li>{e(x)}</li>" for x in d.drivers) + "</ul>") if d.drivers else ""
+    def tiles(rows: list[tuple[str, str, str]]) -> str:
+        return "".join(f'<div class="stat"><div class="k">{e(k)}</div><div class="n">{e(v)}</div>'
+                       f'<div class="s">{e(sub)}</div></div>' for k, v, sub in rows)
+    yours = [x for x in d.drivers if not x.startswith("Engine")]
+    veracode = [x for x in d.drivers if x.startswith("Engine")]
+    causes = ""
+    if d.status == "Regression":
+        causes = ("<h3>What changed</h3><ul>"
+                  + "".join(f"<li>In your upload: {e(x)}</li>" for x in yours)
+                  + "".join(f"<li>Veracode side: {e(x)}</li>" for x in veracode)
+                  + ("" if yours else "<li>Nothing in the upload grew. Analysis time also depends on "
+                     "Veracode's engine and platform load, which you cannot change; no action needed "
+                     "unless it persists.</li>") + "</ul>")
+    level = ("YELLOW" if d.status == "Regression" and not d.has_size_or_module_driver
+             else {"Regression": "RED", "Normal": "GREEN"}.get(d.status, "GRAY"))
+    label = "Slower" if level == "YELLOW" else d.status
     return (f'<section id="performance"><h2>Scan performance</h2><p class="lead">Analysis time is '
-            f'submit to publish and excludes upload and prescan. Status: {chip({"Regression": "RED", "Normal": "GREEN"}.get(d.status, "GRAY"), d.status)} '
-            f'{e(d.reason)}</p><div class="stats">{st}</div>{dur}'
-            f'<p class="na">Shaded band: baseline median plus or minus 3 scaled MAD over the previous '
-            f'{d.baseline_n} build(s). Line: regression threshold.</p>{drivers}'
-            f'<h3>Normalised throughput and size</h3>'
+            f'submit to publish (upload and prescan excluded). {chip(level, label)} {e(d.reason)}</p>'
+            f'<div class="stats">{tiles(top)}</div>'
+            + (f'{dur}<p class="na">Shaded band: the usual range. Line: the slow threshold.</p>'
+               if len(d.points) > 1 else "")
+            + f'{causes}'
+            f'<details><summary>More timing detail</summary><div class="stats">{tiles(stats)}</div>'
             f'<div class="grid2"><div>{spm}</div><div>{skpl}</div></div>'
-            f'<div class="grid2"><div>{size}</div><div>{loc}</div></div></section>')
+            f'<div class="grid2"><div>{size}</div><div>{loc}</div></div></details></section>')
 
 
 def _cadence(an: Analysis, r: AppReport) -> str:
@@ -296,11 +312,8 @@ def _findings(an: Analysis) -> str:
                       [("New", "s2", [x.new for x in rows]), ("Fixed", "s3", [x.fixed for x in rows])], tips)
     legend_nf = ('<div class="legend"><span><i class="sw s2"></i>New</span>'
                  '<span><i class="sw s3"></i>Fixed (flaw-status)</span></div>')
-    score = line_chart("Veracode score", labels, [float(x.score) if x.score is not None else None for x in rows],
-                       [f"build {x.build_id}, score {x.score}, rating {x.rating}" for x in rows],
-                       lambda v: f"{v:,.0f}", size=HALF)
-    ev = "".join(f"<li>Build {e(x['build_id'])}: {e(x['event'])}</li>" for x in an.findings.events)
     eng = f'<p class="disclaimer">{e(an.findings.engine_effect)}</p>' if an.findings.engine_effect else ""
+    other = _other_changes(an, {x.build_id: short_date(x.published) for x in rows})
     head = ("<tr><th>Build</th><th>Published</th><th class=n>Very High</th><th class=n>High</th>"
             "<th class=n>Medium</th><th class=n>Low</th><th class=n>Open policy</th><th class=n>Mitigated</th>"
             "<th class=n>Total</th><th class=n>New</th><th class=n>Reopened</th><th class=n>Fixed</th>"
@@ -315,11 +328,24 @@ def _findings(an: Analysis) -> str:
     return (f'<section id="findings"><h2>Findings</h2><p class="lead">Open means neither fixed nor '
             f'covered by an accepted mitigation. Fixed counts come from the flaw-status element.</p>'
             f'<div class="grid2"><div>{legend_sev}{sev}</div><div>{legend_nf}{nf}</div></div>'
-            f'<div class="grid2"><div>{score}</div><div><h3>Timeline events</h3>'
-            f'<ul>{ev or "<li class=na>None</li>"}</ul></div></div>{eng}'
+            f'{eng}{other}'
             f'<details><summary>Findings table</summary><div class="tw"><table><thead>{head}</thead>'
-            f'<tbody>{body}</tbody></table></div></details>'
-            f'<p class="na">Flaw aging (Findings API) is not included in this version.</p></section>')
+            f'<tbody>{body}</tbody></table></div></details></section>')
+
+
+def _other_changes(an: Analysis, dates: dict[str, str]) -> str:
+    """Besides code, what moved results in this window: engine updates, policy changes, deadlines."""
+    groups: dict[str, list[str]] = {}
+    for x in an.findings.events:
+        ev, when = x["event"], dates.get(x["build_id"], "") or f"build {x['build_id']}"
+        kind = ("Veracode engine updated" if ev.startswith("Engine") else
+                "Policy changed" if ev.startswith("Policy") else ev)
+        groups.setdefault(kind, []).append(when)
+    if not groups:
+        return ""
+    parts = "; ".join(f"{e(k)}: {e(', '.join(v))}" for k, v in groups.items())
+    return (f'<p class="na"><b>Besides code changes:</b> {parts}. An engine or policy update can '
+            "change findings or policy status without any code change.</p>")
 
 
 def _composition(an: Analysis, r: AppReport) -> str:
@@ -347,14 +373,43 @@ def _composition(an: Analysis, r: AppReport) -> str:
         elif not b.sca_enabled:
             sca = "SCA is not enabled for this scan."
         else:
-            comps = ", ".join(f"<code>{e(c)}</code>" for c in (b.sca_components or [])[:30])
-            sca = f"{b.sca_vulnerable_components or 0} vulnerable component(s)" + (f": {comps}" if comps else ".")
+            sca = _sca_table(b)
     return (f'<section id="composition"><h2>Composition</h2><p class="lead">Modules in the latest build, '
             f'selected first. Flaw counts are the platform\'s per-module figures (Very High / High / '
             f'Medium / Low).</p><div class="tw"><table><thead><tr><th>Module</th><th>Role</th>'
             f'<th class=n>LOC</th><th class=n>Flaws VH/H/M/L</th><th>Size</th><th>Compiler / platform</th>'
             f'<th>Prescan</th></tr></thead><tbody>{"".join(body)}</tbody></table></div>{more}'
-            f'<h3>Software composition analysis</h3><p>{sca}</p></section>')
+            f'<h3>Software composition analysis</h3>{sca}</section>')
+
+
+_SCA_COLS = [("file_name", "Component file", ""), ("library", "Library", ""), ("version", "Version", ""),
+             ("vendor", "Vendor", ""), ("max_cvss_score", "Max CVSS", "n"),
+             ("vulnerabilities", "Vulnerabilities", "n"),
+             ("component_affects_policy_compliance", "Affects policy", ""), ("new", "New", "")]
+
+
+def _sca_table(b: Any) -> str:
+    """Vulnerable components, collapsed; columns appear only when the report supplies them."""
+    rows = b.sca_details or [{"file_name": c} for c in b.sca_components or []]
+    n = b.sca_vulnerable_components if b.sca_vulnerable_components is not None else len(rows)
+    if not rows:
+        return f"<p>{n or 0} vulnerable component(s).</p>"
+    cols = [c for c in _SCA_COLS if any(r.get(c[0]) not in (None, "") for r in rows)]
+    def cell(k: str, v: Any) -> str:
+        if v in (None, ""):
+            return '<span class="na">n/a</span>'
+        if k == "max_cvss_score":
+            return e(f"{v:.1f}")
+        if k in ("component_affects_policy_compliance", "new"):
+            return e("Yes" if str(v).lower() == "true" else "No" if str(v).lower() == "false" else v)
+        return f"<code>{e(v)}</code>" if k == "file_name" else e(v)
+    head = "".join(f'<th{" class=n" if c else ""}>{e(lab)}</th>' for _, lab, c in cols)
+    body = "".join("<tr>" + "".join(f'<td{" class=n" if c else ""}>{cell(k, r.get(k))}</td>'
+                                    for k, _, c in cols) + "</tr>" for r in rows[:200])
+    more = f'<p class="na">and {len(rows) - 200:,} more.</p>' if len(rows) > 200 else ""
+    return (f'<details><summary>{n:,} vulnerable component(s), highest CVSS first</summary>'
+            f'<div class="tw"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+            f'{more}</details>')
 
 
 def _notes(r: AppReport) -> str:

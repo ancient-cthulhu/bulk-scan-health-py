@@ -39,6 +39,9 @@ EXIT_RESOLVE = 2
 EXIT_WRITE = 3
 EXIT_INTERRUPT = 130
 
+# A detailed report slower than this (or failing) switches older builds to the summary report.
+SLOW_REPORT_SECONDS = 120.0
+
 APP_REPORT_CONFIG: dict[str, Any] = {
     "history_hard_cap": 50,
     "max_unpublished_walk": 10,
@@ -265,6 +268,7 @@ class BuildSnapshot:
     sandbox: str = ""
     is_latest: bool = False
     mode: str = "full"
+    fallback: str = ""
     status: str = ""
     submitted: str | None = None
     published: str | None = None
@@ -306,6 +310,7 @@ class BuildSnapshot:
     sca_enabled: bool | None = None
     sca_vulnerable_components: int | None = None
     sca_components: list[str] = field(default_factory=list)
+    sca_details: list[dict[str, Any]] = field(default_factory=list)
     checks: list[CheckOutcome] = field(default_factory=list)
     checks_ran: bool = False
     health: str = "Unavailable"
@@ -520,6 +525,9 @@ class Fetcher:
         # While resolving, 401/403 stops at once; afterwards the auth window covers credential
         # rotation.
         self.fail_fast = False
+        self.last_seconds = 0.0
+        # Set once a detailed report is slow or fails: older builds then use the summary report.
+        self.slow_reports = False
 
     def xml(self, endpoint: str, params: dict[str, Any], *, app_id: str,
             build_id: str | None = None, cache_policy: str = "none") -> FetchResult:
@@ -545,6 +553,7 @@ class Fetcher:
         bucket = sh.RateLimiter.classify(endpoint)
         url = f"{self.client._cfg['xml']}/{endpoint}"
         self.calls[bucket] += 1
+        t0 = time.monotonic()
         try:
             r = self.client._get(url, params, bucket, auth_retry=not self.fail_fast,
                                  quick=self.fail_fast)
@@ -553,12 +562,14 @@ class Fetcher:
         except requests.RequestException as e:
             if self.fail_fast:
                 raise ApiUnreachable(unreachable_message(url, e, self.region)) from e
-            return self._fail(endpoint, f"{type(e).__name__}: {e}")
+            return self._fail(endpoint, f"{type(e).__name__} after {time.monotonic() - t0:.0f}s: {e}")
+        finally:
+            self.last_seconds = time.monotonic() - t0
         if self.fail_fast and r.status_code in (401, 403):
             raise AccessDenied(access_denied_message(r.status_code, f"app {app_id} ({endpoint})",
                                                      self.region))
         if not r.ok:
-            return self._fail(endpoint, f"HTTP {r.status_code}")
+            return self._fail(endpoint, f"HTTP {r.status_code} after {self.last_seconds:.0f}s")
         try:
             root = sh.parse_xml_bytes(r.content)
         except ET.ParseError as e:
@@ -928,6 +939,25 @@ _FS_KNOWN = frozenset({
     "new", "reopen", "open", "cannot-reproduce", "fixed", "total", "not_mitigated",
     "sev-1-change", "sev-2-change", "sev-3-change", "sev-4-change", "sev-5-change",
 })
+
+
+_SCA_ATTRS = ("file_name", "library", "version", "vendor", "max_cvss_score", "vulnerabilities",
+              "component_affects_policy_compliance", "new")
+
+
+def parse_sca_components(root: ET.Element) -> list[dict[str, Any]]:
+    """Vulnerable components from the detailed report; each field is read only when present."""
+    out = []
+    for c in root.findall(".//vulnerable_components/component"):
+        rec: dict[str, Any] = {k: html.unescape(c.get(k, "")) for k in _SCA_ATTRS}
+        try:
+            rec["max_cvss_score"] = float(rec["max_cvss_score"]) if rec["max_cvss_score"] else None
+        except ValueError:
+            rec["max_cvss_score"] = None
+        rec["vulnerabilities"] = sh._si_or_none(rec["vulnerabilities"]) if rec["vulnerabilities"] else None
+        out.append(rec)
+    out.sort(key=lambda r: (-(r["max_cvss_score"] or -1), r["file_name"].lower()))
+    return out
 
 
 def parse_report_meta(root: ET.Element) -> dict[str, Any]:
@@ -1447,6 +1477,24 @@ def collect_snapshot(fetcher: Fetcher, app: AppInfo, ref: BuildRef, *,
     else:
         rep = fetcher.xml(report_ep, {"build_id": bid}, app_id=aid, build_id=bid,
                           cache_policy=report_policy)
+        if report_ep == "detailedreport.do" and not rep.from_cache and (
+                fetcher.last_seconds > SLOW_REPORT_SECONDS or not rep.ok):
+            fetcher.slow_reports = True
+    # A detailed report Veracode cannot produce (5xx, dropped connection, or "No report available."
+    # for a build that is published, seen after about 5 minutes on very large applications): the
+    # summary report has no per-flaw list but still gives size, timing, policy and flaw counts.
+    if report_ep == "detailedreport.do" and not rep.ok:
+        why = rep.error
+        if sh.NO_REPORT_AVAILABLE in why:
+            why = (f'Veracode answered "No report available." after {fetcher.last_seconds:.0f}s for a '
+                   "published build, so it could not generate the detailed report")
+        sr = fetcher.xml("summaryreport.do", {"build_id": bid}, app_id=aid, build_id=bid,
+                         cache_policy=report_policy)
+        snap.errors[report_ep] = why
+        if sr.ok:
+            snap.fallback = f"detailedreport.do failed ({why}); used summaryreport.do"
+            rep, report_ep, eff_mode = sr, "summaryreport.do", "light"
+            snap.mode = "light"
     if rep.from_cache:
         snap.cache_hits.append(report_ep)
     meta: dict[str, Any] = {}
@@ -1487,13 +1535,16 @@ def collect_snapshot(fetcher: Fetcher, app: AppInfo, ref: BuildRef, *,
             snap.open_policy_flaws = fl.open_pol
             snap.mitigated_flaws = fl.mitigated
         snap.sca_components = list(dr.get("sca_comps") or [])
+        if rep.root is not None:
+            snap.sca_details = parse_sca_components(rep.root)
         rv, tr = sh.platform_urls(fetcher.client.base, dr, bid)
         snap.review_url, snap.triage_url = rv, tr
         snap.overview_url = _overview_url(fetcher.client.base, dr, bid)
 
     if eff_mode != "full":
-        snap.checks = outcomes_unavailable("Light history mode: checks run on the latest build only",
-                                           status="Not run")
+        why = ("Detailed report unavailable: the checks need it" if snap.fallback
+               else "Light history mode: checks run on the latest build only")
+        snap.checks = outcomes_unavailable(why, status="Not run")
         return snap
 
     fl_res = fetcher.xml("getfilelist.do", {"app_id": app.legacy_id, "build_id": bid},
@@ -1787,9 +1838,8 @@ def history_status(report: AppReport, target: int, since: date | None, en: Enume
 def _standard_notes(report: AppReport) -> None:
     report.note("Analysis time", "Analysis time is published_date minus submitted_date from "
                 "the static-analysis element. It excludes upload and prescan.")
-    report.note("Mitigation state", "Mitigation state on historical builds may reflect the "
-                "current state rather than the state at scan time. This has not been verified "
-                "against a live tenant and is not asserted either way.")
+    report.note("Mitigation state", "On older builds, mitigations may show their current state "
+                "rather than the state at scan time.")
     report.note("Fixed counts", "Veracode advises against relying on remediation_status=\"fixed\" "
                 "in detailedreport. Fixed counts come from the flaw-status element; each build "
                 "records which report supplied it in flaw_status_source.")
@@ -2018,11 +2068,26 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
             report.note("History", f"Requested {target} published builds; "
                         f"{len(en.published)} exist in this context.")
 
+        auto_light = False
         for i, ref in enumerate(en.published):
-            log.info("[*] Build %s (%d/%d): fetching results (large reports can take minutes)",
-                     ref.build_id, i + 1, len(en.published))
+            mode = args.history_mode
+            if i > 0 and mode == "full" and fetcher.slow_reports:
+                mode = "light"
+                if not auto_light:
+                    auto_light = True
+                    log.warning("[!] Detailed reports for this application are slow or failing; "
+                                "the remaining %d older build(s) use the summary report (timing, "
+                                "size, policy, flaw counts; no checks).", len(en.published) - i)
+                    report.note("History", "Detailed reports for this application were slow (over "
+                                f"{SLOW_REPORT_SECONDS:.0f}s) or failed, so older builds use the "
+                                "summary report: timing, size, policy and flaw counts, without checks. "
+                                "Use --history-mode full --report-timeout to force detailed reports.",
+                                "warning")
+            log.info("[*] Build %s (%d/%d): fetching %s", ref.build_id, i + 1, len(en.published),
+                     "summary report" if (i > 0 and mode == "light") else
+                     "results (large reports can take minutes)")
             snap = collect_snapshot(
-                fetcher, app, ref, is_latest=(i == 0), mode=args.history_mode, skip=skip,
+                fetcher, app, ref, is_latest=(i == 0), mode=mode, skip=skip,
                 sandbox_name=context.get("sandbox_name") or "",
                 recency_applicable=(None if resolved is None or i > 0
                                     else resolved.is_latest_build is True),
@@ -2036,6 +2101,13 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
             log.info("[*] Build %s (%d/%d): %s, health %s%s", snap.build_id, i + 1,
                      len(en.published), snap.analysis_duration, snap.health,
                      f", cache hits {len(snap.cache_hits)}" if snap.cache_hits else "")
+            if snap.fallback:
+                log.warning("[!] Build %s: %s", snap.build_id, snap.fallback)
+                report.note("API errors", f"Build {snap.build_id}: {snap.fallback}; checks did not "
+                            "run on this build.", "warning")
+            elif snap.errors:
+                log.warning("[!] Build %s unavailable: %s", snap.build_id,
+                            "; ".join(f"{ep}: {err}" for ep, err in snap.errors.items()))
 
         report.history_status = (history_status(report, target, since, en)
                                  if scan is None or len(en.published) > 1

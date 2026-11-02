@@ -1053,9 +1053,10 @@ def _performance(rep: ta.TenantReport, base: str) -> str:
                     "Analysis time of each profile's latest published scan (submit to publish; "
                     "excludes upload and prescan).",
                     f'<div class="stats">{tiles}</div>{_own_history(p, base)}{by_size}'
-                    f'<h3>Analysis time distribution</h3>{hist}'
-                    f'<div class="cols2"><div><h3>Slowest scans</h3>{slow}</div>'
-                    f'<div><h3>Largest analysis sizes</h3>{big}</div></div>')
+                    f'<h3>Largest analysis sizes</h3><p class="small">Size is what the team controls: '
+                    f'smaller, cleaner uploads analyse faster.</p>{big}'
+                    f'<details><summary>More timing detail</summary>'
+                    f'<h3>Analysis time distribution</h3>{hist}<h3>Slowest scans</h3>{slow}</details>')
 
 
 def _findings(rep: ta.TenantReport, base: str) -> str:

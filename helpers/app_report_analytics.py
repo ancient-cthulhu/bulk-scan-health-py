@@ -387,14 +387,12 @@ def findings_trend(builds: list[BuildSnapshot], cfg: dict[str, Any] | None = Non
             if b.engine_version and prev.engine_version and b.engine_version != prev.engine_version:
                 ft.events.append({"build_id": b.build_id, "event":
                                   f"Engine {prev.engine_version} to {b.engine_version}"})
-                same_mods = {m.name for m in b.modules} == {m.name for m in prev.modules}
                 r = _rel(float(total) if total is not None else None,
                          float(prev_total) if prev_total else None)
-                if same_mods and r is not None and abs(r) > cfg["engine_effect_change"] \
-                        and b is builds[0]:
-                    ft.engine_effect = ("Result shift likely engine-related; review before "
-                                        "attributing to code changes (engine changed, total "
-                                        f"flaws {_pct_str(r)}, same selected modules)")
+                if r is not None and abs(r) > cfg["engine_effect_change"] and b is builds[0]:
+                    ft.engine_effect = (f"Total flaws changed {_pct_str(r)} with this scan. Usually "
+                                        "that is new or changed code; this scan also ran on a newer "
+                                        "Veracode engine, which can add or remove findings by itself.")
         if b.grace_period_expired:
             ft.events.append({"build_id": b.build_id, "event": "Grace period expired"})
         if b.scan_overdue:
@@ -650,8 +648,13 @@ def verdicts(report: AppReport, dur: DurationStats, cad: CadenceStats,
                            f"Last policy scan {d} days ago" + (
                                f"; median interval {cad.median_interval_days} days"
                                if cad.median_interval_days is not None else "")))
-    dl = {"Regression": "RED", "Normal": "GREEN"}.get(dur.status, "GRAY")
-    out.append(Verdict("Duration trend", dl, dur.status, dur.reason))
+    if dur.status == "Regression" and not dur.has_size_or_module_driver:
+        # Nothing in the upload grew: likely engine or platform load, which the team cannot change.
+        out.append(Verdict("Duration trend", "YELLOW", "Slower",
+                           dur.reason + "; no change in the upload explains it"))
+    else:
+        dl = {"Regression": "RED", "Normal": "GREEN"}.get(dur.status, "GRAY")
+        out.append(Verdict("Duration trend", dl, dur.status, dur.reason))
     return out
 
 
@@ -757,9 +760,9 @@ def action_plan(report: AppReport, dur: DurationStats, cad: CadenceStats,
             how_to_fix=["Fix or, where justified, propose a mitigation for each Very High flaw.",
                         "Use Triage Flaws to filter by severity 5."],
             verify="Open Very High count is 0 on the next policy scan.", links=links))
-    if dur.status == "Regression":
+    if dur.status == "Regression" and dur.has_size_or_module_driver:
         items.append(ActionItem(
-            priority="P1" if dur.has_size_or_module_driver else "P2",
+            priority="P1",
             title="Investigate the scan duration regression", owner_role="Build/Release Engineer",
             effort="M", category="Scan performance", why=dur.reason,
             evidence=dur.drivers or ["No size, LOC or module driver identified"],
