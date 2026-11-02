@@ -135,6 +135,8 @@ Teams come from the application profile. Access teams named `Service Delivery - 
 - **tenant_report.html:** scan health and findings side by side; a fix list filterable by team, business unit, check and priority, with CSV export; a heatmap and a group table with per-run trends; priorities, changes and trends. A **Group by** switch (business unit or team) changes every grouped view; it starts on whichever most profiles use. A profile in several teams counts in each. Analysis time is compared per profile against its own earlier scans and by size band, never as one tenant-wide average. A "How results are classified" section states every rule the report uses. One page, no external resources; values are escaped and the only script is allowed by hash.
 - **Snapshots:** a small gzip record per run, used for tenant trends. Only runs with the same scope are compared.
 
+**Priority** (same rule in every report): P1 findings at risk, sensitive files or Very High flaws; P2 partial or stale results, policy not met; P3 scan time only. **Effort**: Small (packaging), Medium (build change), Large (code or toolchain).
+
 Scan health and findings are separate: a healthy scan does not mean no vulnerabilities. Apps without a published scan are Unknown, not healthy. Only `accepted` mitigations close a flaw. A failed API retrieval marks the profile `Error`, never clean.
 
 ## Health checks
