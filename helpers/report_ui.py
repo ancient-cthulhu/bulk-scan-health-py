@@ -475,15 +475,47 @@ def mix_bar(parts: list[tuple[str, int, str]]) -> str:
 
 
 # Browser print dialog: exact PDF, no library or network. Hidden until the script runs.
-# Collapsed sections are opened for printing (any print, not only the button) and closed again after.
-PDF_SCRIPT = ('(function () { var opened = []; '
-              'window.addEventListener("beforeprint", function () { '
-              'document.querySelectorAll("details:not([open])").forEach(function (d) { '
-              'd.open = true; opened.push(d); }); }); '
-              'window.addEventListener("afterprint", function () { '
-              'opened.forEach(function (d) { d.open = false; }); opened = []; }); '
-              'var b = document.getElementById("save-pdf"); if (!b) { return; } '
-              'b.hidden = false; b.addEventListener("click", function () { window.print(); }); }());')
+# One inline script, allowed by hash. Printing opens collapsed sections and closes them after (any
+# print, not only the button). Each table[data-copy] gets a Copy button: HTML for Word, email and
+# Sheets, tab-separated text for Excel and plain editors. A cell's data-v replaces its visible text.
+PDF_SCRIPT = (
+    '(function () { var opened = []; '
+    'window.addEventListener("beforeprint", function () { '
+    'document.querySelectorAll("details:not([open])").forEach(function (d) { '
+    'd.open = true; opened.push(d); }); }); '
+    'window.addEventListener("afterprint", function () { '
+    'opened.forEach(function (d) { d.open = false; }); opened = []; }); '
+    'function text(c) { var v = c.getAttribute("data-v"); '
+    'if (v === null) { var k = c.cloneNode(true); '
+    'k.querySelectorAll("[aria-hidden=true]").forEach(function (x) { x.remove(); }); '
+    'k.querySelectorAll("div, li, p").forEach(function (x) { x.insertAdjacentText("beforebegin", " "); }); '
+    'v = k.textContent; } return v.replace(/\\s+/g, " ").trim(); } '
+    'function esc(x) { return x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); } '
+    'document.querySelectorAll("table[data-copy]").forEach(function (t) { '
+    'var btn = document.createElement("button"); btn.type = "button"; btn.className = "copybtn"; '
+    'btn.textContent = "Copy table"; '
+    'btn.title = "Paste into Excel, Sheets, Word or an email as a table"; '
+    'btn.addEventListener("click", function () { '
+    'var rows = Array.prototype.map.call(t.rows, function (r) { '
+    'return Array.prototype.map.call(r.cells, text); }); '
+    'var tsv = rows.map(function (r) { return r.map(function (c) { '
+    'return c.replace(/\\t/g, " "); }).join("\\t"); }).join("\\n"); '
+    'var html = "<table>" + rows.map(function (r, i) { '
+    'var tag = (i === 0 && t.tHead) ? "th" : "td"; return "<tr>" + r.map(function (c) { '
+    'return "<" + tag + ">" + esc(c) + "</" + tag + ">"; }).join("") + "</tr>"; }).join("") + "</table>"; '
+    'function done(ok) { btn.textContent = ok ? "Copied" : "Copy failed"; '
+    'setTimeout(function () { btn.textContent = "Copy table"; }, 2000); } '
+    'function plain() { var a = document.createElement("textarea"); a.value = tsv; '
+    'a.style.position = "fixed"; a.style.opacity = "0"; document.body.appendChild(a); a.select(); '
+    'var ok = false; try { ok = document.execCommand("copy"); } catch (err) { ok = false; } '
+    'document.body.removeChild(a); done(ok); } '
+    'try { navigator.clipboard.write([new ClipboardItem({ '
+    '"text/html": new Blob([html], { type: "text/html" }), '
+    '"text/plain": new Blob([tsv], { type: "text/plain" }) })]).then(function () { done(true); }, plain); '
+    '} catch (err) { plain(); } }); '
+    'var w = t.closest(".tw") || t; w.parentNode.insertBefore(btn, w); }); '
+    'var b = document.getElementById("save-pdf"); if (!b) { return; } '
+    'b.hidden = false; b.addEventListener("click", function () { window.print(); }); }());')
 
 
 def pdf_button() -> str:
@@ -507,15 +539,20 @@ PRINT_CSS = """
 .toolbar{float:right;margin:0 0 8px 16px}
 .pdfbtn{font:inherit;font-size:14px;font-weight:600;color:var(--link);background:var(--card);border:1px solid var(--s1);border-radius:8px;padding:6px 14px;cursor:pointer}
 .pdfbtn:hover{background:var(--wash)}
+.copybtn{display:block;margin:8px 0 2px auto;font:inherit;font-size:12.5px;color:var(--link);background:var(--card);border:1px solid var(--s1);border-radius:6px;padding:2px 10px;cursor:pointer}
+.copybtn:hover{background:var(--wash)} .copybtn:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
+.print-only{display:none}
 .pdfbtn:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 @page{size:A4;margin:14mm}
-@media print{.toolbar,.jump{display:none} *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
-main{max-width:none;padding:0} section,.part,main>section{break-inside:auto!important;margin:14px 0}
+@media print{.toolbar,.jump,.copybtn,.screen-only{display:none!important} div.print-only{display:block}
+p.print-only{display:block} div.print-only{break-inside:avoid} footer{margin-top:10px;break-before:avoid} *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+main{max-width:none;padding:0} section,.part{margin:14px 0} main>section{break-inside:auto} main>section.keep{break-inside:avoid}
+main>section.newpage{break-before:page;margin-top:0}
 h1,h2,h3,summary{break-after:avoid} tr,svg,.v,.act,.stat,.kpi,.panel,.q,figure{break-inside:avoid}
 body{font-size:12.5px} .grid2,.cols2{grid-template-columns:repeat(2,minmax(0,1fr))!important}
-.tw{overflow:visible!important} table{width:100%;font-size:10px}
+.tw{overflow:visible!important} table{width:100%;font-size:11px}
 th,td,td.nw{white-space:normal!important;padding:3px} td{overflow-wrap:break-word}
-th{font-size:8.5px;letter-spacing:0;overflow-wrap:normal} td.n,th.n{white-space:nowrap!important}
+th{font-size:9.5px;letter-spacing:0;overflow-wrap:normal} td.n,th.n{white-space:nowrap!important}
 td.name{max-width:none;overflow-wrap:anywhere} td .chip{white-space:normal} summary{font-weight:600;color:inherit;margin:8px 0 4px}}
 @media print{details::details-content{content-visibility:visible;display:block}}
 """
