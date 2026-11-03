@@ -186,10 +186,13 @@ class CheckHistory:
 
 @dataclass
 class Verdict:
+    """name and value are stable for report.json readers; label and display are what the page shows."""
     name: str
     level: str
     value: str
     reason: str
+    label: str = ""
+    display: str = ""
 
 
 @dataclass
@@ -209,6 +212,7 @@ class ActionItem:
     check_num: int | None = None
     consecutive_failing: int = 0
     priority_why: str = ""
+    impact: str = ""
 
 
 @dataclass
@@ -271,12 +275,12 @@ def duration_stats(builds: list[BuildSnapshot], baseline_window: int,
                              cfg["regression_ratio"] * st.baseline_median), 1)
     if st.latest > st.threshold:
         st.status = "Regression"
-        st.reason = (f"Latest {sh._fmt_seconds(st.latest)} vs baseline median "
+        st.reason = (f"Latest {sh._fmt_seconds(st.latest)} vs usual "
                      f"{sh._fmt_seconds(int(st.baseline_median))} "
                      f"({_pct_str(_rel(st.latest, st.baseline_median))})")
     else:
         st.status = "Normal"
-        st.reason = (f"Latest {sh._fmt_seconds(st.latest)}, baseline median "
+        st.reason = (f"Latest {sh._fmt_seconds(st.latest)}, usual "
                      f"{sh._fmt_seconds(int(st.baseline_median))}")
     st.drivers, st.has_size_or_module_driver = _drivers(builds, base_pts, cfg)
     return st
@@ -308,7 +312,7 @@ def _drivers(builds: list[BuildSnapshot], base_pts: list[DurationPoint],
             continue
         r = _rel(float(cur), median(hist))
         if r is not None and abs(r) >= cfg["driver_min_change"]:
-            ranked.append((abs(r), name, f"{name} {_pct_str(r)} vs baseline median"))
+            ranked.append((abs(r), name, f"{name} {_pct_str(r)} vs usual"))
     ranked.sort(reverse=True)
     out = [t for _, _, t in ranked]
     sized = any(n in ("Analysis size", "Selected modules", "Uploaded module size (prescan)")
@@ -350,10 +354,10 @@ def cadence_stats(builds: list[BuildSnapshot], others: list[BuildRef],
     attempted = len(dated) + failed
     if failed and attempted:
         cs.failure_rate = round(failed / attempted, 3)
-        cs.failure_rate_note = f"{failed} failed or cancelled of {attempted} attempts in the window"
+        cs.failure_rate_note = f"{failed} of {attempted} attempts in the window"
     else:
-        cs.failure_rate_note = ("Unavailable: failed builds are normally deleted before the next "
-                                "upload, so the build list cannot show them")
+        cs.failure_rate_note = ("unknown, because Veracode normally deletes failed builds before the "
+                                "next upload")
     return cs
 
 
@@ -610,7 +614,8 @@ def findings_risk(b: BuildSnapshot) -> tuple[str, str]:
     if basis > 0:
         app.flaw_density = round(app.weighted_flaw_load / max(basis, cfg["flaws"]["min_basis"]), 2)
     level = sh._flaw_risk(app, cfg)
-    return level, app.findings_basis or "No open very-high or high flaws"
+    said = (app.findings_basis or "No open Very High or High flaws").removeprefix("Severity floor: ")
+    return level, said.replace("open very-high", "Very High open").replace("open high", "High open")
 
 
 def verdicts(report: AppReport, dur: DurationStats, cad: CadenceStats,
@@ -623,7 +628,10 @@ def verdicts(report: AppReport, dur: DurationStats, cad: CadenceStats,
         return [Verdict("Scan health", "GRAY", "No published scan", "Nothing to evaluate")]
     hl = {"Good": "GREEN", "Fair": "YELLOW", "Poor": "RED"}.get(b.health, "GRAY")
     if b.checks_ran:
-        why = f"{b.high_issues or 0} high and {b.medium_issues or 0} medium severity issues"
+        fail = [c for c in b.checks if c.status == "Fail"]
+        hi = sum(1 for c in fail if c.severity == "high")
+        why = (f"{len(fail)} failing check(s): {hi} high, {len(fail) - hi} medium" if fail
+               else "No check fails")
     else:
         why = "Checks could not run on this build (inputs unavailable)"
     out.append(Verdict("Scan health", hl, b.health, why))
@@ -647,88 +655,110 @@ def verdicts(report: AppReport, dur: DurationStats, cad: CadenceStats,
         lv = "GREEN" if d <= cfg["stale_days"] else ("ORANGE" if d <= 90 else "RED")
         out.append(Verdict("Freshness", lv, f"{d} days",
                            f"Last policy scan {d} days ago" + (
-                               f"; median interval {cad.median_interval_days} days"
+                               f"; usually every {cad.median_interval_days:g} days"
                                if cad.median_interval_days is not None else "")))
     if dur.status == "Regression" and not dur.has_size_or_module_driver:
         # Nothing in the upload grew: likely engine or platform load, which the team cannot change.
         out.append(Verdict("Duration trend", "YELLOW", "Slower",
-                           dur.reason + "; no change in the upload explains it"))
+                           dur.reason + "; nothing in the upload explains it", label="Scan time"))
     else:
         dl = {"Regression": "RED", "Normal": "GREEN"}.get(dur.status, "GRAY")
-        out.append(Verdict("Duration trend", dl, dur.status, dur.reason))
+        out.append(Verdict("Duration trend", dl, dur.status, dur.reason, label="Scan time",
+                           display="Slower" if dur.status == "Regression" else ""))
     return out
 
 
-_CHECK_META: dict[int, tuple[str, str, str]] = {
-    1: ("Build/Release Engineer", "S", "Scan performance"),
-    2: ("AppSec", "S", "Results accuracy"),
-    3: ("AppSec", "M", "Results accuracy"),
-    4: ("Developer", "M", "Results accuracy"),
-    5: ("Build/Release Engineer", "M", "Results accuracy"),
-    6: ("Build/Release Engineer", "S", "Scan performance"),
-    7: ("Build/Release Engineer", "S", "Scan performance"),
-    8: ("Developer", "M", "Results accuracy"),
-    9: ("AppSec", "M", "Results accuracy"),
-    10: ("AppSec", "S", "Results accuracy"),
-    11: ("Build/Release Engineer", "M", "Results accuracy"),
-    12: ("Build/Release Engineer", "M", "Results accuracy"),
-    13: ("Build/Release Engineer", "S", "Results accuracy"),
-    14: ("Developer", "L", "Results accuracy"),
-    15: ("AppSec", "S", "Results accuracy"),
-    16: ("Build/Release Engineer", "S", "Security exposure"),
-    17: ("Build/Release Engineer", "S", "Security exposure"),
-    18: ("Build/Release Engineer", "S", "Scan performance"),
-    19: ("Build/Release Engineer", "S", "Results accuracy"),
-    20: ("Build/Release Engineer", "M", "Scan performance"),
-    21: ("Build/Release Engineer", "S", "Scan performance"),
-    22: ("Build/Release Engineer", "M", "Results accuracy"),
-    23: ("Build/Release Engineer", "M", "Results accuracy"),
-    24: ("AppSec", "S", "Results accuracy"),
-    25: ("AppSec", "S", "Results accuracy"),
-    26: ("AppSec", "S", "Results accuracy"),
-    27: ("Build/Release Engineer", "S", "Results accuracy"),
-    28: ("Build/Release Engineer", "S", "Scan performance"),
-    29: ("App Owner", "L", "Scan performance"),
-    30: ("App Owner", "S", "Process/cadence"),
-    31: ("Build/Release Engineer", "M", "Scan performance"),
+# (effort, impact). Impact follows the issue text of Veracode's scan_health for each check:
+# missed = some code is not analysed, noise = code you do not ship is analysed or results vary,
+# config = a sign of a misconfigured scan, exposure = sensitive files sent, stale, time = slower only.
+_CHECK_META: dict[int, tuple[str, str]] = {
+    1: ("S", "time"), 2: ("S", "noise"), 3: ("M", "config"), 4: ("M", "missed"), 5: ("M", "missed"),
+    6: ("S", "time"), 7: ("S", "missed"), 8: ("M", "missed"), 9: ("M", "missed"), 10: ("S", "missed"),
+    11: ("M", "missed"), 12: ("M", "missed"), 13: ("S", "config"), 14: ("L", "missed"), 15: ("S", "noise"),
+    16: ("S", "exposure"), 17: ("S", "exposure"), 18: ("S", "time"), 19: ("S", "noise"), 20: ("M", "time"),
+    21: ("S", "time"), 22: ("M", "config"), 23: ("M", "missed"), 24: ("S", "missed"), 25: ("S", "noise"),
+    26: ("S", "noise"), 27: ("S", "noise"), 28: ("S", "missed"), 29: ("L", "time"), 30: ("S", "stale"),
+    31: ("M", "time"),
 }
-_WHY: dict[str, str] = {
-    "Results accuracy": "Affects which code is analysed, so findings can be missing or misleading.",
-    "Scan performance": "Adds upload and analysis time without improving results.",
-    "Security exposure": "Sensitive material was uploaded to the scanning service.",
-    "Process/cadence": "Stale results hide issues introduced since the last scan.",
+# The category vocabulary report.json has always used, so readers keep working.
+IMPACT_CATEGORY = {
+    "missed": "Results accuracy", "noise": "Results accuracy", "config": "Results accuracy",
+    "exposure": "Security exposure", "stale": "Process/cadence", "time": "Scan performance",
 }
-# One priority rule for both reports: the check's severity (as Veracode's scan_health assigns it)
-# and what the problem affects.
+IMPACT_LABEL = {
+    "missed": "Code not scanned", "noise": "Unshipped code analysed", "config": "Likely misconfigured",
+    "exposure": "Sensitive files uploaded", "stale": "Results out of date", "time": "Slower scans",
+}
+# What goes wrong, per check, in the words of the original tool's issue text.
+_CHECK_REASON: dict[int, str] = {
+    1: "Unneeded files add upload and scan time.",
+    2: "Third-party code is analysed as your own.",
+    3: "Zero or very many flaws usually means a misconfigured scan.",
+    4: "Some modules could not be scanned.",
+    5: "Some Java modules could not be scanned.",
+    6: "File types Veracode does not scan; they only add upload time.",
+    7: "Files inside nested archives are not scanned.",
+    8: "ASP.NET views that are not precompiled are not scanned.",
+    9: "No SCA results: open-source risk is not shown.",
+    10: "JavaScript in unselected modules is not scanned.",
+    11: "Source code for a compiled technology is not scanned.",
+    12: "Selected modules are missing files, which limits analysis.",
+    13: "Without debug symbols, flaws lack accurate line numbers.",
+    14: "Modules from an unsupported compiler or platform could not be scanned.",
+    15: "A build tool is analysed instead of your application.",
+    16: "Possible secrets or sensitive files were sent for scanning.",
+    17: "A Git repository was uploaded; it can contain secrets.",
+    18: "node_modules adds upload size; package manifests are enough.",
+    19: "Test code complicates module selection and may be analysed.",
+    20: "A very large number of files slows the scan.",
+    21: "Microsoft runtime files add upload and scan time.",
+    22: "Loose .class files: packaging is likely incomplete.",
+    23: "Go multi-module workspaces are not supported, so code may be missed.",
+    24: "Possible first-party modules are not selected, so not scanned.",
+    25: "Dependencies selected twice can make results vary between scans.",
+    26: "Dependencies as entry points can raise findings that are not reachable.",
+    27: "Same-name files with different content can make results vary between scans.",
+    28: "Minified JavaScript is not scanned.",
+    29: "A very large number of modules slows the scan and often means a selection problem.",
+    30: "Results are old: code and engine changes since then are not reflected.",
+    31: "A very large upload or analysis slows the scan.",
+}
+# One priority rule for both reports: what the problem does to the results, then severity.
 PRIORITY_MEANING = {
-    "P1": "Fix first: findings at risk or data exposed",
-    "P2": "Fix soon: partial or stale results",
-    "P3": "Later: scan time only",
+    "P1": "Fix first: code not scanned, secrets uploaded, or Very High flaws open",
+    "P2": "Fix soon: results incomplete, noisy or old, or policy not met",
+    "P3": "When convenient: slows scans only",
 }
 EFFORT_MEANING = {"S": "Small (packaging)", "M": "Medium (build change)", "L": "Large (code or toolchain)"}
 EFFORT_NAME = {"S": "Small", "M": "Medium", "L": "Large"}
 
 
+def check_effort(check: int) -> str:
+    return _CHECK_META.get(check, ("M", "config"))[0]
+
+
+def check_impact(check: int, severity: str = "") -> str:
+    """The check's impact; #27 at medium severity is identical copies, which only cost time."""
+    if check == 27 and str(severity).lower() != "high":
+        return "time"
+    return _CHECK_META.get(check, ("M", "config"))[1]
+
+
 def check_priority(check: int, severity: str) -> tuple[str, str]:
-    """(priority, reason) for one failing check, from its severity and what it affects."""
-    category = _CHECK_META.get(check, ("", "M", "Results accuracy"))[2]
-    high = str(severity).lower() == "high"
-    if category == "Security exposure":
-        return "P1", "Sensitive files uploaded."
-    if category == "Results accuracy" and high:
-        return "P1", "Code may be skipped; findings can be missing."
-    if category == "Results accuracy":
-        return "P2", "Partial or noisy results."
-    if category == "Process/cadence":
-        return "P2", "Results out of date."
-    if high:
-        return "P2", "Very large or slow scan."
-    return "P3", "Scan time only; results unaffected."
+    """(priority, reason) for one failing check, from its impact and severity."""
+    impact = check_impact(check, severity)
+    reason = ("Identical copies of files add scan time." if check == 27 and impact == "time"
+              else _CHECK_REASON.get(check, "Affects scan quality."))
+    if impact == "exposure" or (impact == "missed" and str(severity).lower() == "high"):
+        return "P1", reason
+    if impact == "time":
+        return "P3", reason
+    return "P2", reason
 
 
-_P1_ACCURACY = {4, 5, 8, 11, 14, 16, 19}
-_P2_ACCURACY = {2, 10, 12, 13, 24, 25, 26}
-_P2_PERF = {1, 6, 7, 18, 20, 21, 28, 31}
+# Checks that mean part of the application was not analysed; the high-severity ones put findings at risk.
+MISSED_CHECKS = frozenset(n for n, (_, imp) in _CHECK_META.items() if imp == "missed")
+MISSED_MAJOR = frozenset(n for n in MISSED_CHECKS if sh.CHECK_CATALOG[n][1] == "high")
 
 
 def _prescan_bytes(names: list[str], b: BuildSnapshot) -> int | None:
@@ -743,6 +773,15 @@ def _prescan_bytes(names: list[str], b: BuildSnapshot) -> int | None:
     return sum(v for v in vals if v)
 
 
+def _dedupe(recs: list[str]) -> list[str]:
+    """Recommendations without repeats, including one already contained in a longer one."""
+    out: list[str] = []
+    for r in dict.fromkeys(x.strip() for x in recs if x.strip()):
+        if not any(r.rstrip(".").lower() in o.lower() for o in out):
+            out = [o for o in out if o.rstrip(".").lower() not in r.lower()] + [r]
+    return out
+
+
 def action_plan(report: AppReport, dur: DurationStats, cad: CadenceStats,
                 hist: list[CheckHistory], cfg: dict[str, Any] | None = None) -> list[ActionItem]:
     """Ranked actions from failing checks, regressions and findings signals."""
@@ -752,12 +791,12 @@ def action_plan(report: AppReport, dur: DurationStats, cad: CadenceStats,
         return []
     by_num = {h.check_num: h for h in hist}
     items: list[ActionItem] = []
-    links = [(lbl, u) for lbl, u in (("Review Modules", b.review_url), ("Triage Flaws", b.triage_url))
-             if u]
+    modules_link = [("Review Modules", b.review_url)] if b.review_url else []
+    flaws_link = [("Triage Flaws", b.triage_url)] if b.triage_url else []
     for c in b.checks:
         if c.status != "Fail":
             continue
-        owner, effort, category = _CHECK_META.get(c.check_num, ("AppSec", "M", "Results accuracy"))
+        effort = check_effort(c.check_num)
         prio, prio_why = check_priority(c.check_num, c.severity)
         h = by_num.get(c.check_num)
         verify = f"Check #{c.check_num} passes on the next scan."
@@ -768,38 +807,40 @@ def action_plan(report: AppReport, dur: DurationStats, cad: CadenceStats,
                       "(upper bound on what deselecting or removing them takes out of the scan)")
             verify += f" Uploaded module size drops by up to {size / 1e6:.1f} MB."
         items.append(ActionItem(
-            priority=prio, title=c.label, owner_role=owner, effort=effort, category=category,
-            why=_WHY[category], evidence=list(c.issues),
-            evidence_total=c.evidence_total, how_to_fix=list(c.recommendations),
-            verify=verify, expected_effect=effect, links=links, check_num=c.check_num,
+            priority=prio, title=c.label, owner_role="", effort=effort,
+            category=IMPACT_CATEGORY[check_impact(c.check_num, c.severity)],
+            impact=IMPACT_LABEL[check_impact(c.check_num, c.severity)],
+            why="", evidence=list(c.issues),
+            evidence_total=c.evidence_total, how_to_fix=_dedupe(c.recommendations),
+            verify=verify, expected_effect=effect, links=modules_link, check_num=c.check_num,
             consecutive_failing=h.consecutive_failing if h else 0, priority_why=prio_why))
     if b.open_by_severity and b.open_by_severity.get("very_high"):
         n = b.open_by_severity["very_high"]
         items.append(ActionItem(
-            priority="P1", title=f"Remediate {n} open Very High flaw(s)", owner_role="Developer",
+            priority="P1", title=f"Remediate {n} open Very High flaw(s)", owner_role="",
             effort="M", category="Security exposure",
             priority_why="Most exploitable flaws; usually fail policy.",
             why="",
             evidence=[f"{n} open Very High, {b.open_by_severity.get('high', 0)} open High"],
             how_to_fix=["Fix or, where justified, propose a mitigation for each Very High flaw.",
                         "Use Triage Flaws to filter by severity 5."],
-            verify="Open Very High count is 0 on the next policy scan.", links=links))
+            verify="Open Very High count is 0 on the next policy scan.", links=flaws_link))
     if dur.status == "Regression" and dur.has_size_or_module_driver:
         items.append(ActionItem(
-            priority="P3", priority_why="Slower scans from a larger upload; results unaffected.",
-            title="Investigate the scan duration regression", owner_role="Build/Release Engineer",
+            priority="P3", priority_why="Scans got slower as the upload grew.",
+            title="Investigate the slower scan", owner_role="",
             effort="M", category="Scan performance", why=dur.reason,
             evidence=dur.drivers or ["No size, LOC or module driver identified"],
             how_to_fix=["Compare the uploaded package with the previous build (see What changed).",
                         "Remove test, third-party and duplicate artefacts from the upload."],
             verify="Analysis time returns below the baseline threshold "
-                   f"({sh._fmt_seconds(int(dur.threshold or 0))}).", links=links))
+                   f"({sh._fmt_seconds(int(dur.threshold or 0))}).", links=modules_link))
     if cad.failure_rate is not None and cad.failure_rate > cfg["failure_rate_p1"]:
         items.append(ActionItem(
             priority="P2", priority_why="Failed scans leave no fresh results.",
-            title="Reduce failed scan attempts", owner_role="Build/Release Engineer",
-            effort="M", category="Process/cadence", why=cad.failure_rate_note,
-            evidence=[f"Failure rate {cad.failure_rate:.0%}"],
+            title="Reduce failed scan attempts", owner_role="",
+            effort="M", category="Process/cadence", why="",
+            evidence=[f"Failed or cancelled: {cad.failure_rate_note} ({cad.failure_rate:.0%})"],
             how_to_fix=["Review the prescan errors of the failed builds.",
                         "Use the Veracode CLI auto-packager to produce consistent uploads."],
             verify="The next attempts publish results."))
@@ -807,11 +848,11 @@ def action_plan(report: AppReport, dur: DurationStats, cad: CadenceStats,
         items.append(ActionItem(
             priority="P2", priority_why="Policy is not met.",
             title="Bring the application back into policy compliance",
-            owner_role="App Owner", effort="M", category="Security exposure",
+            owner_role="", effort="M", category="Security exposure",
             why=f"Policy {b.policy_name or ''} status is {b.policy_compliance_status}.",
             evidence=[f"Rules status: {b.policy_rules_status or 'Unknown'}"],
             how_to_fix=["Address the policy-affecting flaws first (Triage Flaws, filter by policy)."],
-            verify="Policy status is Pass on the next policy scan.", links=links))
+            verify="Policy status is Pass on the next policy scan.", links=flaws_link))
     rank = {"P1": 0, "P2": 1, "P3": 2}
     items.sort(key=lambda a: (rank[a.priority], -a.consecutive_failing, a.check_num or 0))
     return items

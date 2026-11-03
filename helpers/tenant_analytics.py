@@ -302,7 +302,7 @@ def check_table(snap: dict[str, Any], prev: dict[str, Any] | None,
         hit = sorted(by_check.get(num, []), key=lambda r: (-(r.get("attention") or 0), _display(r).lower()))
         n = cur.get(num, len(hit))
         ci = info.get(str(num)) or {}
-        owner, effort, category = ana._CHECK_META.get(num, ("AppSec", "M", "Results accuracy"))
+        effort, category = ana.check_effort(num), ana.IMPACT_LABEL[ana.check_impact(num, max_sev)]
         bus = Counter(_bu(r) for r in hit)
         tms = Counter(t for r in hit for t in _teams(r))
         p = old.get(num) if prev is not None else None
@@ -314,7 +314,7 @@ def check_table(snap: dict[str, Any], prev: dict[str, Any] | None,
             "previous": p, "delta": (n - p) if p is not None else None,
             "top_bus": [{"bu": b, "apps": k} for b, k in bus.most_common(3)],
             "top_teams": [{"bu": b, "apps": k} for b, k in tms.most_common(3)],
-            "owner": owner, "effort": effort, "impact": category,
+            "effort": effort, "impact": category,
             "recommendation": str(ci.get("rec") or ""),
             "affected": [_app_ref(r) for r in hit[:cfg["check_app_list"]]],
             "affected_more": max(0, len(hit) - cfg["check_app_list"]),
@@ -638,11 +638,11 @@ def actions(checks: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]
         trend = ("" if c["delta"] is None else
                  f"; {c['delta']:+d} since the last run" if c["delta"] else "; unchanged since the last run")
         issues.append({
-            **{k: c[k] for k in ("check", "label", "severity", "apps", "share", "delta", "owner",
+            **{k: c[k] for k in ("check", "label", "severity", "apps", "share", "delta",
                                  "effort", "impact", "recommendation", "top_bus", "top_teams")},
             "priority": pr, "priority_why": pr_why,
             "quick_win": c["effort"] == "S",
-            "why": ana._WHY.get(c["impact"], "Affects scan quality."),
+            "why": c["impact"],
             "evidence": f"{c['apps']} profiles ({c['share']}% of the tenant){trend}",
             "examples": c["affected"][:5],
             "verify": f"Fewer profiles fail check #{c['check']} on the next bulk run.",
@@ -763,7 +763,7 @@ def fix_list(current: dict[str, Any], prev: dict[str, Any] | None, checks: list[
             if not isinstance(c, int) or c not in sh.CHECK_CATALOG:
                 continue
             sev, found, advice = det.get((key, c), ("", "", ""))
-            owner, effort, impact = ana._CHECK_META.get(c, ("AppSec", "M", "Results accuracy"))
+            effort = ana.check_effort(c)
             change = "" if base is None else ("Recurring" if c in base.get(key, set()) else "New")
             out.append({
                 "key": key, "app_id": a.get("app_id"), "name": _display(a), "bu": _bu(a),
@@ -772,8 +772,7 @@ def fix_list(current: dict[str, Any], prev: dict[str, Any] | None, checks: list[
                 "severity": (sev or "").upper() or sev_seen.get(c) or sh.CHECK_CATALOG[c][1].upper(),
                 "priority": issue_priority(c, (sev or "").upper() or sev_seen.get(c)
                                            or sh.CHECK_CATALOG[c][1].upper()),
-                "owner": owner, "effort": effort,
-                "impact": impact, "found": found, "recommendation": advice or rec.get(c, ""),
+                "effort": effort, "found": found, "recommendation": advice or rec.get(c, ""),
                 "change": change, "quick_win": effort == "S",
             })
     out.sort(key=lambda f: (_PRI_RANK[f["priority"]], _SEV_RANK.get(f["severity"], 3),

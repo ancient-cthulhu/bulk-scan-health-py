@@ -26,8 +26,8 @@ _GLYPH = {
 }
 
 # Failing these means part of the app may not have been analysed.
-_ACCURACY = {n for n, (_, _, cat) in ana._CHECK_META.items() if cat == "Results accuracy"}
-_ACCURACY_MAJOR = _ACCURACY & ana._P1_ACCURACY
+_ACCURACY = set(ana.MISSED_CHECKS)
+_ACCURACY_MAJOR = set(ana.MISSED_MAJOR)
 _CHECK_LABELS = {n: label for n, (label, _) in sh.CHECK_CATALOG.items()}
 
 
@@ -207,7 +207,7 @@ def action_list(items: list[ActionView], open_first: int = 3) -> str:
             f'<details class="act"{aid}{" open" if i < open_first else ""}><summary>'
             f'<span class="pri {e(a.priority)}">{e(a.priority)}</span>'
             f'<span class="t">{e(a.title)}</span>'
-            f'<span class="m">{lens_label(a.lens)}<span>{e(a.owner)}</span>'
+            f'<span class="m">{lens_label(a.lens)}{"<span>" + e(a.owner) + "</span>" if a.owner else ""}'
             f'<span>{e(ana.EFFORT_NAME.get(a.effort, a.effort))} effort</span>'
             f'{"<span>" + e(a.note) + "</span>" if a.note else ""}</span>'
             f'</summary><dl>'

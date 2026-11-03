@@ -259,7 +259,7 @@ def _checks(rep: ta.TenantReport, base: str) -> str:
         share = 100.0 * (c["share"] or 0) / top_share
         rows.append(
             f"<tr><td class=n>{e(c['check'])}</td><td class=name>{e(c['label'])}"
-            f"<div class=small>{e(c['category'])} &middot; {e(c['owner'])}</div></td>"
+            f"<div class=small>{e(c['impact'])}</div></td>"
             f"<td>{chip(SEV_LEVEL.get(c['severity'], 'GRAY'), c['severity'].title())}</td>"
             f"<td class=n>{kit.filter_link(fmt_num(c['apps']), 'fix', 'check=' + str(c['check']), 'Show in the fix list')}</td>"
             f'<td><span class="share"><span class="bar"><i style="width:{min(share, 100):.1f}%"></i></span>'
@@ -491,7 +491,7 @@ _TABLE_SCRIPT = r"""(function () {
         if (fown.value && fown.value !== "__no_team__" && teamsOf(app).indexOf(fown.value) < 0) { return false; }
         if (fsev.value && r[FC.sev] !== fsev.value) { return false; }
         if (fchg.value && (r[FC.chg] || "") !== fchg.value) { return false; }
-        if (fquick.checked && ck[2] !== "S") { return false; }
+        if (fquick.checked && ck[1] !== "S") { return false; }
         return true;
       },
       row: function (r) {
@@ -507,6 +507,7 @@ _TABLE_SCRIPT = r"""(function () {
         c.appendChild(el("div", null, "#" + r[FC.check] + " " + ck[0]));
         var meta = el("div", "small");
         meta.appendChild(chip(SL[r[FC.sev]] || "GRAY", (r[FC.sev] || "").charAt(0) + (r[FC.sev] || "").slice(1).toLowerCase()));
+        meta.appendChild(document.createTextNode(" \u00b7 " + (EFF[ck[1]] || ck[1]) + " effort" + (ck[1] === "S" ? ", quick win" : "")));
         c.appendChild(meta);
         tr.appendChild(c);
         var found = FOUND[r[FC.found]] || "";
@@ -515,7 +516,6 @@ _TABLE_SCRIPT = r"""(function () {
         tr.appendChild(f);
         var o = el("td", "name");
         o.appendChild(el("div", teamsOf(app).length ? null : "na", teamText(app)));
-        o.appendChild(el("div", "small", (EFF[ck[2]] || ck[2]) + " effort" + (ck[2] === "S" ? ", quick win" : "")));
         tr.appendChild(o);
         cell(tr, r[FC.chg] === "New" ? chip("YELLOW", "New") : (r[FC.chg] || ""), "small");
         var d = el("details"), s = el("summary", null, "How to fix");
@@ -542,7 +542,7 @@ _TABLE_SCRIPT = r"""(function () {
       fixes.view.forEach(function (r) {
         var app = APPS[r[FC.app]], ck = CK[r[FC.check]];
         lines.push([r[FC.pri], app[AC.name], app[AC.bu], app[AC.sbx], "#" + r[FC.check] + " " + ck[0],
-                    r[FC.sev], FOUND[r[FC.found]] || "", teamsOf(app).join("; "), EFF[ck[2]] || ck[2], r[FC.chg],
+                    r[FC.sev], FOUND[r[FC.found]] || "", teamsOf(app).join("; "), EFF[ck[1]] || ck[1], r[FC.chg],
                     RECS[r[FC.rec]] || "",
                     platformUrl(app), command(app)].map(safe).join(","));
       });
@@ -614,7 +614,6 @@ _TABLE_SCRIPT = r"""(function () {
       cell(tr, r[AC.cov] ? chip(CL[r[AC.cov]] || "GRAY", r[AC.cov]) : "");
       var att = el("td", "nw");
       att.appendChild(chip(r[AC.lvl] || "GRAY", num(r[AC.att])));
-      att.appendChild(el("div", "small", r[AC.band] || ""));
       tr.appendChild(att);
       cell(tr, r[AC.age] === null ? "n/a" : num(r[AC.age]) + " d", "n");
       cell(tr, r[AC.quad] ? chip(QL[r[AC.quad]] || "GRAY", r[AC.quad]) : "");
@@ -756,8 +755,7 @@ def _fix_data(rep: ta.TenantReport, index: dict[str, int]) -> dict[str, Any]:
             found_ix[fd] = len(found)
             found.append(fd)
         rows.append([ai, f["check"], f["severity"], f["priority"], found_ix[fd], rec_ix[r], f["change"]])
-    checks = {str(n): [lab, *ana._CHECK_META.get(n, ("AppSec", "M", "Results accuracy"))]
-              for n, (lab, _) in sh.CHECK_CATALOG.items()}
+    checks = {str(n): [lab, ana.check_effort(n)] for n, (lab, _) in sh.CHECK_CATALOG.items()}
     # Shared budget keeps very large tenants usable; the workbook has the full text.
     total = sum(len(x) for x in found)
     if total > FOUND_BUDGET:
@@ -852,7 +850,7 @@ def _apps(rep: ta.TenantReport, base: str) -> tuple[str, dict[str, int]]:
 
     heads = [("name", "Application", ""), ("bu", GROUP_HEAD, ""), ("health", "Scan health", ""),
              ("fails", "Failing checks", "n"), ("cov", "Coverage", ""), ("att", "Attention", ""),
-             ("age", "Scan age", "n"), ("quad", "Priority box", ""), ("pol", "Policy", ""),
+             ("age", "Scan age", "n"), ("quad", "Focus", ""), ("pol", "Policy", ""),
              ("vh", "Open VH", "n"), ("h", "Open H", "n"), ("chg", "Since last run", "")]
     th_js = "".join(f'<th data-col="{k}"{" class=n" if cls else ""}'
                     f'{" aria-sort=descending" if k == "att" else ""}><button type="button">{lab}</button></th>'
@@ -871,7 +869,7 @@ def _apps(rep: ta.TenantReport, base: str) -> tuple[str, dict[str, int]]:
         '<option>Fair</option><option>Poor</option><option>Unknown</option></select></label>'
         '<label>Coverage<select id="f-cov"><option value="">All</option><option>At risk</option>'
         '<option>Partial</option><option>Complete</option><option>Unknown</option></select></label>'
-        f'<label>Priority box<select id="f-quad"><option value="">All</option>{quads}</select></label>'
+        f'<label>Focus<select id="f-quad"><option value="">All</option>{quads}</select></label>'
         '<label>Policy<select id="f-policy"><option value="">All</option><option>Pass</option>'
         '<option>Conditional</option><option>Did not pass</option><option>Unknown</option></select></label>'
         f'<label>Attention band<select id="f-band"><option value="">All</option>{bands}</select></label>'
@@ -981,9 +979,10 @@ def _classification() -> str:
          "each sandbox is a row of its own and is judged on its own scans."),
         _r("Never scanned / Errors", "No published static scan exists / the API calls for that profile "
          "failed this run (rerun to retry). Neither is counted as Good."),
-        _r("Result coverage", "Findings only cover what was uploaded and selected. <b>At risk</b>: fails "
-         f"{e(_checks_list(kit._ACCURACY_MAJOR))}. <b>Partial</b>: fails one of the other "
-         f"{len(kit._ACCURACY - kit._ACCURACY_MAJOR)} accuracy checks. <b>Complete</b>: none fail."),
+        _r("Result coverage", "Findings only cover code that was scanned. <b>At risk</b>: a high-severity "
+         f"check found code that was not scanned ({e(_checks_list(kit._ACCURACY_MAJOR))}). <b>Partial</b>: "
+         f"another not-scanned check fails ({e(_checks_list(kit._ACCURACY - kit._ACCURACY_MAJOR))}). "
+         "<b>Complete</b>: none fail."),
         _r("Analysis time", "Never averaged across the tenant. Each profile is compared with its own "
          f"earlier scans (slower = {perf['perf_slower_ratio']:g}x and {perf['perf_min_extra'] // 60} "
          "min above its usual), and profiles are grouped by analysis size."),
@@ -1003,7 +1002,7 @@ def _classification() -> str:
          f"{f['density_red']:g}. <b>Gray</b>: severity not available."),
     ])
     groups = _rules("How profiles are grouped", None, [
-        _r("Priority box", "Puts the two sides together without merging them. Scan health is bad when "
+        _r("Focus", "Puts the two sides together without merging them. Scan health is bad when "
          "the profile is Poor; findings are bad when findings risk is Orange or Red. <b>Immediate</b>: "
          "both. <b>Review</b>: findings only. <b>Attention</b>: scan health only. <b>Monitor</b>: "
          "neither. <b>Insufficient data</b>: neither side known."),
@@ -1012,9 +1011,11 @@ def _classification() -> str:
          f"{a['high_severity_issue_weight']}, trend {a['trend_weight']}, data quality "
          f"{a['data_quality_weight']}. Missing inputs are left out, never counted as healthy. "
          f"Never-scanned profiles are capped at {a['never_scanned_cap']}. Bands: {e(bands)}."),
-        _r("Priority", "Same rule in every report. <b>P1</b>: high-severity accuracy check, sensitive "
-         "files (#16, #17) or open Very High flaws. <b>P2</b>: medium accuracy check, stale results (#30), "
-         "high-severity size check, policy not met, failed scans. <b>P3</b>: scan time only."),
+        _r("Priority", "Same rule in every report, from what the problem does to the results. "
+         "<b>P1</b>: code not scanned (high severity), sensitive files or a Git repository uploaded "
+         "(#16, #17), or open Very High flaws. <b>P2</b>: other code not scanned, unshipped code "
+         "analysed, a likely misconfiguration, old results (#30), policy not met, failed scans. "
+         "<b>P3</b>: only makes scans slower."),
         _r("Effort", " &middot; ".join(e(t) for t in ana.EFFORT_MEANING.values()) + "."),
         _r("Business unit and team", "As set on the application profile in Veracode. Access teams named "
          "Service Delivery - * are not shown."),
@@ -1025,7 +1026,7 @@ def _classification() -> str:
          "These are this tool's defaults, not Veracode guidance."),
     ])
     return _section("how", "How results are classified",
-                    "Scan health and policy/findings are classified separately; only the priority box "
+                    "Scan health and policy/findings are classified separately; only the focus boxes "
                     "and attention score look at both.",
                     f'<div class="rulegrid">{scan}{posture}{groups}</div>')
 
@@ -1199,7 +1200,7 @@ def overview(rep: ta.TenantReport) -> str:
     spark_s = kit.sparkline([p.get("poor") for p in rep.series], labels, "Poor profiles",
                             lambda x: f"{x:,.0f}")
     first_s = (kit.filter_link(f"#{e(top['check'])} {e(top['label'])}", "fix", f"check={top['check']}")
-               + f' <span class="small">{e(top["owner"])}, {top["apps"]:,} profiles</span>'
+               + f' <span class="small">{top["apps"]:,} profiles</span>'
                if top else '<span class="na">No check fails on any profile.</span>')
     vs = v.get("Scan health")
     scan_panel = kit.lens_panel(kit.LENS_SCAN, vs.level if vs else "GRAY", vs.label if vs else "Unknown",
@@ -1220,7 +1221,7 @@ def overview(rep: ta.TenantReport) -> str:
         kit.Result("Severity unavailable", f"{k['severity_unavailable']:,}", "excluded from totals"),
         kit.Result("Result coverage", kit.filter_link(f"{cov.get('At risk', 0):,} at risk", "apps", "cov=At%20risk"),
                    f"{cov.get('Partial', 0):,} partial, {cov.get('Complete', 0):,} complete "
-                   "(from the accuracy checks)",
+                   "(code not scanned checks)",
                    "Check scans" if cov.get("At risk") else "", "ORANGE"),
     ]
     spark_p = kit.sparkline([p.get("open_vh") for p in rep.series], labels, "Open Very High flaws",
@@ -1246,7 +1247,7 @@ def overview(rep: ta.TenantReport) -> str:
                if not rep.complete else "")
     nav = "".join(f'<a href="#{i}">{t}</a>' for i, t in (
         ("fix", "Fix list"), ("org", "Fix once, repair many"), ("teams", "By group"),
-        ("priority", "Priority by profile"), ("apps", "Applications"), ("changes", "What changed"), ("trends", "Trends"),
+        ("priority", "Where to focus"), ("apps", "Applications"), ("changes", "What changed"), ("trends", "Trends"),
         ("checks", "All checks"), ("findings", "Findings and policy"), ("how", "How it's classified"),
         ("notes", "Data notes")))
     return (f'<header><h1>Scan health report</h1><p class="ctx">{ctx}</p>'
@@ -1270,7 +1271,7 @@ def org_actions(rep: ta.TenantReport) -> list[kit.ActionView]:
         ex = ", ".join(r["name"] for r in it["examples"])
         out.append(kit.ActionView(
             priority=it["priority"], title=f"#{it['check']} {it['label']}", lens=kit.LENS_SCAN,
-            owner=it["owner"], effort=it["effort"], why=it["why"], priority_why=it.get("priority_why", ""),
+            owner="", effort=it["effort"], why=it["why"], priority_why=it.get("priority_why", ""),
             evidence=[x for x in (it["evidence"], f"Most affected business units: {bus}" if bus else "",
                                   f"Most affected teams: {tms}" if tms and rep.has_teams else "",
                                   f"For example: {ex}" if ex else "") if x],
@@ -1322,7 +1323,7 @@ def render_html(rep: ta.TenantReport, collection: dict[str, Any] | None = None) 
                        kit.LENS_SCAN,
                        title_html=_dual("Which business unit has which problem",
                                         "Which team has which problem"))
-            + _section("priority", "Priority by profile",
+            + _section("priority", "Where to focus",
                        "Scan health risk against findings risk for every profile. Click a box to list "
                        "those profiles.", priority(rep))
             + apps_html

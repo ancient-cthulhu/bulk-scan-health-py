@@ -1836,18 +1836,16 @@ def history_status(report: AppReport, target: int, since: date | None, en: Enume
 
 
 def _standard_notes(report: AppReport) -> None:
-    report.note("Analysis time", "Analysis time is published_date minus submitted_date from "
-                "the static-analysis element. It excludes upload and prescan.")
+    report.note("Analysis time", "From submission to published results (Veracode's submitted and "
+                "published dates). Upload and prescan are not included.")
     report.note("Mitigation state", "On older builds, mitigations may show their current state "
                 "rather than the state at scan time.")
-    report.note("Fixed counts", "Veracode advises against relying on remediation_status=\"fixed\" "
-                "in detailedreport. Fixed counts come from the flaw-status element; each build "
-                "records which report supplied it in flaw_status_source.")
-    report.note("Module flaw counts", "Per-module numflawssev0..5 are reported as the platform "
-                "supplies them. Whether they count open flaws only is not documented, so they "
-                "are never used as open-flaw counts.")
-    report.note("Units", "MB in this report means 10^6 bytes. The bulk workbook's "
-                "\"Analysis Size (MB)\" column uses 2^20.")
+    report.note("Fixed counts", "Taken from each flaw's status, as Veracode advises, not from its "
+                "remediation status.")
+    report.note("Module flaw counts", "Shown as Veracode reports them per module. Veracode does not "
+                "say whether they include closed flaws, so open counts come from the flaw list.")
+    report.note("Units", "MB means 1,000,000 bytes. The bulk workbook's \"Analysis Size (MB)\" "
+                "column uses 1,048,576.")
 
 
 def _add_scan_trend(fetcher: Fetcher, app: AppInfo, context: dict[str, Any], en: Enumeration,
@@ -2120,8 +2118,8 @@ def run(args: argparse.Namespace, skip_checks: set[int] | None = None) -> int:
         if rec is not None:
             hp = cache.append_history(app.guid, rec)
             if hp is None:
-                report.note("Point-in-time history", "history.jsonl not written "
-                            "(cache disabled or not writable).")
+                report.note("Saved history", "This run was not added to the saved history "
+                            "(cache disabled or not writable), so the next report cannot use it.")
             else:
                 log.info("[+] History: %s", hp)
         if cache.mode != "off" and cache.root is not None:

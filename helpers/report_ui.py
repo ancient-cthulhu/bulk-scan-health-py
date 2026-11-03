@@ -158,7 +158,7 @@ def line_chart(title: str, labels: list[str], values: list[float | None], tips: 
     if threshold:
         yt = _y(threshold, ymax, h)
         out.append(f'<line class="thr" x1="{ML}" x2="{w - MR}" y1="{yt:.1f}" y2="{yt:.1f}"/>'
-                   f'<text class="tick" x="{ML + 6}" y="{yt - 6:.1f}">regression threshold '
+                   f'<text class="tick" x="{ML + 6}" y="{yt - 6:.1f}">slow threshold '
                    f'{e(fmt(threshold))}{e(unit)}</text>')
     path = " ".join(f"{'M' if k == 0 else 'L'}{xs[i]:.1f},{_y(v, ymax, h):.1f}" for k, (i, v) in enumerate(pts))
     out.append(f'<path class="ln s1" d="{path}"/>')
@@ -396,8 +396,11 @@ svg path.v1,svg rect.v1{fill:var(--v1)} svg path.v2,svg rect.v2{fill:var(--v2)}
 svg path.v3,svg rect.v3{fill:var(--v3)} svg path.v4,svg rect.v4{fill:var(--v4)}
 .disclaimer{font-size:13px;color:var(--ink2);border-left:3px solid var(--axis);padding:4px 10px;margin:12px 0 0}
 footer{color:var(--muted);font-size:12.5px;text-align:center;margin-top:28px}
+.jump{display:flex;flex-wrap:wrap;gap:4px 16px;margin:12px 0 0;font-size:14px}
+.jump a{color:var(--link);text-decoration:none} .jump a:hover{text-decoration:underline}
+p.scope{margin:6px 0 0}
 @media print{body{background:#fff}section,.v{break-inside:avoid;border-color:#ccc}
-details{display:block} details>summary{display:none} details>*{display:block}
+summary{list-style:none} summary::-webkit-details-marker{display:none}
 a{color:inherit;text-decoration:none} main{max-width:none;padding:0}}
 @media (max-width:640px){h1{font-size:22px} section{padding:16px} .act dl{grid-template-columns:minmax(0,1fr)}
 .act dt{margin-top:6px}}
@@ -472,7 +475,14 @@ def mix_bar(parts: list[tuple[str, int, str]]) -> str:
 
 
 # Browser print dialog: exact PDF, no library or network. Hidden until the script runs.
-PDF_SCRIPT = ('(function () { var b = document.getElementById("save-pdf"); if (!b) { return; } '
+# Collapsed sections are opened for printing (any print, not only the button) and closed again after.
+PDF_SCRIPT = ('(function () { var opened = []; '
+              'window.addEventListener("beforeprint", function () { '
+              'document.querySelectorAll("details:not([open])").forEach(function (d) { '
+              'd.open = true; opened.push(d); }); }); '
+              'window.addEventListener("afterprint", function () { '
+              'opened.forEach(function (d) { d.open = false; }); opened = []; }); '
+              'var b = document.getElementById("save-pdf"); if (!b) { return; } '
               'b.hidden = false; b.addEventListener("click", function () { window.print(); }); }());')
 
 
@@ -499,8 +509,13 @@ PRINT_CSS = """
 .pdfbtn:hover{background:var(--wash)}
 .pdfbtn:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 @page{size:A4;margin:14mm}
-@media print{.toolbar{display:none} *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+@media print{.toolbar,.jump{display:none} *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
 main{max-width:none;padding:0} section,.part,main>section{break-inside:auto!important;margin:14px 0}
 h1,h2,h3,summary{break-after:avoid} tr,svg,.v,.act,.stat,.kpi,.panel,.q,figure{break-inside:avoid}
-body{font-size:12.5px} .grid2,.cols2{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+body{font-size:12.5px} .grid2,.cols2{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+.tw{overflow:visible!important} table{width:100%;font-size:10px}
+th,td,td.nw{white-space:normal!important;padding:3px} td{overflow-wrap:break-word}
+th{font-size:8.5px;letter-spacing:0;overflow-wrap:normal} td.n,th.n{white-space:nowrap!important}
+td.name{max-width:none;overflow-wrap:anywhere} td .chip{white-space:normal} summary{font-weight:600;color:inherit;margin:8px 0 4px}}
+@media print{details::details-content{content-visibility:visible;display:block}}
 """
