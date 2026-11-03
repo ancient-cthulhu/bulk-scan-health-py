@@ -54,6 +54,11 @@ def fmt_mb(n: int | float | None) -> str:
     return "Unavailable" if n is None else f"{n / 1e6:,.1f} MB"
 
 
+def plural(n: int, word: str, many: str = "") -> str:
+    """'1 check', '3 checks'; many overrides the plural form."""
+    return f"{n:,} {word if n == 1 else (many or word + 's')}"
+
+
 def fmt_num(n: object) -> str:
     if n is None:
         return '<span class="na">n/a</span>'

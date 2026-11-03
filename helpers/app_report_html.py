@@ -24,6 +24,7 @@ from .report_ui import (
     line_chart,
     link,
     pdf_button,
+    plural,
     rec_html,
     short_date,
     stacked_columns,
@@ -41,12 +42,13 @@ def _header(r: AppReport) -> str:
     scan = r.parameters.get("scan")
     if scan and len(r.builds) > 1:
         scope = (f"Scan build {e(scan.get('build_id'))} with {len(r.builds) - 1} earlier "
-                 f"build(s) for trend ({e(r.history_status)})")
+                 f"{'build' if len(r.builds) == 2 else 'builds'} for trend"
+                 + ("" if r.history_status == "Complete" else f" ({e(r.history_status.lower())})"))
     elif scan:
         scope = f"Single scan, build {e(scan.get('build_id'))}"
     else:
         hs = "" if r.history_status == "Complete" else f" ({e(r.history_status.lower())})"
-        scope = f"{len(r.builds)} published build(s) analysed{hs}"
+        scope = f"{plural(len(r.builds), 'published build')} analysed{hs}"
     links = []
     if b is not None:
         links = [link(b.overview_url, "Static Overview"), link(b.review_url, "Review Modules"),
@@ -117,7 +119,7 @@ def _actions(an: Analysis) -> str:
     top = "".join(_action_card(a) for a in an.actions[:5])
     rest = ""
     if len(an.actions) > 5:
-        rest = (f"<details><summary>{len(an.actions) - 5} more action(s)</summary>"
+        rest = (f"<details><summary>{plural(len(an.actions) - 5, 'more action')}</summary>"
                 f'<div class="actions">{"".join(_action_card(a) for a in an.actions[5:])}</div></details>')
     return (f'<section id="actions"><h2>Top actions</h2>{_priority_key()}'
             f'<div class="actions">{top}</div>{rest}</section>')
@@ -201,8 +203,8 @@ def _changes(r: AppReport, an: Analysis) -> str:
                  f"<h3>Removed</h3><p>{_list_or_none(d.files_removed, 200)}</p>"
                  f"<h3>Changed</h3><p>{_list_or_none(d.files_changed, 200)}</p></details>")
     return (f'<section id="changes"><h2>What changed since the previous scan</h2>'
-            f'<p class="lead">Build {e(r.latest.build_id if r.latest else "")} compared with build '
-            f'{e(d.previous_build)}.</p>'
+            f'<p class="lead">Build <b>{e(r.latest.build_id if r.latest else "")}</b> compared with the '
+            f'previous scan, build {e(d.previous_build)}.</p>'
             + (f'<div class="tw"><table data-copy>{body}</table></div>' if body else "")
             + f'{same_txt}{files}</section>')
 
@@ -277,21 +279,41 @@ def _checks(r: AppReport, an: Analysis) -> str:
             if len(c.issues) > 1:
                 found += f" (+{len(c.issues) - 1} more)"
             prows.append([str(c.check_num), e(c.label), e(" \u00b7 ".join(res)), e(found)])
-    failing = sum(1 for c in b.checks if c.status == "Fail")
     head = ("<thead><tr><th class=n>#</th><th>Check</th><th>Status</th><th>Severity</th><th>Lifecycle</th>"
             "<th>History</th><th>Details</th></tr></thead>")
     main = (f'<div class="tw screen-only"><table data-copy>{head}<tbody>{"".join(rows)}</tbody></table></div>'
             if rows else '<p class="lead">No check is failing on this build.</p>')
-    rest = (f'<details class="screen-only"><summary>{len(quiet)} passing, not applicable or skipped '
-            f'checks</summary><div class="tw"><table data-copy>{head}<tbody>{"".join(quiet)}</tbody></table>'
-            f'</div></details>' if quiet else "")
+    kinds = {k: len(v) for k, v in pquiet.items()}
+    label = (plural(len(quiet), "passing check") if list(kinds) == ["Passing"] else
+             f"{plural(len(quiet), 'other check')} ("
+             + ", ".join(f"{n} {k.lower()}" for k, n in kinds.items()) + ")")
+    rest = (f'<details class="screen-only"><summary>{label}</summary><div class="tw"><table data-copy>'
+            f'{head}<tbody>{"".join(quiet)}</tbody></table></div></details>' if quiet else "")
     quiet_txt = " ".join(f"<b>{e(k)}:</b> {', '.join(f'#{n}' for n in sorted(v))}." for k, v in pquiet.items())
     printed = (_ptable(["#", "Check", "Result", "What was found"], prows, (0,))
                + (f'<p class="print-only na">{quiet_txt}</p>' if quiet_txt else ""))
-    return (f'<section id="checks"><h2>Health checks</h2><p class="lead">All 31 checks on build '
-            f'{e(b.build_id)}: {failing} failing.<span class="screen-only"> History: one dot per recent '
-            f'scan, oldest first (green pass, red fail, grey not evaluated).</span></p>'
-            f'{main}{rest}{printed}</section>')
+    return (f'<section id="checks"><h2>Health checks</h2><p class="lead">{_checks_lead(b)}</p>'
+            f'{main}{rest}{printed}<p class="na screen-only">History: one dot per recent scan, oldest '
+            f'first. Green pass, red fail, grey not evaluated.</p></section>')
+
+
+def _checks_lead(b: Any) -> str:
+    """'3 of 31 checks fail on build 5006 (1 high, 2 medium). 28 pass.'"""
+    by: dict[str, int] = {}
+    for c in b.checks:
+        by[c.status] = by.get(c.status, 0) + 1
+    fail = [c for c in b.checks if c.status == "Fail"]
+    hi = sum(1 for c in fail if c.severity == "high")
+    total = len(b.checks)
+    split = ", ".join(f"{n} {w}" for n, w in ((hi, "high"), (len(fail) - hi, "medium")) if n)
+    head = (f"<b>{len(fail)} of {total} checks fail</b> on build {e(b.build_id)} ({split})." if fail
+            else f"<b>No check fails</b> on build {e(b.build_id)}.")
+    rest = [plural(by[k], w, m) for k, w, m in (("Pass", "passes", "pass"), ("Error", "error", ""),
+                                                 ("Unavailable", "unavailable", "unavailable"),
+                                                 ("Not run", "not run", "not run"),
+                                                 ("N/A", "not applicable", "not applicable"),
+                                                 ("Skipped", "skipped", "skipped")) if by.get(k)]
+    return head + (" " + ", ".join(rest) + "." if rest else "")
 
 
 def _performance(an: Analysis) -> str:
@@ -369,7 +391,8 @@ def _cadence(an: Analysis, r: AppReport) -> str:
     tl, undated = timeline(c.attempts, c.longest_gap)
     gap = (f"Longest gap: {e(c.longest_gap[0])} to {e(c.longest_gap[1])}." if c.longest_gap else "")
     if undated:
-        gap += f" {undated} undated attempt(s) are listed under Builds."
+        gap += (f" {plural(undated, 'undated attempt')} {'is' if undated == 1 else 'are'} listed "
+                "under Builds.")
     fr = (f"Failed or cancelled: {e(c.failure_rate_note)} ({c.failure_rate:.0%})."
           if c.failure_rate is not None else f"Failed or cancelled: {e(c.failure_rate_note)}.")
     legend = ('<div class="legend"><span><i class="sw s1" style="border-radius:50%"></i>Published</span>'
@@ -407,8 +430,14 @@ def _findings(an: Analysis) -> str:
         f"<td class=n>{fmt_num(x.total)}</td><td class=n>{fmt_num(x.new)}</td><td class=n>{fmt_num(x.reopen)}</td>"
         f"<td class=n>{fmt_num(x.fixed)}</td><td class=n>{e(fmt_signed(x.net_change))}</td><td class=n>{fmt_num(x.score)}</td>"
         f"<td>{chip(sh._policy_level(x.policy or ''), x.policy or 'Unknown')}</td></tr>" for x in reversed(rows))
-    return (f'<section id="findings"><h2>Findings</h2><p class="lead">Open: not fixed and not '
-            f'covered by an accepted mitigation.</p>'
+    last = rows[-1]
+    sevs = [x for x in (last.very_high, last.high, last.medium, last.low) if x is not None]
+    now = ""
+    if len(sevs) == 4:
+        now = (f"<b>{plural(sum(sevs), 'open flaw')}</b> on build {e(last.build_id)}: "
+               f"{last.very_high} Very High, {last.high} High, {last.medium} Medium, {last.low} Low. ")
+    return (f'<section id="findings"><h2>Findings</h2><p class="lead">{now}Open means not fixed and '
+            f'not covered by an accepted mitigation.</p>'
             f'<div class="grid2"><div>{legend_sev}{sev}</div><div>{legend_nf}{nf}</div></div>'
             f'{eng}{other}'
             f'<details class="screen-only"><summary>Findings table</summary><div class="tw">'
@@ -447,7 +476,7 @@ def _composition(an: Analysis, r: AppReport) -> str:
         sev_txt = " / ".join("n/a" if x is None else str(x) for x in sev) if sev else "n/a"
         flags = [t for t, on in (("selected", m["selected"]), ("dependency", m["dependency"]),
                                  ("third-party", m["third_party"]), ("fatal", m["fatal"])) if on]
-        iss = (f"<details><summary>{len(m['issues'])} issue(s)</summary><ul>"
+        iss = (f"<details><summary>{plural(len(m['issues']), 'issue')}</summary><ul>"
                + "".join(f"<li>{e(i)}</li>" for i in m["issues"]) + "</ul></details>") if m["issues"] else ""
         body.append(f"<tr><td class=name><code>{e(m['name'])}</code></td><td>{e(', '.join(flags) or 'not selected')}</td>"
                     f"<td class=n>{fmt_num(m['loc'])}</td><td class=n>{e(sev_txt)}</td><td>{e(m['size'] or 'n/a')}</td>"
@@ -459,8 +488,7 @@ def _composition(an: Analysis, r: AppReport) -> str:
         ("fatal", m["fatal"])) if on) or "not selected"), fmt_num(m["loc"]),
         e(" / ".join("n/a" if x is None else str(x) for x in m["flaws_by_sev"]) if m["flaws_by_sev"] else "n/a"),
         e(f"{len(m['issues'])}" if m["issues"] else "")] for m in rows[:15]]
-    printed = (f'<p class="print-only">{len(rows):,} module(s), {len(sel):,} selected.</p>'
-               + _ptable(["Module", "Role", "LOC", "Flaws VH/H/M/L", "Prescan issues"], prow, (2, 3, 4),
+    printed = (_ptable(["Module", "Role", "LOC", "Flaws VH/H/M/L", "Prescan issues"], prow, (2, 3, 4),
                          FULL_IN_HTML if len(rows) > 15 else ""))
     more = f"<p class=na>Showing {limit} of {len(rows)} modules.</p>" if len(rows) > limit else ""
     b = r.latest
@@ -472,9 +500,10 @@ def _composition(an: Analysis, r: AppReport) -> str:
             sca = "SCA is not enabled for this scan."
         else:
             sca = _sca_table(b)
-    return (f'<section id="composition"><h2>Modules</h2><p class="lead">Modules in the latest build, '
-            f'selected first. Flaw counts are the platform\'s per-module figures (Very High / High / '
-            f'Medium / Low).</p><div class="tw screen-only"><table data-copy><thead><tr><th>Module</th>'
+    bid = e(b.build_id) if b is not None else ""
+    return (f'<section id="composition"><h2>Modules</h2><p class="lead"><b>{plural(len(rows), "module")}'
+            f'</b> in build {bid}, {len(sel):,} selected for analysis. Flaws per module: Very High / High / '
+            f'Medium / Low.</p><div class="tw screen-only"><table data-copy><thead><tr><th>Module</th>'
             f'<th>Role</th><th class=n>LOC</th><th class=n>Flaws VH/H/M/L</th><th>Size</th>'
             f'<th>Compiler / platform</th><th>Prescan</th></tr></thead><tbody>{"".join(body)}</tbody></table>'
             f'</div>{more}{printed}'
@@ -492,7 +521,7 @@ def _sca_table(b: Any) -> str:
     rows = b.sca_details or [{"file_name": c} for c in b.sca_components or []]
     n = b.sca_vulnerable_components if b.sca_vulnerable_components is not None else len(rows)
     if not rows:
-        return f"<p>{n or 0} vulnerable component(s).</p>"
+        return f"<p>{plural(n or 0, 'vulnerable component')}.</p>"
     cols = [c for c in _SCA_COLS if any(r.get(c[0]) not in (None, "") for r in rows)]
     def cell(k: str, v: Any) -> str:
         if v in (None, ""):
@@ -511,10 +540,10 @@ def _sca_table(b: Any) -> str:
             + [cell(k, r.get(k)) for k in pcols] for r in rows[:10]]
     phead = ["Component"] + [{"version": "Version", "max_cvss_score": "Max CVSS",
                               "vulnerabilities": "Vulnerabilities"}[k] for k in pcols]
-    return (f'<details class="screen-only"><summary>{n:,} vulnerable component(s), highest CVSS first'
+    return (f'<details class="screen-only"><summary>{plural(n, "vulnerable component")}, highest CVSS first'
             f'</summary><div class="tw"><table data-copy><thead><tr>{head}</tr></thead><tbody>{body}'
             f'</tbody></table></div>{more}</details>'
-            f'<p class="print-only">{n:,} vulnerable component(s), highest CVSS first.</p>'
+            f'<p class="print-only">{plural(n, "vulnerable component")}, highest CVSS first.</p>'
             + _ptable(phead, prow, tuple(i + 1 for i, k in enumerate(pcols) if k != "version"),
                       FULL_IN_HTML if len(rows) > 10 else ""))
 
@@ -530,7 +559,7 @@ def _notes(r: AppReport) -> str:
     calls = c.get("api_calls", {})
     cache = c.get("cache", {})
     coll = (f"API calls: report {e(calls.get('report', 0))}, xml {e(calls.get('xml', 0))}, rest "
-            f"{e(calls.get('rest', 0))}. Cache: {e(cache.get('mode', 'n/a'))}, {e(cache.get('hits', 0))} hit(s).")
+            f"{e(calls.get('rest', 0))}. Cache: {e(cache.get('mode', 'n/a'))}, {e(plural(int(cache.get('hits', 0) or 0), 'hit'))}.")
     warn_html = (f'<h3>{chip("ORANGE", "Gaps in this report")}</h3><div class="tw"><table><tbody>'
                  + "".join(row(n) for n in warn) + "</tbody></table></div>") if warn else ""
     return (f'<section id="notes"><h2>About this data</h2><p class="lead">Why a value may show as '
@@ -558,7 +587,10 @@ def _appendix(r: AppReport) -> str:
             for b in r.builds]
     prow += [[e(o.build_id), "", "", "", e(o.status_class), e(o.status or o.info_error or "")]
              for o in r.other_builds]
-    return (f'<section id="appendix"><h2>Builds</h2><div class="tw screen-only"><table data-copy>'
+    lead = (f'<p class="lead"><b>{plural(len(r.builds), "published build")}</b>, newest first'
+            + (f'; {plural(len(r.other_builds), "attempt")} not published.' if r.other_builds else ".")
+            + "</p>")
+    return (f'<section id="appendix"><h2>Builds</h2>{lead}<div class="tw screen-only"><table data-copy>'
             f'<thead>{head}</thead><tbody>{body}{other}</tbody></table></div>'
             + _ptable(["Build", "Published", "Analysis time", "Size", "Health", "Policy"], prow, (2, 3))
             + "</section>")

@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 
 import scan_health as sh
 
+from .report_ui import plural
+
 if TYPE_CHECKING:
     from .app_report import AppReport, BuildRef, BuildSnapshot
 
@@ -266,7 +268,7 @@ def duration_stats(builds: list[BuildSnapshot], baseline_window: int,
     st.baseline_n = len(base)
     if len(base) < cfg["min_baseline_points"]:
         st.status = "Insufficient history"
-        st.reason = (f"{len(base)} earlier build(s) with timing; "
+        st.reason = (f"{plural(len(base), 'earlier build')} with timing; "
                      f"{cfg['min_baseline_points']} needed for a baseline")
         return st
     st.baseline_median = round(median(base), 1)
@@ -630,7 +632,8 @@ def verdicts(report: AppReport, dur: DurationStats, cad: CadenceStats,
     if b.checks_ran:
         fail = [c for c in b.checks if c.status == "Fail"]
         hi = sum(1 for c in fail if c.severity == "high")
-        why = (f"{len(fail)} failing check(s): {hi} high, {len(fail) - hi} medium" if fail
+        split = ", ".join(f"{n} {w}" for n, w in ((hi, "high"), (len(fail) - hi, "medium")) if n)
+        why = (f"{plural(len(fail), 'failing check')}: {split}" if fail
                else "No check fails")
     else:
         why = "Checks could not run on this build (inputs unavailable)"
@@ -817,7 +820,7 @@ def action_plan(report: AppReport, dur: DurationStats, cad: CadenceStats,
     if b.open_by_severity and b.open_by_severity.get("very_high"):
         n = b.open_by_severity["very_high"]
         items.append(ActionItem(
-            priority="P1", title=f"Remediate {n} open Very High flaw(s)", owner_role="",
+            priority="P1", title=f"Remediate {plural(n, 'open Very High flaw')}", owner_role="",
             effort="M", category="Security exposure",
             priority_why="Most exploitable flaws; usually fail policy.",
             why="",

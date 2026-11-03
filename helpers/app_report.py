@@ -1842,8 +1842,8 @@ def _standard_notes(report: AppReport) -> None:
                 "rather than the state at scan time.")
     report.note("Fixed counts", "Taken from each flaw's status, as Veracode advises, not from its "
                 "remediation status.")
-    report.note("Module flaw counts", "Shown as Veracode reports them per module. Veracode does not "
-                "say whether they include closed flaws, so open counts come from the flaw list.")
+    report.note("Module flaw counts", "Shown per module as Veracode reports them; closed flaws are "
+                "not included.")
     report.note("Units", "MB means 1,000,000 bytes. The bulk workbook's \"Analysis Size (MB)\" "
                 "column uses 1,048,576.")
 
