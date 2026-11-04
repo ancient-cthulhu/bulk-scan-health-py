@@ -363,6 +363,14 @@ def cadence_stats(builds: list[BuildSnapshot], others: list[BuildRef],
     return cs
 
 
+def _open_count(b: BuildSnapshot) -> int | None:
+    """Open flaws across all severities, when the build has them."""
+    sev = b.open_by_severity
+    if not sev or any(sev.get(k) is None for k in ("very_high", "high", "medium", "low")):
+        return None
+    return int(sum(sev[k] for k in ("very_high", "high", "medium", "low")))
+
+
 def findings_trend(builds: list[BuildSnapshot], cfg: dict[str, Any] | None = None) -> FindingsTrend:
     """Per-build findings, timeline events and the engine-effect flag."""
     cfg = cfg or ANALYTICS_CONFIG
@@ -394,12 +402,15 @@ def findings_trend(builds: list[BuildSnapshot], cfg: dict[str, Any] | None = Non
             if b.engine_version and prev.engine_version and b.engine_version != prev.engine_version:
                 ft.events.append({"build_id": b.build_id, "event":
                                   f"Engine {prev.engine_version} to {b.engine_version}"})
-                r = _rel(float(total) if total is not None else None,
-                         float(prev_total) if prev_total else None)
+                now_open, prev_open = _open_count(b), _open_count(prev)
+                what = "Open flaws" if now_open is not None and prev_open is not None else "Total flaws"
+                cur_n, old_n = (now_open, prev_open) if what == "Open flaws" else (total, prev_total)
+                r = _rel(float(cur_n) if cur_n is not None else None, float(old_n) if old_n else None)
                 if r is not None and abs(r) > cfg["engine_effect_change"] and b is builds[0]:
-                    ft.engine_effect = (f"Total flaws changed {_pct_str(r)} with this scan. Usually "
-                                        "that is new or changed code; this scan also ran on a newer "
-                                        "Veracode engine, which can add or remove findings by itself.")
+                    ft.engine_effect = (f"{what} changed {_pct_str(r)} with the latest scan, which "
+                                        "also ran on a newer Veracode engine. Usually a change like "
+                                        "this is new or changed code, but an engine update can add or "
+                                        "remove findings by itself.")
         if b.grace_period_expired:
             ft.events.append({"build_id": b.build_id, "event": "Grace period expired"})
         if b.scan_overdue:

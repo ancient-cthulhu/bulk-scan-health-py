@@ -417,8 +417,7 @@ def _findings(an: Analysis) -> str:
                       [("New", "s2", [x.new for x in rows]), ("Fixed", "s3", [x.fixed for x in rows])], tips)
     legend_nf = ('<div class="legend"><span><i class="sw s2"></i>New</span>'
                  '<span><i class="sw s3"></i>Fixed</span></div>')
-    eng = f'<p class="disclaimer">{e(an.findings.engine_effect)}</p>' if an.findings.engine_effect else ""
-    other = _other_changes(an, {x.build_id: short_date(x.published) for x in rows})
+    other = _other_changes(an)
     head = ("<tr><th>Build</th><th>Published</th><th class=n>Very High</th><th class=n>High</th>"
             "<th class=n>Medium</th><th class=n>Low</th><th class=n>Open policy</th><th class=n>Mitigated</th>"
             "<th class=n>Total</th><th class=n>New</th><th class=n>Reopened</th><th class=n>Fixed</th>"
@@ -439,7 +438,7 @@ def _findings(an: Analysis) -> str:
     return (f'<section id="findings"><h2>Findings</h2><p class="lead">{now}Open means not fixed and '
             f'not covered by an accepted mitigation.</p>'
             f'<div class="grid2"><div>{legend_sev}{sev}</div><div>{legend_nf}{nf}</div></div>'
-            f'{eng}{other}'
+            f'{other}'
             f'<details class="screen-only"><summary>Findings table</summary><div class="tw">'
             f'<table data-copy><thead>{head}</thead><tbody>{body}</tbody></table></div></details>'
             + _ptable(["Build", "Published", "Very High", "High", "Medium", "Low", "New", "Fixed", "Policy"],
@@ -450,19 +449,58 @@ def _findings(an: Analysis) -> str:
             + "</section>")
 
 
-def _other_changes(an: Analysis, dates: dict[str, str]) -> str:
-    """Besides code, what moved results in this window: engine updates, policy changes, deadlines."""
-    groups: dict[str, list[str]] = {}
+def _event_text(ev: str) -> str:
+    if ev.startswith("Engine "):
+        return "Veracode engine updated (" + ev.removeprefix("Engine ") + ")"
+    if ev.startswith("Policy version "):
+        return "Policy updated (version " + ev.removeprefix("Policy version ") + ")"
+    if ev == "Grace period expired":
+        return "Policy grace period expired"
+    if ev == "Scan overdue":
+        return "Policy scan overdue"
+    return ev
+
+
+def _open_of(row: Any) -> int | None:
+    if row is None:
+        return None
+    sev = [row.very_high, row.high, row.medium, row.low]
+    return sum(x for x in sev if x is not None) if all(x is not None for x in sev) else None
+
+
+def _other_changes(an: Analysis) -> str:
+    """Changes outside the code that can move findings or policy status, one row per scan, with what
+    the findings and policy did at that scan so the reader can judge the effect."""
+    rows = an.findings.rows
+    by_build: dict[str, list[str]] = {}
     for x in an.findings.events:
-        ev, when = x["event"], dates.get(x["build_id"], "") or f"build {x['build_id']}"
-        kind = ("Veracode engine updated" if ev.startswith("Engine") else
-                "Policy changed" if ev.startswith("Policy") else ev)
-        groups.setdefault(kind, []).append(when)
-    if not groups:
+        by_build.setdefault(x["build_id"], []).append(_event_text(x["event"]))
+    if not by_build:
         return ""
-    parts = "; ".join(f"{e(k)}: {e(', '.join(v))}" for k, v in groups.items())
-    return (f'<p class="na"><b>Besides code changes:</b> {parts}. An engine or policy update can '
-            "change findings or policy status without any code change.</p>")
+    idx = {r.build_id: i for i, r in enumerate(rows)}
+
+    def moved(old: Any, new: Any) -> str:
+        if old is None or new is None:
+            return e(new if new is not None else "n/a")
+        return e(f"{old:,} to {new:,}") if isinstance(new, int) else e(f"{old} to {new}")
+
+    body = []
+    for bid in sorted(by_build, key=lambda b: idx.get(b, -1), reverse=True):
+        i = idx.get(bid)
+        cur = rows[i] if i is not None else None
+        prev = rows[i - 1] if i else None
+        flaws = moved(_open_of(prev), _open_of(cur))
+        policy = ("Unchanged" if cur and prev and cur.policy == prev.policy
+                  else moved(prev.policy if prev else None, cur.policy if cur else None))
+        when = f"{short_date(cur.published)}, build {bid}" if cur and cur.published else f"build {bid}"
+        body.append(f"<tr><td class=nw>{e(when)}</td><td>{'<br>'.join(e(t) for t in by_build[bid])}</td>"
+                    f"<td class=n>{flaws}</td><td>{policy}</td></tr>")
+    lead = (e(an.findings.engine_effect) if an.findings.engine_effect else
+            "These can change findings or policy status with no code change. Compare the flaw count at "
+            "each one.")
+    return (f'<h3>Changes outside your code</h3><p class="na">{lead}</p><div class="tw"><table data-copy>'
+            "<thead><tr><th>Scan</th><th>What changed</th><th class=n>Open flaws</th><th>Policy</th></tr>"
+            f'</thead><tbody>{"".join(body)}</tbody></table></div>')
 
 
 def _composition(an: Analysis, r: AppReport) -> str:
